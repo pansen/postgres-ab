@@ -166,6 +166,28 @@ cmd_status() {
     incus list "$CONTAINER"
 }
 
+cmd_export() {
+    local file="$REPO_ROOT/var/pg-dev-$(date +%Y-%m-%dT%H:%M:%S).tar.gz"
+    echo "==> Freezing $CONTAINER for consistent export..."
+    incus pause "$CONTAINER"
+    incus export "$CONTAINER" "$file"
+    incus resume "$CONTAINER"
+    echo "Exported to $file"
+}
+
+cmd_import_last() {
+    local file
+    file=$(ls -t "$REPO_ROOT/var/pg-dev-"*.tar.gz 2>/dev/null | head -1)
+    if [[ -z "$file" ]]; then
+        echo "No export found in var/ — run 'make pg.export' first"
+        exit 1
+    fi
+    echo "==> Importing from $file..."
+    incus import "$file"
+    incus start "$CONTAINER"
+    echo "Imported and started $CONTAINER"
+}
+
 usage() {
     echo "Usage: pg-dev-local <command> [args]"
     echo ""
@@ -180,6 +202,8 @@ usage() {
     echo "  psql [args]                 open psql session inside container"
     echo "  shell                       open a bash shell in the container"
     echo "  status                      show container state"
+    echo "  export                      export container to var/pg-dev-<timestamp>.tar.gz"
+    echo "  import-last                 import most recent export from var/"
 }
 
 case "${1:-}" in
@@ -193,5 +217,7 @@ case "${1:-}" in
     psql)         shift; cmd_psql "$@" ;;
     shell)        shift; cmd_shell "$@" ;;
     status)       shift; cmd_status "$@" ;;
+    export)       shift; cmd_export "$@" ;;
+    import-last)  shift; cmd_import_last "$@" ;;
     *)            usage; exit 1 ;;
 esac

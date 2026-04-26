@@ -65,6 +65,14 @@ pg.shell:
 pg.status:
 	$(PG_DEV) status
 
+.PHONY: pg.export
+pg.export:
+	$(PG_DEV) export
+
+.PHONY: pg.import-last
+pg.import-last:
+	$(PG_DEV) import-last
+
 .PHONY: delete
 delete:
 	colima delete --force
