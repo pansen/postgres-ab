@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONTAINER=pg-dev
+IMAGE=images:ubuntu/24.04/cloud
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../.env
+[[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
+
+PG_USER="${PG_USER:-dev}"
+PG_DB="${PG_DB:-dev}"
+PG_PASSWORD="${PG_PASSWORD:-dev}"
+
+cmd_up() {
+    if incus info "$CONTAINER" > /dev/null 2>&1; then
+        echo "Container '$CONTAINER' already exists. Use: pg-dev-local status"
+        exit 1
+    fi
+
+    echo "==> Launching $CONTAINER (may take a minute if image is not cached)..."
+    incus launch --verbose "$IMAGE" "$CONTAINER"
+
+    echo "==> Waiting for IPv4 address..."
+    until incus list "$CONTAINER" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
+        sleep 2
+    done
+
+    echo "==> Installing PostgreSQL 17..."
+    incus exec --verbose "$CONTAINER" -- bash << 'SETUP'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+echo "--- Installing prerequisites ---"
+apt-get update -q
+apt-get install -y curl gnupg lsb-release
+
+echo "--- Adding PGDG repository ---"
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list
+apt-get update -q
+apt-get install -y --no-install-recommends postgresql-17
+
+echo "--- Writing configuration ---"
+mkdir -p /etc/postgresql/17/main/conf.d
+
+cat > /etc/postgresql/17/main/conf.d/99-dev.conf << 'PGCONF'
+listen_addresses = '*'
+dynamic_shared_memory_type = mmap
+
+shared_buffers = 512MB
+effective_cache_size = 1536MB
+work_mem = 16MB
+maintenance_work_mem = 256MB
+max_parallel_maintenance_workers = 2
+
+max_wal_size = 1GB
+checkpoint_completion_target = 0.8
+wal_level = minimal
+max_wal_senders = 0
+
+fsync = off
+full_page_writes = off
+synchronous_commit = off
+autovacuum = off
+
+log_destination = stderr
+logging_collector = off
+log_min_duration_statement = 0
+log_checkpoints = on
+log_lock_waits = on
+deadlock_timeout = 100
+debug_pretty_print = on
+PGCONF
+
+cat > /etc/postgresql/17/main/pg_hba.conf << 'PGHBA'
+local   all   postgres                peer
+local   all   all                     md5
+host    all   all   0.0.0.0/0         scram-sha-256
+host    all   all   ::/0              scram-sha-256
+PGHBA
+
+echo "--- Starting PostgreSQL ---"
+systemctl restart postgresql@17-main
+SETUP
+
+    echo "==> Creating role '$PG_USER' and database '$PG_DB'..."
+    incus exec --verbose "$CONTAINER" -- su -c psql postgres << SQL
+CREATE ROLE "$PG_USER" WITH LOGIN PASSWORD '$PG_PASSWORD' SUPERUSER;
+CREATE DATABASE "$PG_DB" OWNER "$PG_USER";
+SQL
+
+    local ip
+    ip=$(cmd_ip)
+    echo ""
+    echo "==> PostgreSQL ready"
+    echo "    host (container):  $ip"
+    echo "    user:              $PG_USER"
+    echo "    database:          $PG_DB"
+    echo "    incus exec $CONTAINER -- psql -U $PG_USER $PG_DB"
+}
+
+cmd_down() {
+    incus delete "$CONTAINER" --force
+}
+
+cmd_snapshot() {
+    local name="${1:?Usage: pg-dev-local snapshot <name> [--force]}"
+    shift
+    echo "==> Stopping $CONTAINER..."
+    incus stop "$CONTAINER" --force 2>/dev/null || true
+    if [[ "${1:-}" == "--force" ]]; then
+        incus snapshot delete "$CONTAINER" "$name" 2>/dev/null || true
+    fi
+    incus snapshot create "$CONTAINER" "$name"
+    echo "==> Starting $CONTAINER..."
+    incus start "$CONTAINER"
+    echo "Snapshot '$name' created."
+}
+
+cmd_restore() {
+    local name="${1:?Usage: pg-dev-local restore <name>}"
+    incus stop "$CONTAINER" --force 2>/dev/null || true
+    incus snapshot restore "$CONTAINER" "$name"
+    incus start "$CONTAINER"
+    echo "Restored to snapshot '$name'."
+}
+
+cmd_restore_last() {
+    local name
+    name=$(incus snapshot list "$CONTAINER" -f json \
+        | jq -r 'if length == 0 then empty else sort_by(.created_at) | last | .name end')
+    if [[ -z "$name" ]]; then
+        echo "No snapshots found for '$CONTAINER'."
+        exit 1
+    fi
+    echo "==> Restoring to most recent snapshot: $name"
+    cmd_restore "$name"
+}
+
+cmd_snapshots() {
+    if [[ "${1:-}" == "--json" ]]; then
+        incus snapshot list "$CONTAINER" -f json
+    else
+        incus snapshot list "$CONTAINER"
+    fi
+}
+
+cmd_ip() {
+    incus list "$CONTAINER" --format csv -c 4 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -1
+}
+
+cmd_psql() {
+    # Container IPs are on the incus bridge inside the Lima VM and are not
+    # directly routable from macOS, so we exec psql inside the container.
+    incus exec "$CONTAINER" -- env PGPASSWORD="$PG_PASSWORD" psql -U "$PG_USER" "$PG_DB" "$@"
+}
+
+cmd_shell() {
+    incus exec "$CONTAINER" -- bash
+}
+
+cmd_status() {
+    incus list "$CONTAINER"
+}
+
+usage() {
+    echo "Usage: pg-dev-local <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  up                          launch container and install PostgreSQL"
+    echo "  down                        delete container"
+    echo "  snapshot <name> [--force]   create a named snapshot (--force overwrites existing)"
+    echo "  restore  <name>             restore container to a snapshot"
+    echo "  restore-last                restore to the most recent snapshot"
+    echo "  snapshots                   list snapshots"
+    echo "  ip                          print container IP"
+    echo "  psql [args]                 open psql session inside container"
+    echo "  shell                       open a bash shell in the container"
+    echo "  status                      show container state"
+}
+
+case "${1:-}" in
+    up)           shift; cmd_up "$@" ;;
+    down)         shift; cmd_down "$@" ;;
+    snapshot)     shift; cmd_snapshot "$@" ;;
+    restore)      shift; cmd_restore "$@" ;;
+    restore-last) shift; cmd_restore_last "$@" ;;
+    snapshots)    shift; cmd_snapshots "$@" ;;
+    ip)           shift; cmd_ip "$@" ;;
+    psql)         shift; cmd_psql "$@" ;;
+    shell)        shift; cmd_shell "$@" ;;
+    status)       shift; cmd_status "$@" ;;
+    *)            usage; exit 1 ;;
+esac

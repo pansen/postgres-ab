@@ -1,0 +1,115 @@
+// Folder-specific settings
+//
+// For a full list of overridable settings, and general information on folder-specific settings,
+// see the documentation: https://zed.dev/docs/configuring-zed#settings-files
+//
+// Via: https://www.dairon.org/editing-kubernetes-with-zed-editor/
+{
+  "lsp": {
+    "biome": {
+      "binary": {
+        "path": "bash",
+        "arguments": [
+          "-c",
+          "eval \"$(mise activate bash)\" && cd src/frontend && yarn biome lsp-proxy",
+        ],
+      },
+      "settings": {
+        "require_config_file": true,
+        "config_path": "src/frontend",
+      },
+    },
+    "yaml-language-server": {
+      "settings": {
+        "yaml": {
+          "schemaStore": {
+            "enable": true,
+          },
+          "completion": true,
+          "schemas": {
+            "kubernetes": "charts/**.yaml",
+          },
+        },
+      },
+    },
+    "ruff": {
+      "settings": {
+        "python": {
+          "pythonPath": "src/one_service_impl/.venv/bin/python",
+        },
+        "python.analysis": {
+          "autoImportCompletions": true,
+        },
+      },
+    },
+    "ty": {
+      "binary": {
+        // Because of our magic mount, this uses the exact ty binary
+        // installed inside your devcontainer's .venv directory!
+        "path": "src/one_service_impl/.venv/bin/ty",
+        "arguments": ["server"],
+      },
+    },
+    "typescript-language-server": {
+      // Point tsserver at the Yarn PnP SDK wrapper so it resolves packages
+      // via .pnp.cjs instead of looking for node_modules.
+      // SDK files live in src/frontend/.yarn/sdks/typescript/.
+      "initialization_options": {
+        "tsserver": {
+          "path": "src/frontend/.yarn/sdks/typescript/lib/tsserver.js",
+        },
+      },
+    },
+  },
+  "languages": {
+    "Python": {
+      "language_servers": ["ty", "ruff", "!pyright", "!basedpyright"],
+      "formatter": { "language_server": { "name": "ruff" } },
+      "format_on_save": "on",
+      /*
+        Run Ruff fixes before the formatter
+        This organizes the newly auto-imported statements
+      */
+      "code_actions_on_format": {
+        "source.fixAll.ruff": true,
+        "source.organizeImports.ruff": true,
+      },
+    },
+
+    "TypeScript": {
+      "language_servers": ["typescript-language-server", "biome"],
+      "formatter": { "language_server": { "name": "biome" } },
+      "format_on_save": "on",
+      "code_actions_on_format": {
+        "source.fixAll.biome": true,
+        "source.organizeImports.biome": true,
+      },
+    },
+    "TSX": {
+      "language_servers": ["typescript-language-server", "biome"],
+      "formatter": { "language_server": { "name": "biome" } },
+      "format_on_save": "on",
+      "code_actions_on_format": {
+        "source.fixAll.biome": true,
+        "source.organizeImports.biome": true,
+      },
+    },
+    "JavaScript": {
+      "language_servers": ["typescript-language-server", "biome"],
+      "formatter": { "language_server": { "name": "biome" } },
+      "format_on_save": "on",
+    },
+    "JSON": {
+      "formatter": { "language_server": { "name": "biome" } },
+      "format_on_save": "on",
+    },
+    "CSS": {
+      "formatter": { "language_server": { "name": "biome" } },
+      "format_on_save": "on",
+    },
+    "Make": {
+      "hard_tabs": true,
+      "tab_size": 4,
+    },
+  },
+}
