@@ -7,7 +7,9 @@ deps:
 start:
 	colima start \
 		--verbose \
-		--runtime=incus
+		--runtime=incus \
+		--memory 8 \
+		--cpu 4
 	$(MAKE) status
 
 .PHONY: status
