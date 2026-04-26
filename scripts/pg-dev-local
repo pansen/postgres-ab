@@ -109,14 +109,12 @@ cmd_down() {
 cmd_snapshot() {
     local name="${1:?Usage: pg-dev-local snapshot <name> [--force]}"
     shift
-    echo "==> Stopping $CONTAINER..."
-    incus stop "$CONTAINER" --force 2>/dev/null || true
     if [[ "${1:-}" == "--force" ]]; then
         incus snapshot delete "$CONTAINER" "$name" 2>/dev/null || true
     fi
+    incus pause "$CONTAINER"
     incus snapshot create "$CONTAINER" "$name"
-    echo "==> Starting $CONTAINER..."
-    incus start "$CONTAINER"
+    incus resume "$CONTAINER"
     echo "Snapshot '$name' created."
 }
 
