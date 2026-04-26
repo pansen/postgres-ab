@@ -8,7 +8,7 @@ start:
 	colima start \
 		--verbose \
 		--runtime=incus \
-		--memory 8 \
+		--memory 12 \
 		--cpu 4
 	$(MAKE) status
 
