@@ -3,13 +3,16 @@ deps:
 	HOMEBREW_NO_AUTO_UPDATE=1 brew install incus colima
 	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade incus colima
 
+-include .env
+export
+
 .PHONY: start
 start:
 	colima start \
 		--verbose \
 		--runtime=incus \
-		--memory 12 \
-		--cpu 4
+		--memory $(COLIMA_MEMORY) \
+		--cpu $(COLIMA_CPU)
 	$(MAKE) status
 
 .PHONY: status
