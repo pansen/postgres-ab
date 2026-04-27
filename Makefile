@@ -31,6 +31,7 @@ PG_DEV := scripts/pg-dev-local
 .PHONY: pg.up
 pg.up:
 	$(PG_DEV) up
+	$(MAKE) pg.logs
 
 .PHONY: pg.down
 pg.down:
@@ -75,6 +76,10 @@ pg.export:
 .PHONY: pg.import-last
 pg.import-last:
 	$(PG_DEV) import-last
+
+.PHONY: pg.logs
+pg.logs:
+	incus exec pg-dev -- tail -f /var/log/postgresql/postgresql-17-main.log
 
 .PHONY: delete
 delete:
