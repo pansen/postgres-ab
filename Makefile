@@ -1,7 +1,7 @@
 .PHONY: deps
 deps:
-	HOMEBREW_NO_AUTO_UPDATE=1 \
-		brew upgrade incus colima
+	HOMEBREW_NO_AUTO_UPDATE=1 brew install incus colima
+	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade incus colima
 
 .PHONY: start
 start:

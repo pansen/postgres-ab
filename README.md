@@ -1,3 +1,11 @@
+## Once
+
+```shell
+make deps
+```
+
+## Daily
+
 ```shell
 make pg.up
 make pg.export
