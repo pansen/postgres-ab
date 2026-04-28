@@ -8,9 +8,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
 
-PG_USER="${PG_USER:-dev}"
-PG_DB="${PG_DB:-dev}"
-PG_PASSWORD="${PG_PASSWORD:-dev}"
+PG_USER="${PG_USER}"
+PG_DB="${PG_DB}"
+PG_PASSWORD="${PG_PASSWORD}"
 
 cmd_up() {
     if incus info "$CONTAINER" > /dev/null 2>&1; then
