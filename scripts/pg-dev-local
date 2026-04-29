@@ -121,6 +121,27 @@ cmd_snapshot() {
 cmd_restore() {
     local name="${1:?Usage: pg-dev-local restore <name>}"
     incus stop "$CONTAINER" --force 2>/dev/null || true
+
+    # ZFS requires removing snapshots taken after the target before restoring.
+    local snapshots_after
+    snapshots_after=$(incus snapshot list "$CONTAINER" -f json \
+        | jq -r --arg name "$name" '
+            . as $all
+            | ($all | map(.name) | index($name)) as $idx
+            | if $idx == null then [] else $all[$idx+1:] end
+            | .[].name
+        ')
+    if [[ -n "$snapshots_after" ]]; then
+        echo "==> The following snapshots will be deleted to allow restore:"
+        echo "$snapshots_after" | sed 's/^/     /'
+        local reply
+        read -r -p "Continue? [Y/n] " reply
+        [[ "${reply:-Y}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+        while IFS= read -r snap; do
+            incus snapshot delete "$CONTAINER" "$snap"
+        done <<< "$snapshots_after"
+    fi
+
     incus snapshot restore "$CONTAINER" "$name"
     incus start "$CONTAINER"
     echo "Restored to snapshot '$name'."
