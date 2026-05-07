@@ -20,6 +20,9 @@ make deps
 # Start colima
 make pg.up
 
+# Create a snapshot
+make pg.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
+
 # List snapshots
 make pg.snapshots
 
