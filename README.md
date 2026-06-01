@@ -60,6 +60,12 @@ Port **5433** is the staging backend — the opposite slot. Useful for
 ad-hoc exploration of "the other dataset" or for verifying a dump
 mid-import.
 
+Overview command
+
+```shell
+make pg.ip pg.status pg.snapshots
+```
+
 ## Importing a fresh dump (the headline workflow)
 
 This is what this repo exists for. The import runs on staging through the
