@@ -1,7 +1,9 @@
+packages := incus colima jq
+
 .PHONY: deps
 deps:
-	HOMEBREW_NO_AUTO_UPDATE=1 brew install incus colima
-	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade incus colima
+	HOMEBREW_NO_AUTO_UPDATE=1 brew install $(packages)
+	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade $(packages)
 
 -include .env
 export
@@ -23,19 +25,49 @@ status:
 
 .PHONY: stop
 stop:
-	colima stop \
-		--verbose
+	colima stop --verbose
 
 PG_DEV := scripts/pg-dev-local
+
+# ----- lifecycle ----------------------------------------------------------
 
 .PHONY: pg.up
 pg.up:
 	$(PG_DEV) up
-	$(MAKE) pg.logs
 
 .PHONY: pg.down
 pg.down:
 	$(PG_DEV) down
+
+.PHONY: pg.status
+pg.status:
+	$(PG_DEV) status
+
+.PHONY: pg.endpoint
+pg.endpoint:
+	@$(PG_DEV) endpoint
+
+.PHONY: pg.promote
+pg.promote:
+	$(PG_DEV) promote
+
+# ----- active backend -----------------------------------------------------
+
+.PHONY: pg.psql
+pg.psql:
+	$(PG_DEV) psql
+
+.PHONY: pg.shell
+pg.shell:
+	$(PG_DEV) shell
+
+.PHONY: pg.ip
+pg.ip:
+	@$(PG_DEV) ip
+
+.PHONY: pg.logs
+pg.logs:
+	$(PG_DEV) logs
 
 .PHONY: pg.snapshot
 pg.snapshot:
@@ -53,21 +85,47 @@ pg.restore-last:
 pg.snapshots:
 	$(PG_DEV) snapshots
 
-.PHONY: pg.ip
-pg.ip:
-	$(PG_DEV) ip
+# ----- staging backend ----------------------------------------------------
 
-.PHONY: pg.psql
-pg.psql:
-	$(PG_DEV) psql
+.PHONY: pg.staging.psql
+pg.staging.psql:
+	$(PG_DEV) staging.psql
 
-.PHONY: pg.shell
-pg.shell:
-	$(PG_DEV) shell
+.PHONY: pg.staging.shell
+pg.staging.shell:
+	$(PG_DEV) staging.shell
 
-.PHONY: pg.status
-pg.status:
-	$(PG_DEV) status
+.PHONY: pg.staging.logs
+pg.staging.logs:
+	$(PG_DEV) staging.logs
+
+.PHONY: pg.staging.snapshot
+pg.staging.snapshot:
+	$(PG_DEV) staging.snapshot $(name) $(if $(force),--force,)
+
+.PHONY: pg.staging.restore
+pg.staging.restore:
+	$(PG_DEV) staging.restore $(name)
+
+.PHONY: pg.staging.restore-last
+pg.staging.restore-last:
+	$(PG_DEV) staging.restore-last
+
+.PHONY: pg.staging.reset
+pg.staging.reset:
+	$(PG_DEV) staging.reset
+
+# ----- bouncer ------------------------------------------------------------
+
+.PHONY: pg.bouncer.logs
+pg.bouncer.logs:
+	$(PG_DEV) bouncer.logs
+
+.PHONY: pg.bouncer.reload
+pg.bouncer.reload:
+	$(PG_DEV) bouncer.reload
+
+# ----- export / import (active backend) -----------------------------------
 
 .PHONY: pg.export
 pg.export:
@@ -77,9 +135,7 @@ pg.export:
 pg.import-last:
 	$(PG_DEV) import-last
 
-.PHONY: pg.logs
-pg.logs:
-	incus exec pg-dev -- tail -f /var/log/postgresql/postgresql-17-main.log
+# ----- colima ------------------------------------------------------------
 
 .PHONY: delete
 delete:

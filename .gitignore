@@ -1,2 +1,3 @@
 /.zed
 .env
+/var/active-slot

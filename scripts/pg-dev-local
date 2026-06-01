@@ -1,41 +1,145 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER=pg-dev
-IMAGE=images:ubuntu/24.04/cloud
+# pg-dev-local — two PostgreSQL backends behind a dual-listener pgbouncer.
+# See SPEC.md for the design.
+#
+#   pg-dev-a, pg-dev-b   long-lived backends with their own snapshot timelines
+#   pg-bouncer           one container, two pgbouncer instances:
+#                          :5432  active  (current data)
+#                          :5433  staging (import target / opposite of active)
+#                        cross-connect enforced by rendering both inis from
+#                        one state file (var/active-slot).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
 
-PG_USER="${PG_USER}"
-PG_DB="${PG_DB}"
-PG_PASSWORD="${PG_PASSWORD}"
+PG_USER="${PG_USER:?PG_USER must be set in .env}"
+PG_DB="${PG_DB:?PG_DB must be set in .env}"
+PG_PASSWORD="${PG_PASSWORD:?PG_PASSWORD must be set in .env}"
 
-cmd_up() {
-    if incus info "$CONTAINER" > /dev/null 2>&1; then
-        echo "Container '$CONTAINER' already exists. Use: pg-dev-local status"
+# Same secret for the bouncer admin user. Dev convenience: one .pgpass line
+# covers everything. SPEC.md says this loudly.
+PG_BOUNCER_ADMIN_PASSWORD="$PG_PASSWORD"
+
+IMAGE=images:ubuntu/24.04/cloud
+BACKEND_PREFIX=pg-dev
+BACKEND_A="${BACKEND_PREFIX}-a"
+BACKEND_B="${BACKEND_PREFIX}-b"
+BOUNCER=pg-bouncer
+STATE_DIR="$REPO_ROOT/var"
+STATE_FILE="$STATE_DIR/active-slot"
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+_active()    { cat "$STATE_FILE" 2>/dev/null || echo a; }
+_staging()   { [[ "$(_active)" == a ]] && echo b || echo a; }
+_c_active()  { echo "${BACKEND_PREFIX}-$(_active)"; }
+_c_staging() { echo "${BACKEND_PREFIX}-$(_staging)"; }
+
+_set_active() {
+    local new="$1"
+    mkdir -p "$STATE_DIR"
+    local tmp
+    tmp="$(mktemp "$STATE_FILE.XXXXXX")"
+    printf '%s\n' "$new" > "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Bouncer helpers
+# ---------------------------------------------------------------------------
+
+_bouncer_ip() {
+    incus list "$BOUNCER" --format csv -c 4 \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -1
+}
+
+# Derive a stable IP for the bouncer in the incusbr0 subnet (e.g. 10.x.x.10),
+# unless PG_BOUNCER_IP is set in .env.
+_pick_bouncer_ip() {
+    if [[ -n "${PG_BOUNCER_IP:-}" ]]; then
+        echo "$PG_BOUNCER_IP"
+        return
+    fi
+    local addr
+    addr=$(incus network get incusbr0 ipv4.address 2>/dev/null || true)
+    if [[ -z "$addr" || "$addr" == "none" ]]; then
+        echo "ERROR: cannot read incusbr0 ipv4.address; set PG_BOUNCER_IP in .env" >&2
         exit 1
     fi
+    # addr like "10.224.165.1/24"  →  prefix "10.224.165"  →  pick .10
+    local prefix=${addr%.*}
+    prefix=${prefix%%/*}
+    echo "${prefix}.10"
+}
 
-    echo "==> Launching $CONTAINER (may take a minute if image is not cached)..."
-    incus launch --verbose "$IMAGE" "$CONTAINER"
+# _bouncer_admin <role: active|staging> <SQL...>
+# Admin access is the special `pgbouncer` virtual database on the same
+# listen_port as data — pgbouncer doesn't expose a separate admin port.
+_bouncer_admin() {
+    local role="$1"; shift
+    local port
+    case "$role" in
+        active)  port=5432 ;;
+        staging) port=5433 ;;
+        *) echo "bad role: $role" >&2; exit 1 ;;
+    esac
+    incus exec "$BOUNCER" -- env PGPASSWORD="$PG_BOUNCER_ADMIN_PASSWORD" \
+        psql -h 127.0.0.1 -p "$port" -U pgb_admin -d pgbouncer -c "$*"
+}
 
-    echo "==> Waiting for IPv4 address..."
-    until incus list "$CONTAINER" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
+# _render_ini <role: active|staging> <listen_port> <backend container name>
+_render_ini() {
+    local role="$1" port="$2" backend="$3"
+    incus exec "$BOUNCER" -- tee "/etc/pgbouncer/${role}.ini" > /dev/null <<EOF
+;; rendered by pg-dev-local — do not edit by hand
+[databases]
+${PG_DB} = host=${backend} dbname=${PG_DB}
+
+[pgbouncer]
+listen_addr = *
+listen_port = ${port}
+unix_socket_dir = /var/run/pgbouncer-${role}
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+admin_users = pgb_admin
+stats_users = pgb_admin
+pool_mode = session
+server_reset_query = DISCARD ALL
+ignore_startup_parameters = extra_float_digits,statement_timeout,lock_timeout,idle_in_transaction_session_timeout,search_path,default_transaction_isolation,default_transaction_read_only,default_transaction_deferrable
+logfile = /var/log/pgbouncer/${role}.log
+pidfile = /var/run/pgbouncer/${role}.pid
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Provisioning
+# ---------------------------------------------------------------------------
+
+_provision_backend() {
+    local container="$1"
+
+    echo "==> Launching $container..."
+    incus launch --verbose "$IMAGE" "$container"
+
+    echo "==> Waiting for IPv4 on $container..."
+    until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
         sleep 2
     done
 
-    echo "==> Installing PostgreSQL 17..."
-    incus exec --verbose "$CONTAINER" -- bash << 'SETUP'
+    echo "==> Installing PostgreSQL 17 on $container..."
+    incus exec --verbose "$container" -- bash <<'SETUP'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-echo "--- Installing prerequisites ---"
 apt-get update -q
 apt-get install -y curl gnupg lsb-release
 
-echo "--- Adding PGDG repository ---"
 curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
     | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
 echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
@@ -43,10 +147,8 @@ echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main"
 apt-get update -q
 apt-get install -y --no-install-recommends postgresql-17
 
-echo "--- Writing configuration ---"
 mkdir -p /etc/postgresql/17/main/conf.d
-
-cat > /etc/postgresql/17/main/conf.d/99-dev.conf << 'PGCONF'
+cat > /etc/postgresql/17/main/conf.d/99-dev.conf <<'PGCONF'
 listen_addresses = '*'
 dynamic_shared_memory_type = mmap
 
@@ -75,170 +177,474 @@ deadlock_timeout = 100
 debug_pretty_print = on
 PGCONF
 
-cat > /etc/postgresql/17/main/pg_hba.conf << 'PGHBA'
+cat > /etc/postgresql/17/main/pg_hba.conf <<'PGHBA'
 local   all   postgres                peer
 local   all   all                     md5
 host    all   all   0.0.0.0/0         scram-sha-256
 host    all   all   ::/0              scram-sha-256
 PGHBA
 
-echo "--- Starting PostgreSQL ---"
 systemctl restart postgresql@17-main
 SETUP
 
-    echo "==> Creating role '$PG_USER' and database '$PG_DB'..."
-    incus exec --verbose "$CONTAINER" -- su -c psql postgres << SQL
+    echo "==> Creating role '$PG_USER' and database '$PG_DB' on $container..."
+    incus exec --verbose "$container" -- su -c psql postgres <<SQL
 CREATE ROLE "$PG_USER" WITH LOGIN PASSWORD '$PG_PASSWORD' SUPERUSER;
 CREATE DATABASE "$PG_DB" OWNER "$PG_USER";
 SQL
 
-    local ip
-    ip=$(cmd_ip)
-    echo ""
-    echo "==> PostgreSQL ready"
-    echo "    host (container):  $ip"
-    echo "    user:              $PG_USER"
-    echo "    database:          $PG_DB"
-    echo "    incus exec $CONTAINER -- psql -U $PG_USER $PG_DB"
+    echo "==> Snapshotting $container @ initial..."
+    incus pause "$container"
+    incus snapshot create "$container" initial
+    incus resume "$container"
+}
+
+_provision_bouncer() {
+    local bouncer_ip="$1"
+
+    echo "==> Launching $BOUNCER..."
+    incus launch --verbose "$IMAGE" "$BOUNCER"
+
+    echo "==> Waiting for IPv4 on $BOUNCER..."
+    until incus list "$BOUNCER" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
+        sleep 2
+    done
+
+    echo "==> Pinning $BOUNCER eth0 → $bouncer_ip..."
+    incus config device override "$BOUNCER" eth0 ipv4.address="$bouncer_ip"
+    incus restart "$BOUNCER"
+    until incus list "$BOUNCER" --format csv -c 4 | grep -q "$bouncer_ip"; do
+        sleep 1
+    done
+
+    echo "==> Installing pgbouncer + psql client on $BOUNCER..."
+    incus exec --verbose "$BOUNCER" -- bash <<'SETUP'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -q
+apt-get install -y --no-install-recommends pgbouncer postgresql-client
+
+# The Debian package ships a single-instance unit. We replace it with a
+# template so we can run active and staging side by side.
+systemctl disable --now pgbouncer.service 2>/dev/null || true
+
+mkdir -p /var/run/pgbouncer-active /var/run/pgbouncer-staging \
+         /var/run/pgbouncer /var/log/pgbouncer
+chown postgres:postgres /var/run/pgbouncer-active /var/run/pgbouncer-staging \
+                        /var/run/pgbouncer /var/log/pgbouncer
+
+cat > /etc/systemd/system/pgbouncer@.service <<'UNIT'
+[Unit]
+Description=pgbouncer (%i instance)
+After=network.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/sbin/pgbouncer /etc/pgbouncer/%i.ini
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+SETUP
+
+    echo "==> Writing userlist.txt..."
+    incus exec "$BOUNCER" -- tee /etc/pgbouncer/userlist.txt > /dev/null <<EOF
+"$PG_USER" "$PG_PASSWORD"
+"pgb_admin" "$PG_BOUNCER_ADMIN_PASSWORD"
+EOF
+    incus exec "$BOUNCER" -- chown postgres:postgres /etc/pgbouncer/userlist.txt
+    incus exec "$BOUNCER" -- chmod 640 /etc/pgbouncer/userlist.txt
+
+    echo "==> Rendering pgbouncer inis (active→$BACKEND_A, staging→$BACKEND_B)..."
+    _render_ini active  5432 "$BACKEND_A"
+    _render_ini staging 5433 "$BACKEND_B"
+
+    echo "==> Enabling and starting pgbouncer@{active,staging}..."
+    incus exec "$BOUNCER" -- systemctl enable --now \
+        pgbouncer@active pgbouncer@staging
+
+    # Tiny readiness probe.
+    local tries=0
+    until _bouncer_admin active "SHOW VERSION;" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if (( tries > 20 )); then
+            echo "ERROR: pgbouncer@active not responding on :5432" >&2
+            incus exec "$BOUNCER" -- journalctl -u pgbouncer@active --no-pager | tail -n 40 >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    tries=0
+    until _bouncer_admin staging "SHOW VERSION;" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if (( tries > 20 )); then
+            echo "ERROR: pgbouncer@staging not responding on :5433" >&2
+            incus exec "$BOUNCER" -- journalctl -u pgbouncer@staging --no-pager | tail -n 40 >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle commands
+# ---------------------------------------------------------------------------
+
+cmd_up() {
+    if incus info pg-dev > /dev/null 2>&1; then
+        cat <<MSG
+NOTE: a legacy 'pg-dev' container exists alongside this setup. It won't
+conflict — the new system uses pg-dev-a, pg-dev-b, pg-bouncer — but it
+will sit there using disk/memory until you delete it:
+
+    incus delete pg-dev --force
+
+Continuing in 1s...
+MSG
+        sleep 1
+    fi
+
+    for c in "$BACKEND_A" "$BACKEND_B" "$BOUNCER"; do
+        if incus info "$c" > /dev/null 2>&1; then
+            echo "Container '$c' already exists — run '$0 down' first."
+            exit 1
+        fi
+    done
+
+    local bouncer_ip
+    bouncer_ip=$(_pick_bouncer_ip)
+    echo "==> pg-bouncer will be pinned to $bouncer_ip"
+
+    _provision_backend "$BACKEND_A"
+    _provision_backend "$BACKEND_B"
+    _provision_bouncer "$bouncer_ip"
+
+    _set_active a
+
+    echo
+    echo "==> pg-dev ready."
+    echo
+    cmd_endpoint
 }
 
 cmd_down() {
-    incus delete "$CONTAINER" --force
+    for c in "$BOUNCER" "$BACKEND_A" "$BACKEND_B"; do
+        incus delete "$c" --force 2>/dev/null || true
+    done
+    rm -f "$STATE_FILE"
 }
 
-cmd_snapshot() {
-    local name="${1:?Usage: pg-dev-local snapshot <name> [--force]}"
-    shift
-    if [[ "${1:-}" == "--force" ]]; then
-        incus snapshot delete "$CONTAINER" "$name" 2>/dev/null || true
+cmd_status() {
+    local a s
+    a=$(_active); s=$(_staging)
+    echo "active slot: $a   (active = ${BACKEND_PREFIX}-${a}, staging = ${BACKEND_PREFIX}-${s})"
+    echo
+    incus list '^(pg-dev-(a|b)|pg-bouncer)$'
+}
+
+cmd_endpoint() {
+    local ip
+    ip=$(_bouncer_ip)
+    if [[ -z "$ip" ]]; then
+        echo "ERROR: pg-bouncer has no IP — is it running?" >&2
+        exit 1
     fi
-    incus pause "$CONTAINER"
-    incus snapshot create "$CONTAINER" "$name"
-    incus resume "$CONTAINER"
-    echo "Snapshot '$name' created."
+    cat <<EOF
+active   host=$ip port=5432 dbname=$PG_DB   (current data)
+staging  host=$ip port=5433 dbname=$PG_DB   (import target / opposite of active)
+
+.pgpass line (one line, covers both ports):
+    $ip:*:*:$PG_USER:$PG_PASSWORD
+EOF
 }
 
-cmd_restore() {
-    local name="${1:?Usage: pg-dev-local restore <name>}"
-    incus stop "$CONTAINER" --force 2>/dev/null || true
+cmd_promote() {
+    local from to
+    from=$(_active)
+    to=$(_staging)
+
+    echo "==> Promoting: active $from → $to"
+
+    # PAUSE drains in-flight transactions; admin commands themselves are
+    # unaffected, so we can still RELOAD / RESUME while paused.
+    _bouncer_admin active  "PAUSE $PG_DB;"  >/dev/null
+    _bouncer_admin staging "PAUSE $PG_DB;"  >/dev/null
+
+    _render_ini active  5432 "${BACKEND_PREFIX}-${to}"
+    _render_ini staging 5433 "${BACKEND_PREFIX}-${from}"
+
+    _bouncer_admin active  "RELOAD;"        >/dev/null
+    _bouncer_admin staging "RELOAD;"        >/dev/null
+    _bouncer_admin active  "RESUME $PG_DB;" >/dev/null
+    _bouncer_admin staging "RESUME $PG_DB;" >/dev/null
+
+    _set_active "$to"
+
+    echo "==> Promoted. Active: ${BACKEND_PREFIX}-${to}   Staging: ${BACKEND_PREFIX}-${from}"
+    echo
+    cmd_status
+}
+
+# ---------------------------------------------------------------------------
+# Per-slot ops
+# ---------------------------------------------------------------------------
+
+_snapshot() {
+    local container="$1" name="$2" force="${3:-}"
+    if [[ "$force" == "--force" ]]; then
+        incus snapshot delete "$container" "$name" 2>/dev/null || true
+    fi
+    incus pause "$container"
+    incus snapshot create "$container" "$name"
+    incus resume "$container"
+    echo "Snapshot '$name' created on $container."
+}
+
+_restore() {
+    local container="$1" name="$2"
+    incus stop "$container" --force 2>/dev/null || true
 
     # ZFS requires removing snapshots taken after the target before restoring.
-    local snapshots_after
-    snapshots_after=$(incus snapshot list "$CONTAINER" -f json \
+    local after
+    after=$(incus snapshot list "$container" -f json \
         | jq -r --arg name "$name" '
             . as $all
             | ($all | map(.name) | index($name)) as $idx
             | if $idx == null then [] else $all[$idx+1:] end
             | .[].name
         ')
-    if [[ -n "$snapshots_after" ]]; then
-        echo "==> The following snapshots will be deleted to allow restore:"
-        echo "$snapshots_after" | sed 's/^/     /'
+    if [[ -n "$after" ]]; then
+        echo "==> Snapshots on $container that will be deleted:"
+        echo "$after" | sed 's/^/     /'
         local reply
         read -r -p "Continue? [Y/n] " reply
         [[ "${reply:-Y}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
         while IFS= read -r snap; do
-            incus snapshot delete "$CONTAINER" "$snap"
-        done <<< "$snapshots_after"
+            incus snapshot delete "$container" "$snap"
+        done <<< "$after"
     fi
 
-    incus snapshot restore "$CONTAINER" "$name"
-    incus start "$CONTAINER"
-    echo "Restored to snapshot '$name'."
+    incus snapshot restore "$container" "$name"
+    incus start "$container"
+    echo "Restored $container to snapshot '$name'."
 }
 
-cmd_restore_last() {
+_restore_last() {
+    local container="$1"
     local name
-    name=$(incus snapshot list "$CONTAINER" -f json \
+    name=$(incus snapshot list "$container" -f json \
         | jq -r 'if length == 0 then empty else sort_by(.created_at) | last | .name end')
     if [[ -z "$name" ]]; then
-        echo "No snapshots found for '$CONTAINER'."
+        echo "No snapshots on $container."
         exit 1
     fi
-    echo "==> Restoring to most recent snapshot: $name"
-    cmd_restore "$name"
+    echo "==> Restoring $container to most recent snapshot: $name"
+    _restore "$container" "$name"
 }
 
+# active slot
+cmd_snapshot() {
+    local name="${1:?Usage: snapshot <name> [--force]}"; shift || true
+    _snapshot "$(_c_active)" "$name" "${1:-}"
+}
+cmd_restore() {
+    local name="${1:?Usage: restore <name>}"
+    _restore "$(_c_active)" "$name"
+}
+cmd_restore_last() { _restore_last "$(_c_active)"; }
+
+# Unified listing for both slots.
 cmd_snapshots() {
-    if [[ "${1:-}" == "--json" ]]; then
-        incus snapshot list "$CONTAINER" -f json
-    else
-        incus snapshot list "$CONTAINER"
-    fi
+    local a s
+    a=$(_active); s=$(_staging)
+    echo "─── active  (${BACKEND_PREFIX}-${a}) ───"
+    incus snapshot list "${BACKEND_PREFIX}-${a}"
+    echo
+    echo "─── staging (${BACKEND_PREFIX}-${s}) ───"
+    incus snapshot list "${BACKEND_PREFIX}-${s}"
 }
 
-cmd_ip() {
-    incus list "$CONTAINER" --format csv -c 4 \
+# staging slot
+cmd_staging_snapshot() {
+    local name="${1:?Usage: staging.snapshot <name> [--force]}"; shift || true
+    _snapshot "$(_c_staging)" "$name" "${1:-}"
+}
+cmd_staging_restore() {
+    local name="${1:?Usage: staging.restore <name>}"
+    _restore "$(_c_staging)" "$name"
+}
+cmd_staging_restore_last() { _restore_last "$(_c_staging)"; }
+cmd_staging_reset()        { _restore "$(_c_staging)" initial; }
+
+# Shell / psql / ip / logs, per slot.
+_psql() {
+    local container="$1"; shift
+    incus exec "$container" -- env PGPASSWORD="$PG_PASSWORD" \
+        psql -U "$PG_USER" "$PG_DB" "$@"
+}
+cmd_psql()         { _psql "$(_c_active)"  "$@"; }
+cmd_staging_psql() { _psql "$(_c_staging)" "$@"; }
+
+cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
+cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
+
+_ip() {
+    incus list "$1" --format csv -c 4 \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
         | head -1
 }
 
-cmd_psql() {
-    # Container IPs are on the incus bridge inside the Lima VM and are not
-    # directly routable from macOS, so we exec psql inside the container.
-    incus exec "$CONTAINER" -- env PGPASSWORD="$PG_PASSWORD" psql -U "$PG_USER" "$PG_DB" "$@"
+# Unified port + backend view for both slots. The bouncer endpoint
+# (host:port) is the client-facing fact; the backend container name and
+# its container IP are shown for ops/debugging context.
+cmd_ip() {
+    local a s ip_a ip_s bouncer_ip
+    a=$(_active); s=$(_staging)
+    ip_a=$(_ip "${BACKEND_PREFIX}-${a}")
+    ip_s=$(_ip "${BACKEND_PREFIX}-${s}")
+    bouncer_ip=$(_bouncer_ip)
+    printf '%-8s  %-22s  →  %-10s (%s)\n' \
+        active  "${bouncer_ip}:5432" "${BACKEND_PREFIX}-${a}" "$ip_a"
+    printf '%-8s  %-22s  →  %-10s (%s)\n' \
+        staging "${bouncer_ip}:5433" "${BACKEND_PREFIX}-${s}" "$ip_s"
 }
 
-cmd_shell() {
-    incus exec "$CONTAINER" -- bash
+cmd_logs()         { incus exec "$(_c_active)"  -- tail -f /var/log/postgresql/postgresql-17-main.log; }
+cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/postgresql-17-main.log; }
+
+cmd_bouncer_logs() {
+    incus exec "$BOUNCER" -- \
+        tail -f /var/log/pgbouncer/active.log /var/log/pgbouncer/staging.log
 }
 
-cmd_status() {
-    incus list "$CONTAINER"
+cmd_bouncer_reload() {
+    # Re-render both inis from the current pointer state, then RELOAD both
+    # pgbouncer instances. Useful after a config change to _render_ini.
+    local a s
+    a=$(_active); s=$(_staging)
+    _render_ini active  5432 "${BACKEND_PREFIX}-${a}"
+    _render_ini staging 5433 "${BACKEND_PREFIX}-${s}"
+    _bouncer_admin active  "RELOAD;" >/dev/null
+    _bouncer_admin staging "RELOAD;" >/dev/null
+    echo "Reloaded pgbouncer@active and pgbouncer@staging."
 }
+
+# ---------------------------------------------------------------------------
+# Export / import (operate on the active backend)
+# ---------------------------------------------------------------------------
 
 cmd_export() {
-    local file="$REPO_ROOT/var/pg-dev-$(date +%Y-%m-%dT%H:%M:%S).tar.gz"
-    echo "==> Freezing $CONTAINER for consistent export..."
-    incus pause "$CONTAINER"
-    incus export "$CONTAINER" "$file"
-    incus resume "$CONTAINER"
+    mkdir -p "$REPO_ROOT/var"
+    local container
+    container=$(_c_active)
+    local file
+    file="$REPO_ROOT/var/${container}-$(date +%Y-%m-%dT%H-%M-%S).tar.gz"
+    echo "==> Pausing $container for consistent export..."
+    incus pause "$container"
+    incus export "$container" "$file"
+    incus resume "$container"
     echo "Exported to $file"
 }
 
 cmd_import_last() {
+    local container
+    container=$(_c_active)
     local file
-    file=$(ls -t "$REPO_ROOT/var/pg-dev-"*.tar.gz 2>/dev/null | head -1)
+    file=$(ls -t "$REPO_ROOT/var/${container}-"*.tar.gz 2>/dev/null | head -1)
     if [[ -z "$file" ]]; then
-        echo "No export found in var/ — run 'make pg.export' first"
+        echo "No export found for $container in var/."
         exit 1
     fi
     echo "==> Importing from $file..."
+    incus delete "$container" --force 2>/dev/null || true
     incus import "$file"
-    incus start "$CONTAINER"
-    echo "Imported and started $CONTAINER"
+    incus start "$container"
+    echo "Imported and started $container"
 }
 
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
 usage() {
-    echo "Usage: pg-dev-local <command> [args]"
-    echo ""
-    echo "Commands:"
-    echo "  up                          launch container and install PostgreSQL"
-    echo "  down                        delete container"
-    echo "  snapshot <name> [--force]   create a named snapshot (--force overwrites existing)"
-    echo "  restore  <name>             restore container to a snapshot"
-    echo "  restore-last                restore to the most recent snapshot"
-    echo "  snapshots                   list snapshots"
-    echo "  ip                          print container IP"
-    echo "  psql [args]                 open psql session inside container"
-    echo "  shell                       open a bash shell in the container"
-    echo "  status                      show container state"
-    echo "  export                      export container to var/pg-dev-<timestamp>.tar.gz"
-    echo "  import-last                 import most recent export from var/"
+    cat <<EOF
+Usage: $(basename "$0") <command> [args]
+
+Lifecycle:
+  up                              provision pg-dev-a, pg-dev-b, pg-bouncer
+  down                            delete all three containers
+  status                          show pointer + container states
+  endpoint                        print bouncer host/port roles + .pgpass line
+  promote                         flip active↔staging on both bouncer instances
+
+Both slots (rendered side by side):
+  ip                              bouncer endpoint → backend, for both slots
+  snapshots                       snapshot lists for active and staging
+
+Active slot (whatever is currently active):
+  psql [args]                     psql via incus exec into active backend
+  shell                           bash into active backend
+  logs                            tail postgres logs on active backend
+  snapshot <name> [--force]       create a snapshot on active backend
+  restore <name>                  restore active backend to a snapshot
+  restore-last                    restore active backend to its most recent snapshot
+
+Staging slot (the other one):
+  staging.psql [args]
+  staging.shell
+  staging.logs
+  staging.snapshot <name> [--force]
+  staging.restore <name>
+  staging.restore-last
+  staging.reset                   shortcut: restore staging to 'initial'
+
+Bouncer:
+  bouncer.logs                    tail both pgbouncer logs
+  bouncer.reload                  re-render both inis from state and RELOAD
+
+Export / import (act on the active backend):
+  export                          export active backend to var/<name>-<ts>.tar.gz
+  import-last                     re-import most recent export of active backend
+EOF
 }
 
 case "${1:-}" in
-    up)           shift; cmd_up "$@" ;;
-    down)         shift; cmd_down "$@" ;;
-    snapshot)     shift; cmd_snapshot "$@" ;;
-    restore)      shift; cmd_restore "$@" ;;
-    restore-last) shift; cmd_restore_last "$@" ;;
-    snapshots)    shift; cmd_snapshots "$@" ;;
-    ip)           shift; cmd_ip "$@" ;;
-    psql)         shift; cmd_psql "$@" ;;
-    shell)        shift; cmd_shell "$@" ;;
-    status)       shift; cmd_status "$@" ;;
-    export)       shift; cmd_export "$@" ;;
-    import-last)  shift; cmd_import_last "$@" ;;
-    *)            usage; exit 1 ;;
+    up)             shift; cmd_up "$@" ;;
+    down)           shift; cmd_down "$@" ;;
+    status)         shift; cmd_status "$@" ;;
+    endpoint)       shift; cmd_endpoint "$@" ;;
+    promote)        shift; cmd_promote "$@" ;;
+
+    psql)           shift; cmd_psql "$@" ;;
+    shell)          shift; cmd_shell "$@" ;;
+    ip)             shift; cmd_ip "$@" ;;
+    logs)           shift; cmd_logs "$@" ;;
+    snapshot)       shift; cmd_snapshot "$@" ;;
+    restore)        shift; cmd_restore "$@" ;;
+    restore-last)   shift; cmd_restore_last "$@" ;;
+    snapshots)      shift; cmd_snapshots "$@" ;;
+
+    staging.psql)         shift; cmd_staging_psql "$@" ;;
+    staging.shell)        shift; cmd_staging_shell "$@" ;;
+    staging.logs)         shift; cmd_staging_logs "$@" ;;
+    staging.snapshot)     shift; cmd_staging_snapshot "$@" ;;
+    staging.restore)      shift; cmd_staging_restore "$@" ;;
+    staging.restore-last) shift; cmd_staging_restore_last "$@" ;;
+    staging.reset)        shift; cmd_staging_reset "$@" ;;
+
+    bouncer.logs)   shift; cmd_bouncer_logs "$@" ;;
+    bouncer.reload) shift; cmd_bouncer_reload "$@" ;;
+
+    export)         shift; cmd_export "$@" ;;
+    import-last)    shift; cmd_import_last "$@" ;;
+
+    ""|-h|--help)   usage ;;
+    *)              usage; exit 1 ;;
 esac
