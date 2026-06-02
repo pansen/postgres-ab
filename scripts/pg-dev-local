@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# set -x
 
 # pg-dev-local — two PostgreSQL backends behind a dual-listener pgbouncer.
 # See SPEC.md for the design.
@@ -54,9 +55,16 @@ _set_active() {
 # ---------------------------------------------------------------------------
 
 _bouncer_ip() {
-    incus list "$BOUNCER" --format csv -c 4 \
+    # Empty if pg-bouncer has no IPv4 (e.g. it's stopped). `|| true` so
+    # pipefail doesn't trip on grep finding nothing.
+    incus list "$BOUNCER" --format csv -c 4 2>/dev/null \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1
+        | head -1 || true
+}
+
+# RUNNING / STOPPED / FROZEN / … — empty if the container doesn't exist.
+_state() {
+    incus list "$1" --format csv -c s 2>/dev/null | head -n1 || true
 }
 
 # Derive a stable IP for the bouncer in the incusbr0 subnet (e.g. 10.x.x.10),
@@ -496,24 +504,43 @@ cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
 cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
 
 _ip() {
-    incus list "$1" --format csv -c 4 \
+    # Empty if container has no IPv4 (stopped, frozen, just-launched).
+    incus list "$1" --format csv -c 4 2>/dev/null \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1
+        | head -1 || true
+}
+
+# IPv4 when running; otherwise the lifecycle state (STOPPED, FROZEN, …).
+_ip_or_state() {
+    local container="$1" ip
+    ip=$(_ip "$container")
+    if [[ -n "$ip" ]]; then
+        echo "$ip"
+    else
+        echo "$(_state "$container")"
+    fi
 }
 
 # Unified port + backend view for both slots. The bouncer endpoint
-# (host:port) is the client-facing fact; the backend container name and
-# its container IP are shown for ops/debugging context.
+# (host:port) is the client-facing fact; the backend column shows its
+# container IP when running, or its state (STOPPED, …) when not.
 cmd_ip() {
-    local a s ip_a ip_s bouncer_ip
+    local a s info_a info_s bouncer_ip endpoint_a endpoint_s
     a=$(_active); s=$(_staging)
-    ip_a=$(_ip "${BACKEND_PREFIX}-${a}")
-    ip_s=$(_ip "${BACKEND_PREFIX}-${s}")
+    info_a=$(_ip_or_state "${BACKEND_PREFIX}-${a}")
+    info_s=$(_ip_or_state "${BACKEND_PREFIX}-${s}")
     bouncer_ip=$(_bouncer_ip)
+    if [[ -n "$bouncer_ip" ]]; then
+        endpoint_a="${bouncer_ip}:5432"
+        endpoint_s="${bouncer_ip}:5433"
+    else
+        endpoint_a="pg-bouncer $(_state "$BOUNCER")"
+        endpoint_s="pg-bouncer $(_state "$BOUNCER")"
+    fi
     printf '%-8s  %-22s  →  %-10s (%s)\n' \
-        active  "${bouncer_ip}:5432" "${BACKEND_PREFIX}-${a}" "$ip_a"
+        active  "$endpoint_a" "${BACKEND_PREFIX}-${a}" "$info_a"
     printf '%-8s  %-22s  →  %-10s (%s)\n' \
-        staging "${bouncer_ip}:5433" "${BACKEND_PREFIX}-${s}" "$ip_s"
+        staging "$endpoint_s" "${BACKEND_PREFIX}-${s}" "$info_s"
 }
 
 cmd_logs()         { incus exec "$(_c_active)"  -- tail -f /var/log/postgresql/postgresql-17-main.log; }
