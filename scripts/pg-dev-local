@@ -108,6 +108,7 @@ _render_ini() {
 ;; rendered by pg-dev-local — do not edit by hand
 [databases]
 ${PG_DB} = host=${backend} dbname=${PG_DB}
+* = host=${backend}
 
 [pgbouncer]
 listen_addr = *
