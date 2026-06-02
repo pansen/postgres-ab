@@ -73,21 +73,25 @@ bouncer; the active backend keeps serving live queries the entire time.
 
 ```shell
 # 1. Wipe staging back to its clean `initial` snapshot.
-make pg.staging.reset
+$ make pg.staging.reset
+scripts/pg-dev-local staging.reset
+==> Snapshots on pg-dev-a that will be deleted:
+     2026-06-01T17-20-21_dump_import
+Continue? [Y/n]
 
 # 2. Restore the dump through the bouncer's staging port (:5433).
-pg_restore --host=<bouncer-ip> --port=5433 --dbname=$PG_DB \
+$ pg_restore --host=<bouncer-ip> --port=5433 --dbname=$PG_DB \
            --jobs=4 your-dump.pgdump          # ~90 min, no blocking
 
 # 3. Sanity-check the loaded data while still on staging.
-psql -h <bouncer-ip> -p 5433 -d $PG_DB -c '\dt'
+$ psql -h <bouncer-ip> -p 5433 -d $PG_DB -c '\dt'
 
 # 4. Checkpoint the loaded state on the staging slot.
-make pg.staging.snapshot name=initial-loaded
+$ pg.staging.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
 
 # 5. Promote. Sub-second; clients keep their TCP connections through the
 #    bouncer; the dataset underneath flips.
-make pg.promote
+$ make pg.promote
 ```
 
 After `pg.promote`, apps on :5432 see the freshly imported data. The
