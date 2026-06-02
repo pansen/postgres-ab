@@ -115,6 +115,14 @@ pg.staging.restore-last:
 pg.staging.reset:
 	$(PG_DEV) staging.reset
 
+.PHONY: pg.staging.stop
+pg.staging.stop:
+	$(PG_DEV) staging.stop
+
+.PHONY: pg.staging.start
+pg.staging.start:
+	$(PG_DEV) staging.start
+
 # ----- bouncer ------------------------------------------------------------
 
 .PHONY: pg.bouncer.logs

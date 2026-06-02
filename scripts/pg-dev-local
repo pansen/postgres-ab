@@ -491,6 +491,8 @@ cmd_staging_restore() {
 }
 cmd_staging_restore_last() { _restore_last "$(_c_staging)"; }
 cmd_staging_reset()        { _restore "$(_c_staging)" initial; }
+cmd_staging_stop()         { incus stop "$(_c_staging)"; }
+cmd_staging_start()        { incus start "$(_c_staging)"; }
 
 # Shell / psql / ip / logs, per slot.
 _psql() {
@@ -632,6 +634,8 @@ Staging slot (the other one):
   staging.restore <name>
   staging.restore-last
   staging.reset                   shortcut: restore staging to 'initial'
+  staging.stop                    stop staging backend
+  staging.start                   start staging backend
 
 Bouncer:
   bouncer.logs                    tail both pgbouncer logs
@@ -666,6 +670,8 @@ case "${1:-}" in
     staging.restore)      shift; cmd_staging_restore "$@" ;;
     staging.restore-last) shift; cmd_staging_restore_last "$@" ;;
     staging.reset)        shift; cmd_staging_reset "$@" ;;
+    staging.stop)         shift; cmd_staging_stop "$@" ;;
+    staging.start)        shift; cmd_staging_start "$@" ;;
 
     bouncer.logs)   shift; cmd_bouncer_logs "$@" ;;
     bouncer.reload) shift; cmd_bouncer_reload "$@" ;;
