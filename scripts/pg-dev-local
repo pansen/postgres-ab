@@ -238,10 +238,19 @@ apt-get install -y --no-install-recommends pgbouncer postgresql-client
 # template so we can run active and staging side by side.
 systemctl disable --now pgbouncer.service 2>/dev/null || true
 
-mkdir -p /var/run/pgbouncer-active /var/run/pgbouncer-staging \
-         /var/run/pgbouncer /var/log/pgbouncer
-chown postgres:postgres /var/run/pgbouncer-active /var/run/pgbouncer-staging \
-                        /var/run/pgbouncer /var/log/pgbouncer
+# /var/run is tmpfs and wiped on every boot, so a one-time mkdir wouldn't
+# survive a container/VM restart — pgbouncer would then fail to create its
+# unix socket and exit. Declare the socket/pid dirs via tmpfiles.d so systemd
+# recreates them on every boot. /var/log is persistent, so a mkdir is fine.
+cat > /etc/tmpfiles.d/pgbouncer-dev.conf <<'TMPFILES'
+d /run/pgbouncer          0755 postgres postgres -
+d /run/pgbouncer-active   0755 postgres postgres -
+d /run/pgbouncer-staging  0755 postgres postgres -
+TMPFILES
+systemd-tmpfiles --create /etc/tmpfiles.d/pgbouncer-dev.conf
+
+mkdir -p /var/log/pgbouncer
+chown postgres:postgres /var/log/pgbouncer
 
 cat > /etc/systemd/system/pgbouncer@.service <<'UNIT'
 [Unit]
