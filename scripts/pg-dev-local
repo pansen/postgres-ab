@@ -67,6 +67,18 @@ _state() {
     incus list "$1" --format csv -c s 2>/dev/null | head -n1 || true
 }
 
+# The /24 prefix of incusbr0, e.g. "10.224.165" from "10.224.165.1/24".
+_incusbr0_prefix() {
+    local addr
+    addr=$(incus network get incusbr0 ipv4.address 2>/dev/null || true)
+    if [[ -z "$addr" || "$addr" == "none" ]]; then
+        echo "ERROR: cannot read incusbr0 ipv4.address; set the IPs explicitly in .env" >&2
+        exit 1
+    fi
+    local prefix=${addr%.*}
+    echo "${prefix%%/*}"
+}
+
 # Derive a stable IP for the bouncer in the incusbr0 subnet (e.g. 10.x.x.10),
 # unless PG_BOUNCER_IP is set in .env.
 _pick_bouncer_ip() {
@@ -74,17 +86,18 @@ _pick_bouncer_ip() {
         echo "$PG_BOUNCER_IP"
         return
     fi
-    local addr
-    addr=$(incus network get incusbr0 ipv4.address 2>/dev/null || true)
-    if [[ -z "$addr" || "$addr" == "none" ]]; then
-        echo "ERROR: cannot read incusbr0 ipv4.address; set PG_BOUNCER_IP in .env" >&2
-        exit 1
-    fi
-    # addr like "10.224.165.1/24"  →  prefix "10.224.165"  →  pick .10
-    local prefix=${addr%.*}
-    prefix=${prefix%%/*}
-    echo "${prefix}.10"
+    echo "$(_incusbr0_prefix).10"
 }
+
+# Static IPs for the backends. Like the bouncer, the backends MUST keep a
+# stable address: pgbouncer reaches them by container name (host=pg-dev-a),
+# which Incus resolves from a dnsmasq DNS record built off the DHCP lease.
+# Dynamic leases — and thus those A records — are wiped on a VM reboot,
+# leaving pgbouncer unable to resolve the backend and every client stalled.
+# A pinned ipv4.address yields a STATIC lease that Incus regenerates on
+# daemon start, so the record survives. Override in .env if .11/.12 clash.
+_pick_backend_a_ip() { echo "${PG_BACKEND_A_IP:-$(_incusbr0_prefix).11}"; }
+_pick_backend_b_ip() { echo "${PG_BACKEND_B_IP:-$(_incusbr0_prefix).12}"; }
 
 # _bouncer_admin <role: active|staging> <SQL...>
 # Admin access is the special `pgbouncer` virtual database on the same
@@ -131,7 +144,7 @@ EOF
 # ---------------------------------------------------------------------------
 
 _provision_backend() {
-    local container="$1"
+    local container="$1" ip="$2"
 
     echo "==> Launching $container..."
     incus launch --verbose "$IMAGE" "$container"
@@ -139,6 +152,13 @@ _provision_backend() {
     echo "==> Waiting for IPv4 on $container..."
     until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
         sleep 2
+    done
+
+    echo "==> Pinning $container eth0 → $ip (static lease → durable DNS record)..."
+    incus config device override "$container" eth0 ipv4.address="$ip"
+    incus restart "$container"
+    until incus list "$container" --format csv -c 4 | grep -q "$ip"; do
+        sleep 1
     done
 
     echo "==> Installing PostgreSQL 17 on $container..."
@@ -336,12 +356,14 @@ MSG
         fi
     done
 
-    local bouncer_ip
+    local bouncer_ip backend_a_ip backend_b_ip
     bouncer_ip=$(_pick_bouncer_ip)
-    echo "==> pg-bouncer will be pinned to $bouncer_ip"
+    backend_a_ip=$(_pick_backend_a_ip)
+    backend_b_ip=$(_pick_backend_b_ip)
+    echo "==> Static IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip  $BOUNCER=$bouncer_ip"
 
-    _provision_backend "$BACKEND_A"
-    _provision_backend "$BACKEND_B"
+    _provision_backend "$BACKEND_A" "$backend_a_ip"
+    _provision_backend "$BACKEND_B" "$backend_b_ip"
     _provision_bouncer "$bouncer_ip"
 
     _set_active a
