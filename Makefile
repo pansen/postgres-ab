@@ -20,11 +20,14 @@ start:
 	fi
 	$(MAKE) status
 
-.PHONY: status
-status:
+.PHONY: status/incus
+status/incus:
 	incus version
 	incus list
 	incus info --resources | head -n5
+
+.PHONY: status
+status: status/incus pg.ip pg.snapshots
 
 .PHONY: stop
 stop:
