@@ -15,6 +15,9 @@ start:
 		--runtime=incus \
 		--memory $(COLIMA_MEMORY) \
 		--cpu $(COLIMA_CPU)
+	@if [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
+		sleep 2 && $(MAKE) pg.bouncer.reload; \
+	fi
 	$(MAKE) status
 
 .PHONY: status
