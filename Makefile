@@ -124,10 +124,13 @@ pg.staging.reset:
 .PHONY: pg.staging.stop
 pg.staging.stop:
 	$(PG_DEV) staging.stop
+	$(MAKE) status
 
 .PHONY: pg.staging.start
 pg.staging.start:
 	$(PG_DEV) staging.start
+	sleep 1
+	$(MAKE) status
 
 # ----- bouncer ------------------------------------------------------------
 
