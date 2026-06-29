@@ -486,14 +486,32 @@ cmd_promote() {
 # Per-slot ops
 # ---------------------------------------------------------------------------
 
+# Block until Postgres in <container> is accepting connections.
+_pg_wait_ready() {
+    local container="$1" tries=0
+    until incus exec "$container" -- pg_isready -q; do
+        tries=$((tries + 1))
+        if (( tries > 30 )); then
+            echo "ERROR: Postgres on $container not ready after ${tries}s" >&2
+            incus exec "$container" -- journalctl -u postgresql@17-main --no-pager | tail -n 40 >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
 _snapshot() {
     local container="$1" name="$2" force="${3:-}"
     if [[ "$force" == "--force" ]]; then
         incus snapshot delete "$container" "$name" 2>/dev/null || true
     fi
-    incus pause "$container"
+    # Cleanly stop Postgres so the snapshot captures a properly shut-down
+    # cluster (pg_control marked clean). Otherwise `incus pause` freezes it
+    # mid-flight and every restore pays for WAL replay / crash recovery.
+    incus exec "$container" -- systemctl stop postgresql@17-main
     incus snapshot create "$container" "$name"
-    incus resume "$container"
+    incus exec "$container" -- systemctl start postgresql@17-main
+    _pg_wait_ready "$container"
     echo "Snapshot '$name' created on $container."
 }
 
