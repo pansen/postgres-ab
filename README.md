@@ -60,6 +60,17 @@ Port **5433** is the staging backend — the opposite slot. Useful for
 ad-hoc exploration of "the other dataset" or for verifying a dump
 mid-import.
 
+Port **5434** is a pooler-free direct line to the *active* backend (an incus
+`proxy` device on the bouncer, not a pgbouncer listener). Same stable IP and
+same promote-tracking as :5432, but no session stickiness — so test suites
+that `CREATE`/`DROP` databases work here. Through the pooled :5432 they fail
+with `ObjectInUse` ("database is being accessed by other users"), because
+pgbouncer keeps an idle server connection to the just-used database.
+
+```shell
+make pg.backend.endpoint            # prints the :5434 dsn for your test config
+```
+
 Overview command
 
 ```shell

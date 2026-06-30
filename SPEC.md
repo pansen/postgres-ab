@@ -77,6 +77,16 @@ flips, the port semantics don't:
   active dataset.
 - **:5433** = where new dumps land / verify staging — `pg_restore` aims here,
   sanity checks aim here.
+- **:5434** = a pooler-free direct line to the *active* backend. Not a
+  pgbouncer listener but an incus `proxy` device on the bouncer container that
+  forwards, per-connection, to the active backend's Postgres. It tracks promote
+  (its `connect` target is re-pointed whenever active flips) but carries no
+  session stickiness — a client disconnect tears the backend connection down.
+  This is the endpoint for test suites that `CREATE`/`DROP` databases: through
+  the pooled :5432, pgbouncer (`pool_mode=session`) keeps an idle server
+  connection to a just-used database, so a subsequent `DROP DATABASE` fails
+  with `ObjectInUse`; through :5434 the connection is gone on disconnect, so
+  teardown succeeds.
 
 There is no third "transient" container during import. The staging slot is
 permanently there, ready to receive the next dump.

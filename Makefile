@@ -53,6 +53,10 @@ pg.status:
 pg.endpoint:
 	@$(PG_DEV) endpoint
 
+.PHONY: pg.backend.endpoint
+pg.backend.endpoint:
+	@$(PG_DEV) backend-endpoint
+
 .PHONY: pg.promote
 pg.promote:
 	$(PG_DEV) promote
