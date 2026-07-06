@@ -42,6 +42,12 @@ STATE_FILE="$STATE_DIR/active-slot"
 DIRECT_PORT="${PG_DIRECT_PORT:-5434}"
 DIRECT_DEVICE=pgdirect
 
+# How long promote lets PAUSE drain cleanly before forcing the swap with KILL.
+# PAUSE only *returns* once every server is released; in session pooling an
+# idle-but-connected client never releases on its own, so a bare PAUSE hangs
+# forever. See _promote_drain.
+PROMOTE_PAUSE_TIMEOUT="${PROMOTE_PAUSE_TIMEOUT:-10}"
+
 # ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
@@ -511,6 +517,33 @@ DSN:
 EOF
 }
 
+# PAUSE that cannot hang. PAUSE takes effect immediately but only *returns*
+# once every server is released; in session pooling an idle-but-connected
+# client never releases, so a bare PAUSE waits forever. We give it
+# PROMOTE_PAUSE_TIMEOUT seconds to drain cleanly — in that path clients keep
+# their TCP connection and get re-routed on their next query — then force the
+# swap with KILL, which drops the lingering idle clients (they reconnect to the
+# new backend on their next query). Either way the db ends up paused, which the
+# RESUME later in cmd_promote clears.
+_promote_drain() {
+    local role="$1" port="$2"
+    incus exec "$BOUNCER" -- env PGPASSWORD="$PG_BOUNCER_ADMIN_PASSWORD" \
+        psql -h 127.0.0.1 -p "$port" -U pgb_admin -d pgbouncer \
+        -c "PAUSE $PG_DB;" >/dev/null 2>&1 &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( waited >= PROMOTE_PAUSE_TIMEOUT )); then
+            kill "$pid" 2>/dev/null || true
+            echo "==> $role: PAUSE didn't drain in ${PROMOTE_PAUSE_TIMEOUT}s" \
+                 "(idle session clients) — forcing them off with KILL..."
+            _bouncer_admin "$role" "KILL $PG_DB;" >/dev/null
+            break
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
 cmd_promote() {
     local from to
     from=$(_active)
@@ -518,10 +551,10 @@ cmd_promote() {
 
     echo "==> Promoting: active $from → $to"
 
-    # PAUSE drains in-flight transactions; admin commands themselves are
-    # unaffected, so we can still RELOAD / RESUME while paused.
-    _bouncer_admin active  "PAUSE $PG_DB;"  >/dev/null
-    _bouncer_admin staging "PAUSE $PG_DB;"  >/dev/null
+    # Drain (or force) both listeners. Admin commands work while paused, so we
+    # can still RELOAD / RESUME below.
+    _promote_drain active  5432
+    _promote_drain staging 5433
 
     _render_ini active  5432 "${BACKEND_PREFIX}-${to}"
     _render_ini staging 5433 "${BACKEND_PREFIX}-${from}"

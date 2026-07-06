@@ -101,7 +101,9 @@ $ psql -h <bouncer-ip> -p 5433 -d $PG_DB -c '\dt'
 $ pg.staging.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
 
 # 5. Promote. Sub-second; clients keep their TCP connections through the
-#    bouncer; the dataset underneath flips.
+#    bouncer; the dataset underneath flips. (If an idle client is holding a
+#    session open, promote waits PROMOTE_PAUSE_TIMEOUT=10s for it to drain,
+#    then forces it off so it can't stall — that client just reconnects.)
 $ make pg.promote
 ```
 

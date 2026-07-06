@@ -282,17 +282,29 @@ decision for shell tooling).
 
 1. Read `var/active-slot`, derive the new `(active, staging)` pair (a/b
    swapped).
-2. `_bouncer_admin active "PAUSE $PG_DB;"` and
-   `_bouncer_admin staging "PAUSE $PG_DB;"`.
+2. `_promote_drain active 5432` and `_promote_drain staging 5433`.
 3. Re-render both `.ini` files from the new state, from the same shared
    template. They remain cross-connected by construction.
 4. `_bouncer_admin active "RELOAD;"` / `_bouncer_admin staging "RELOAD;"` and
    `_bouncer_admin active "RESUME $PG_DB;"` /
    `_bouncer_admin staging "RESUME $PG_DB;"`.
 5. Atomically write the new value of `var/active-slot`.
-6. Print new status.
+6. Re-point the `:5434` direct-forward proxy at the new active backend.
+7. Print new status.
 
-Total promote wall-clock: sub-second. Both port mappings flip together,
-dominated by the time PAUSE waits for in-flight transactions to finish (none
-on :5433 during the import workflow, because `pg_restore` is the only thing
-that talks to it and it has already finished by step 4 of the workflow).
+**Why `_promote_drain`, not a bare `PAUSE`.** `PAUSE` takes effect at once but
+only *returns* after every server connection is released. In **session**
+pooling a server stays bound to its client for the whole session, so a single
+idle-but-connected client (an app pool, a forgotten `psql`) makes a bare
+`PAUSE` block forever — this is a real stall we hit in practice, not a
+theoretical one. `_promote_drain` runs the `PAUSE` with a `PROMOTE_PAUSE_TIMEOUT`
+(default 10s) budget: if it drains in time, clients keep their TCP connection
+and get re-routed on their next query (the nice path); if it doesn't, we force
+the swap with `KILL`, which drops the lingering idle clients — they reconnect
+to the new backend on their next query. Promote can no longer hang.
+
+Total promote wall-clock: sub-second when nothing is holding a session open;
+up to `PROMOTE_PAUSE_TIMEOUT` when an idle client has to be forced off. Both
+port mappings flip together. (During the import workflow :5433 has no clients —
+`pg_restore` is the only thing that talks to it and has already finished by
+step 4 — so its drain is instant.)
