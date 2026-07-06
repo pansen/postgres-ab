@@ -1,8 +1,9 @@
 # Summary
 
 Working with PostgreSQL dumps is painful when `pg_restore` takes ~90 minutes
-and your dev database is unreachable for the whole window. This repo wraps
-a colima VM running incus + ZFS to give you:
+and your dev database is unreachable for the whole window. This repo drives
+Incus containers — natively on Linux, with copy-on-write snapshots (btrfs on
+Linux, ZFS under colima on macOS) — to give you:
 
 - **two long-lived Postgres backends** (`pg-dev-a`, `pg-dev-b`) with
   independent ZFS snapshot timelines, so already-loaded states stay cheap to
@@ -22,36 +23,47 @@ day-to-day surface.
 ## Once, after cloning
 
 ```shell
-make deps                 # incus, colima, jq on macOS
+make deps                 # incus + jq, enable the daemon, join incus-admin (Fedora/dnf)
 cp .env.example .env      # edit PG_* if you don't like the defaults
-make start                # boot colima with the incus runtime
+make start                # start the incus daemon, init storage/network, open the ports
 make pg.up                # provision pg-dev-a, pg-dev-b, pg-bouncer (~15 min)
 make pg.endpoint          # prints connection info + a ready-to-paste .pgpass line
 ```
 
-`make pg.endpoint` prints something like (with `<bouncer-ip>` being .10 in
-whatever subnet `incus network get incusbr0 ipv4.address` reports — e.g.
-`192.168.100.10` if your bridge is on `192.168.100.0/24`):
+`make deps` adds you to the `incus-admin` group — **log out and back in once**
+so the plain `incus` CLI (and every `make pg.*` target) works without `sudo`.
+
+`make pg.endpoint` prints something like, where `<host-ip>` is **this machine's
+LAN address** — the Postgres ports are published on the host (all interfaces),
+so any other host on the LAN can connect there:
 
 ```
-active   host=<bouncer-ip> port=5432 dbname=<PG_DB>   (current data)
-staging  host=<bouncer-ip> port=5433 dbname=<PG_DB>   (import target / opposite of active)
+active   host=<host-ip> port=5432 dbname=<PG_DB>   (current data)
+staging  host=<host-ip> port=5433 dbname=<PG_DB>   (import target / opposite of active)
 
 .pgpass line (one line, covers both ports):
-    <bouncer-ip>:*:*:<PG_USER>:<PG_PASSWORD>
+    <host-ip>:*:*:<PG_USER>:<PG_PASSWORD>
 ```
 
 Paste that single line into `~/.pgpass` and you're done with auth forever.
-The bouncer IP is pinned at the device level — it survives reboots,
-promotes, snapshot restores, everything short of `make pg.down`. Override
-the auto-pick by setting `PG_BOUNCER_IP` in `.env`.
+`make start` publishes ports 5432/5433/5434 on the host (Incus `proxy` devices,
+`bind=host`) and opens them on firewalld, so they survive reboots, promotes and
+snapshot restores. The endpoint auto-picks your primary NIC's IP; override with
+`PG_HOST_IP` in `.env`. Internally the bouncer still keeps a pinned incusbr0 IP
+(override with `PG_BOUNCER_IP`), but clients never need it.
+
+> **Security:** the database is now reachable by *anything on your LAN*, guarded
+> only by the `$PG_PASSWORD`. That's fine for a trusted home/office network and
+> in the spirit of [SPEC.md](SPEC.md)'s "one developer, one laptop" scope — but
+> don't run this on an untrusted network. To keep it host-only, skip
+> `make firewall` and connect from the host itself.
 
 ## Day to day: querying the database
 
 Port **5432** always means *current data*. Pick whatever client you like:
 
 ```shell
-psql -h <bouncer-ip> -p 5432 -d $PG_DB        # any psql, any app
+psql -h <host-ip> -p 5432 -d $PG_DB        # any psql, any app
 make pg.psql                                   # quick shell via incus exec
 make pg.logs                                   # tail postgres logs
 ```
@@ -91,11 +103,11 @@ scripts/pg-dev-local staging.reset
 Continue? [Y/n]
 
 # 2. Restore the dump through the bouncer's staging port (:5433).
-$ pg_restore --host=<bouncer-ip> --port=5433 --dbname=$PG_DB \
+$ pg_restore --host=<host-ip> --port=5433 --dbname=$PG_DB \
            --jobs=4 your-dump.pgdump          # ~90 min, no blocking
 
 # 3. Sanity-check the loaded data while still on staging.
-$ psql -h <bouncer-ip> -p 5433 -d $PG_DB -c '\dt'
+$ psql -h <host-ip> -p 5433 -d $PG_DB -c '\dt'
 
 # 4. Checkpoint the loaded state on the staging slot.
 $ pg.staging.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
@@ -150,14 +162,43 @@ make pg.bouncer.logs  # tail both pgbouncer instances
 
 ```shell
 make pg.down          # delete pg-dev-a, pg-dev-b, pg-bouncer (irreversible)
-make stop             # stop colima
-make delete           # nuke colima entirely; rebuild fresh with `make recreate`
+make stop             # stop the three containers, leave the incus daemon up
+make delete           # same as pg.down — destroy the containers + their snapshots
+make recreate         # delete, then start (re-provision with `make pg.up`)
 ```
 
-Snapshots live inside the colima VM. `make delete` loses them all.
-`make pg.export` / `make pg.import-last` serialise the *active* backend
-(data + snapshots) to a tarball under `var/`, which survives a colima
-rebuild — slower than ZFS snapshots, but the only way out of the VM.
+Unlike the colima setup there's no VM to throw away, so `make delete` just
+removes the containers (and their snapshots) — the incus daemon and any other
+workloads on it are untouched. `make pg.export` / `make pg.import-last`
+serialise the *active* backend (data + snapshots) to a tarball under `var/`,
+which survives a teardown — slower than a snapshot, but the way to move a
+backend between machines.
+
+# Troubleshooting (native Incus on Linux)
+
+Most of the Linux-specific setup is automated by `make deps` / `make start`,
+but three things bite on a fresh host and are worth knowing:
+
+- **"You don't have the needed permissions to talk to the incus daemon."**
+  `make deps` adds you to the `incus-admin` group, but existing login shells
+  don't pick that up until you get a fresh session — and a GUI re-login often
+  isn't enough (the display manager keeps the session alive). `make start` and
+  every `make pg.*` work around this by re-running under `sg incus-admin`, so
+  they *just work* with no logout. The catch: commands running under `sg` can
+  swallow Ctrl-C. For the cleanest experience, **reboot once** after `make deps`
+  — then the group is active everywhere, the `sg` layer is skipped entirely, and
+  long commands are interruptible again.
+
+- **`make pg.up` says "Waiting for IPv4" / a container has only an IPv6 address.**
+  firewalld's default zone drops DHCP on the incus bridge. `make start` fixes
+  this by putting `incusbr0` in the `trusted` zone (`make firewall` on its own
+  does the same). The provisioner now also fails fast with this hint instead of
+  hanging forever.
+
+- **"System doesn't have a functional idmap setup" when a container launches.**
+  incusd runs as root and needs a subordinate UID/GID range, which Fedora omits.
+  `make deps` adds `root:1000000:1000000000` to `/etc/subuid` and `/etc/subgid`
+  and restarts incus.
 
 # Questions
 

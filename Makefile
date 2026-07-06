@@ -1,24 +1,99 @@
-packages := incus colima jq
+# Native Incus on Linux — no colima wrapper. The incus daemon runs directly on
+# the host; `make start` just makes sure it's up, initialised, and that the
+# Postgres ports are reachable from the LAN. See README.md.
 
-.PHONY: deps
-deps:
-	HOMEBREW_NO_AUTO_UPDATE=1 brew install $(packages)
-	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade $(packages)
+# Ports published on the host (LAN-wide). Keep in sync with pg-dev-local's
+# ACTIVE_PORT / STAGING_PORT / DIRECT_PORT.
+PG_PORTS := 5432-5434
 
 -include .env
 export
 
+# Install the host prerequisites and grant this user Incus access. Fedora/dnf;
+# adjust the package line for other distros. btrfs-progs lets `incus admin init`
+# build a copy-on-write pool (cheap snapshots) — the ZFS stand-in on Linux.
+.PHONY: deps
+deps:
+	sudo dnf install -y incus jq btrfs-progs
+	@# incusd runs as root and maps container UIDs/GIDs from root's subordinate
+	@# ranges. Fedora ships /etc/sub{u,g}id without a root entry, so unprivileged
+	@# containers fail to create ("System doesn't have a functional idmap setup").
+	@# Grant root a large range (idempotent).
+	@for f in /etc/subuid /etc/subgid; do \
+		if ! grep -q '^root:' $$f 2>/dev/null; then \
+			echo "==> Adding root subordinate-id range to $$f"; \
+			echo 'root:1000000:1000000000' | sudo tee -a $$f >/dev/null; \
+		fi; \
+	done
+	sudo systemctl enable --now incus.socket incus.service incus-startup.service
+	sudo systemctl restart incus.service
+	@if id -nG "$$USER" | tr ' ' '\n' | grep -qx incus-admin; then \
+		echo "==> $$USER is already in the incus-admin group."; \
+	else \
+		echo "==> Adding $$USER to incus-admin — log out and back in for it to take effect."; \
+		sudo usermod -aG incus-admin "$$USER"; \
+	fi
+
+# `start` is a thin gate: bring the daemon up, make sure we can talk to it,
+# then hand off to `_start` for the real work. Right after `make deps` the
+# incus-admin group is assigned but not yet active in existing login shells
+# (even a GUI re-login often isn't enough — the display manager keeps the
+# session alive). Rather than force a reboot we run the worker under `sg`, which
+# activates the group with no logout. Keeping this in ONE recipe line matters:
+# an `exec` inside a make recipe only replaces that line's subshell, not make,
+# so a multi-line delegation would leak back into the ungrouped parent.
 .PHONY: start
 start:
-	colima start \
-		--verbose \
-		--runtime=incus \
-		--memory $(COLIMA_MEMORY) \
-		--cpu $(COLIMA_CPU)
+	sudo systemctl start incus.socket incus.service
+	@if incus info >/dev/null 2>&1; then \
+		$(MAKE) _start; \
+	elif id -nG "$$USER" | grep -qw incus-admin; then \
+		echo "==> Activating the incus-admin group for this run (sg; no logout needed)..."; \
+		sg incus-admin -c "$(MAKE) _start"; \
+	else \
+		echo "ERROR: '$$USER' can't reach the incus daemon (/run/incus/unix.socket)."; \
+		echo "  Run 'make deps' to join the incus-admin group, then reboot once"; \
+		echo "  (or 'newgrp incus-admin' in this shell) and retry."; \
+		exit 1; \
+	fi
+
+# The real bring-up. Assumes the incus daemon is reachable (see `start`).
+.PHONY: _start
+_start:
+	@# First-run init: create a storage pool + incusbr0 if none exist yet.
+	@if [ -z "$$(incus storage list --format csv 2>/dev/null)" ]; then \
+		echo "==> Initialising Incus (btrfs storage pool + incusbr0)..."; \
+		incus admin init --auto --storage-backend btrfs \
+			|| incus admin init --auto; \
+	fi
+	@# Open the Postgres ports so other LAN hosts can connect.
+	@$(MAKE) firewall
+	@# Start any project containers that already exist (a no-op on a fresh host).
+	@for c in pg-dev-a pg-dev-b pg-bouncer; do incus start $$c >/dev/null 2>&1 || true; done
+	@# If the bouncer came up, re-assert its host forwards + backend IP pins.
 	@if [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
 		sleep 2 && $(MAKE) pg.bouncer.reload; \
 	fi
 	$(MAKE) status
+
+# Two firewalld jobs (Fedora's default firewall; skipped when it isn't running):
+#  1. Open PG_PORTS so LAN hosts can reach the published Postgres ports.
+#  2. Put incusbr0 in the `trusted` zone. Without this, firewalld's default zone
+#     drops DHCP/DNS on the bridge, so containers come up with only an IPv6
+#     address and `make pg.up` hangs forever at "Waiting for IPv4". This is the
+#     incus-documented fix. Both settings are --permanent, so they persist
+#     across reboots; safe to re-run.
+.PHONY: firewall
+firewall:
+	@if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then \
+		echo "==> Opening $(PG_PORTS)/tcp on firewalld..."; \
+		sudo firewall-cmd --permanent --add-port=$(PG_PORTS)/tcp >/dev/null; \
+		echo "==> Trusting the incusbr0 bridge (DHCP/DNS for containers)..."; \
+		sudo firewall-cmd --permanent --zone=trusted --change-interface=incusbr0 >/dev/null 2>&1 || true; \
+		sudo firewall-cmd --reload >/dev/null; \
+	else \
+		echo "==> firewalld not active — skipping (open $(PG_PORTS)/tcp + trust incusbr0 yourself if you filter)."; \
+	fi
 
 .PHONY: status/incus
 status/incus:
@@ -29,9 +104,12 @@ status/incus:
 .PHONY: status
 status: status/incus pg.ip pg.snapshots
 
+# Stop the project containers, leaving the incus daemon (and any other
+# workloads on it) running. The counterpart to `make start`.
 .PHONY: stop
 stop:
-	colima stop --verbose
+	@for c in pg-bouncer pg-dev-a pg-dev-b; do incus stop $$c 2>/dev/null || true; done
+	$(MAKE) status
 
 PG_DEV := scripts/pg-dev-local
 
@@ -157,11 +235,14 @@ pg.export:
 pg.import-last:
 	$(PG_DEV) import-last
 
-# ----- colima ------------------------------------------------------------
+# ----- teardown ----------------------------------------------------------
 
+# Destroy the three project containers (and their snapshots). On native Incus
+# there is no VM to throw away, so this is exactly `pg.down`. Irreversible —
+# export first (make pg.export) if you want to keep the active backend.
 .PHONY: delete
 delete:
-	colima delete --force
+	$(PG_DEV) down
 
 .PHONY: recreate
 recreate: delete start
