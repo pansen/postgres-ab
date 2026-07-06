@@ -134,6 +134,7 @@ pg.staging.stop:
 pg.staging.start:
 	$(PG_DEV) staging.start
 	sleep 1
+	$(PG_DEV) bouncer.reload
 	$(MAKE) status
 
 # ----- bouncer ------------------------------------------------------------
