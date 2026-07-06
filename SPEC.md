@@ -1,6 +1,6 @@
-# pg-dev — a/b backends behind pgbouncer
+# pg-dev — a/b backends behind a host-port proxy
 
-A specification for the next iteration of this repo's Postgres dev wrapper.
+A specification for this repo's Postgres dev wrapper, running natively on Incus.
 
 ## Purpose
 
@@ -21,8 +21,10 @@ single command, the worst case is a reconnect.
 This is **not** a production or HA design. Specifically:
 
 - No failover, no replication, no zero-downtime SLA.
-- No protection against a malicious actor on the host. The colima VM is a
-  trusted boundary.
+- No connection pooling. Each host port is a plain TCP passthrough.
+- The ports are published on the host's LAN interfaces and guarded **only** by
+  the Postgres password. The trusted boundary is the LAN — fine for a home/office
+  network, not for an untrusted one. (Skip `make firewall` to keep it host-only.)
 - No multi-user concerns. One developer, one laptop.
 
 Anything that adds friction in the name of robustness — extra auth steps,
@@ -30,42 +32,36 @@ credential rotation rituals, certificate management — is out of scope.
 
 ## Architecture
 
-Three containers inside the colima VM. The bouncer container runs **two**
-pgbouncer processes side-by-side, one per client-facing port:
+Three containers on the host's Incus bridge (`incusbr0`). There is **no
+pgbouncer**: a bare `pg-proxy` container carries two host-bound Incus `proxy`
+devices, one per client-facing port. Each is a per-connection TCP relay to a
+backend's Postgres — indistinguishable from a direct connection.
 
 ```
-                ┌──────────────────────────────────────┐
-client (app) ──►│ pg-bouncer  (stable IP 10.x.x.10)    │
-                │                                      │
-pg_restore  ──►│  :5432 ── active   ini  ─┐            │
-                │  :5433 ── staging  ini  ─┼─ cross    │
-                │  (admin is the special   │  connect  │
-                │   `pgbouncer` db on same │           │
-                │   port, pgb_admin user)  │           │
-                └──────────────┬───────────┴───────────┘
-                               │
-                  ┌────────────┴────────────┐
-                  │ :5432 → active backend  │
-                  │ :5433 → staging backend │
-                  ▼                         ▼
-              pg-dev-a                  pg-dev-b
-              (Postgres 17,             (Postgres 17,
-               own snapshots,            own snapshots,
-               own data)                 own data)
+                                host  <LAN-IP>
+                       ┌────────────────┴────────────────┐
+    client (app)  ───► │ :5432  ┐  proxy devices on       │
+    pg_restore    ───► │ :5433  ┘  pg-proxy (bind=host)    │
+                       └──────┬──────────────────┬─────────┘
+                        connect │          connect │
+                   tcp:<active-ip>:5432   tcp:<staging-ip>:5432
+                              ▼                    ▼
+                          pg-dev-a             pg-dev-b
+                       (Postgres 17,         (Postgres 17,
+                        own snapshots,        own snapshots,
+                        pinned .11)           pinned .12)
 ```
 
-- `pg-bouncer` — single container, fixed identity, lives for the life of the
-  colima VM. Hosts two pgbouncer instances:
-  - **active**  — `listen_port=5432`, `[databases] $PG_DB` → whichever
-    backend is currently active.
-  - **staging** — `listen_port=5433`, `[databases] $PG_DB` → the *other*
-    backend.
+- `pg-proxy` — a bare container (no packages, no config). It exists only to host
+  the two `proxy` devices. With `bind=host` the forkproxy listens on the host's
+  `0.0.0.0:<port>` (so any LAN machine can reach it at the host's IP) and dials
+  the `connect` target from inside `pg-proxy`'s netns, over `incusbr0`, to the
+  backend's pinned IP. `pg-proxy`'s own address is irrelevant and is not pinned.
+  - **:5432** → the currently **active** backend.
+  - **:5433** → the currently **staging** backend.
 
-  pgbouncer has no separate admin port: admin commands are issued by
-  connecting to the special `pgbouncer` virtual database on the same
-  `listen_port` as the `pgb_admin` user.
-  Both `.ini` files are rendered from the single state file `var/active-slot`,
-  so they are always cross-connected and cannot drift.
+  Both `connect` targets are derived from the single state file
+  `var/active-slot`, so they cannot drift.
 - `pg-dev-a`, `pg-dev-b` — symmetric backends, both long-lived, both running.
   At any moment one is **active** (served on :5432) and the other is
   **staging** (served on :5433).
@@ -77,65 +73,54 @@ flips, the port semantics don't:
   active dataset.
 - **:5433** = where new dumps land / verify staging — `pg_restore` aims here,
   sanity checks aim here.
-- **:5434** = a pooler-free direct line to the *active* backend. Not a
-  pgbouncer listener but an incus `proxy` device on the bouncer container that
-  forwards, per-connection, to the active backend's Postgres. It tracks promote
-  (its `connect` target is re-pointed whenever active flips) but carries no
-  session stickiness — a client disconnect tears the backend connection down.
-  This is the endpoint for test suites that `CREATE`/`DROP` databases: through
-  the pooled :5432, pgbouncer (`pool_mode=session`) keeps an idle server
-  connection to a just-used database, so a subsequent `DROP DATABASE` fails
-  with `ObjectInUse`; through :5434 the connection is gone on disconnect, so
-  teardown succeeds.
+
+Because nothing pools connections, `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`,
+prepared statements and advisory locks all behave exactly as a direct
+connection on either port. (An earlier pgbouncer-based design needed a separate
+pooler-free `:5434` to dodge session-pooling `ObjectInUse` on `DROP DATABASE`;
+with a plain proxy that problem doesn't exist, so there is no `:5434`.)
 
 There is no third "transient" container during import. The staging slot is
 permanently there, ready to receive the next dump.
 
 ## Network identity
 
-The user-facing endpoint is **the pgbouncer container's IP, on ports 5432 and
-5433**. That IP must be stable across the life of the colima VM and not
-change on promote, restart, or backend snapshot/restore. This is achieved by
-pinning the pgbouncer container's address at the device level, e.g.:
+The user-facing endpoint is **the host's LAN IP, on ports 5432 and 5433**. The
+proxy devices listen on `0.0.0.0`, so every host interface works; `make
+pg.endpoint` reports the primary one (override with `PG_HOST_IP`). The endpoint
+does not change on promote, restart, or backend snapshot/restore.
 
-```
-incus config device override pg-bouncer eth0 ipv4.address=10.x.x.10
-```
+The two backend containers keep **pinned** `incusbr0` IPs (`.11`/`.12` by
+default; override with `PG_BACKEND_A_IP` / `PG_BACKEND_B_IP`). The proxy dials
+them by IP, and a pinned `ipv4.address` yields a static lease that Incus
+regenerates on daemon start — so the target survives a host reboot. A dynamic
+lease could drift to a different address and silently break the forward. The
+backend IPs are an internal detail; they are never written into a client
+`.pgpass` or connection string.
 
-The two backend containers' IPs are an internal detail. Tooling reaches them
-by container name (`pg-dev-a`, `pg-dev-b`) via incus's bridge DNS; they are
-never written into a client `.pgpass` or connection string.
+On Fedora, firewalld must (a) allow the published ports and (b) trust the
+`incusbr0` bridge, otherwise DHCP on the bridge is dropped and a backend comes
+up IPv6-only. `make firewall` does both (`--permanent`, so it persists).
 
 ## Authentication
 
 Single guiding principle: **set up `.pgpass` once, never touch it again.**
 
 - One Postgres role (`$PG_USER` from `.env`) with one password, used for both
-  application access through the bouncer and direct backend operations.
-- That same role/password is registered in a single
-  `/etc/pgbouncer/userlist.txt`, shared by both pgbouncer instances and
-  generated once during `cmd_up`. No `auth_query`, no SCRAM verifier
-  regeneration after every reconfigure.
-- Both pgbouncer pools run in **session** mode — preserves prepared
-  statements, `SET`, advisory locks; behaves indistinguishably from a direct
-  connection from the client's point of view.
-- Each pgbouncer's admin interface is the special `pgbouncer` virtual
-  database on its own `listen_port` (`:5432` for active, `:5433` for
-  staging), accessed by connecting as `pgb_admin` (declared in
-  `admin_users` and listed in `userlist.txt`). Promote and observability
-  go through `incus exec pg-bouncer -- psql -p {5432,5433} -U pgb_admin
-  -d pgbouncer …`.
-- The `pgb_admin` user shares the application user's password. One secret,
-  one `.pgpass` line — dev convenience, explicit non-goal w.r.t. privilege
-  separation.
-- Backend Postgres `pg_hba.conf` accepts the role from the bouncer's IP and
-  from the local socket. No host-wide open auth.
+  application access through the proxy and direct backend operations.
+- Clients authenticate **directly against the backend Postgres** (the proxy is a
+  transparent TCP relay, not an auth endpoint). There is no `userlist.txt`, no
+  SCRAM verifier to regenerate, no separate admin user or admin console.
+- Backend Postgres `pg_hba.conf` accepts the role over `scram-sha-256` from any
+  address (`0.0.0.0/0`) and via the local socket. This is deliberate: the
+  connection arrives from the proxy's `incusbr0` address, and locking it down
+  further buys nothing given the LAN-exposure model above.
 
 The `.pgpass` line a developer adds once is port-wildcarded so it covers both
-listeners:
+ports (at the host's LAN IP):
 
 ```
-10.x.x.10:*:*:$PG_USER:$PG_PASSWORD
+<host-ip>:*:*:$PG_USER:$PG_PASSWORD
 ```
 
 After that, `psql`, application clients, migration tools and `pg_restore` all
@@ -159,14 +144,18 @@ an import, intermediate marks like `initial-loaded`.
 A promote does *not* touch snapshots. The previously active slot keeps its
 full timeline as the rollback path.
 
+Snapshots are copy-on-write on a btrfs (native Linux) or ZFS (under colima on
+macOS) storage pool, so already-loaded states stay cheap to checkpoint and
+restore.
+
 ## Workflow
 
 ### Steady state (no import in flight)
 
-The active slot serves queries through the bouncer on :5432. The staging slot
-is running but idle, reachable through the bouncer on :5433, holding its
-`initial` snapshot. Day-to-day snapshot/restore on the active slot works
-exactly as today's `make pg.snapshot` / `make pg.restore`.
+The active slot serves queries on the host's :5432. The staging slot is running
+but idle, reachable on :5433, holding its `initial` snapshot. Day-to-day
+snapshot/restore on the active slot works exactly as `make pg.snapshot` /
+`make pg.restore`.
 
 ### Importing a new dump
 
@@ -174,18 +163,17 @@ exactly as today's `make pg.snapshot` / `make pg.restore`.
 # 1. Reset staging to its clean initial state.
 make pg.staging.reset
 
-# 2. Run pg_restore through the bouncer's staging port. The active port
-#    (:5432) keeps serving live queries the whole time.
-pg_restore … --host=10.x.x.10 --port=5433 --dbname=$PG_DB …    # ~90 min
+# 2. Run pg_restore against the staging port. The active port (:5432) keeps
+#    serving live queries the whole time.
+pg_restore … --host=<host-ip> --port=5433 --dbname=$PG_DB …    # ~90 min
 
 # 3. Sanity check the new data while still on staging.
-psql --host=10.x.x.10 --port=5433 --dbname=$PG_DB -c '\dt'
+psql --host=<host-ip> --port=5433 --dbname=$PG_DB -c '\dt'
 
 # 4. Take a checkpoint of the loaded state.
 make pg.staging.snapshot name=initial-loaded
 
-# 5. Promote. Atomic from the client's point of view (PAUSE → reload → RESUME
-#    on both admin consoles). Both port mappings flip together.
+# 5. Promote. The :5432 endpoint is unchanged; both forwards re-point together.
 make pg.promote
 ```
 
@@ -201,9 +189,9 @@ slot is untouched; the pointer just flips back. No data is regenerated.
 
 ## Command surface
 
-Two parallel families plus the flip, mirroring today's surface. The staging
-family operates **directly on the backend container** via `incus exec`,
-because it's used for ops/snapshot work — not through the bouncer:
+Two parallel families plus the flip. The staging family operates **directly on
+the backend container** via `incus exec`, because it's used for ops/snapshot
+work — not through the proxy:
 
 | acts on active             | acts on staging                | meaning                  |
 | -------------------------- | ------------------------------ | ------------------------ |
@@ -216,95 +204,72 @@ because it's used for ops/snapshot work — not through the bouncer:
 | `make pg.snapshots`        | `make pg.staging.snapshots`    | list snapshots           |
 |                            | `make pg.staging.reset`        | shortcut: restore `initial` |
 
-Plus the bouncer-aware operations:
+Plus the proxy-aware operations:
 
-| command              | meaning                                                |
-| -------------------- | ------------------------------------------------------ |
-| `make pg.endpoint`   | print both bouncer ports and their roles (see below)   |
-| `make pg.promote`    | flip active/staging on both bouncer instances at once  |
-| `make pg.status`     | print pointer + state of all three containers          |
+| command              | meaning                                                  |
+| -------------------- | -------------------------------------------------------- |
+| `make pg.endpoint`   | print both host ports and their roles + `.pgpass` line   |
+| `make pg.promote`    | flip active/staging: re-point both proxy forwards        |
+| `make pg.refresh`    | re-pin backend IPs + re-assert the host forwards         |
+| `make pg.status`     | print pointer + state of all three containers            |
 
 `make pg.endpoint` prints both port mappings so a client always knows where
 to point what:
 
 ```
-active   host=10.x.x.10 port=5432 dbname=$PG_DB   (current data)
-staging  host=10.x.x.10 port=5433 dbname=$PG_DB   (import target / opposite of active)
+active   host=<host-ip> port=5432 dbname=$PG_DB   (current data)
+staging  host=<host-ip> port=5433 dbname=$PG_DB   (import target / opposite of active)
 ```
 
 Direct-to-backend tooling (`pg.psql`, `pg.staging.psql`, `pg.shell`,
 snapshot/restore ops) goes via `incus exec` against the container, because
-snapshots are an incus-level operation on the container, not a Postgres-level
-one. The bouncer is in the path of client applications and the import
+snapshots are an Incus-level operation on the container, not a Postgres-level
+one. The proxy is in the path only of client applications and the import
 workflow.
-
-`pg.staging.host` is no longer needed for the import workflow — the import
-endpoint is just `10.x.x.10:5433`. It may be retained as an ops convenience
-(printing the staging container's container-level IP for direct-to-backend
-debugging), but it is not part of the documented import path.
 
 ## State
 
 A single file `var/active-slot` contains the literal text `a` or `b` and is
 the source of truth for which slot is active. It is written atomically
-(tmpfile + rename) and is the *only* thing `make pg.promote` mutates besides
-the two pgbouncer `[databases]` lines (one per `.ini`).
+(tmpfile + rename) and is the *only* persistent thing `make pg.promote` mutates;
+the two proxy `connect` targets are derived from it.
 
-Loss of `var/active-slot` is recoverable: either `.ini` is authoritative
-(whatever the :5432 ini names is `a` or `b`; the file just caches that
-decision for shell tooling).
+Loss of `var/active-slot` is recoverable: the proxy devices are authoritative
+(whichever backend IP the `:5432` device's `connect` names is the active slot;
+the file just caches that decision for shell tooling). It also defaults to `a`
+when absent.
 
 ## Implementation outline
 
-`cmd_up` (one-time provisioning per colima VM):
+`cmd_up` (one-time provisioning):
 
-1. Launch `pg-dev-a`, install Postgres 17, write config, create role and DB,
-   `incus snapshot create pg-dev-a initial`.
+1. Launch `pg-dev-a`, pin its eth0 to its static IP, install Postgres 17, write
+   config, create role and DB, `incus snapshot create pg-dev-a initial`.
 2. Launch `pg-dev-b` the same way (independent install — keeps the two truly
    symmetric and decoupled). Snapshot `initial`.
-3. Launch `pg-bouncer`, install pgbouncer, pin its eth0 to the chosen stable
-   IP.
-4. Render `/etc/pgbouncer/userlist.txt` once from `$PG_USER`/`$PG_PASSWORD`,
-   shared by both instances.
-5. Render two `.ini` files from a single template + initial state
-   (`active-slot=a`):
-   - `pgbouncer-active.ini`  → `listen_port=5432`, admin `6432`,
-     `$PG_DB` → `pg-dev-a`.
-   - `pgbouncer-staging.ini` → `listen_port=5433`, admin `6433`,
-     `$PG_DB` → `pg-dev-b`.
-6. Set up systemd template instances `pgbouncer@active` and
-   `pgbouncer@staging` reading the matching `.ini`, sharing `userlist.txt`.
-   Enable and start both.
-7. Write `var/active-slot=a`.
-8. Print `pg.endpoint` and a ready-to-paste `.pgpass` line.
+3. Launch `pg-proxy` (bare container, no install). Wait for it to be running.
+4. Write `var/active-slot=a` and create the two host-bound proxy devices:
+   - `main`    → `listen=tcp:0.0.0.0:5432`, `connect=tcp:<active-ip>:5432`.
+   - `staging` → `listen=tcp:0.0.0.0:5433`, `connect=tcp:<staging-ip>:5432`.
+5. Print `pg.endpoint` and a ready-to-paste `.pgpass` line.
 
 `cmd_promote`:
 
-1. Read `var/active-slot`, derive the new `(active, staging)` pair (a/b
-   swapped).
-2. `_promote_drain active 5432` and `_promote_drain staging 5433`.
-3. Re-render both `.ini` files from the new state, from the same shared
-   template. They remain cross-connected by construction.
-4. `_bouncer_admin active "RELOAD;"` / `_bouncer_admin staging "RELOAD;"` and
-   `_bouncer_admin active "RESUME $PG_DB;"` /
-   `_bouncer_admin staging "RESUME $PG_DB;"`.
-5. Atomically write the new value of `var/active-slot`.
-6. Re-point the `:5434` direct-forward proxy at the new active backend.
-7. Print new status.
+1. Read `var/active-slot`, derive the new `(active, staging)` pair (a/b swapped).
+2. Atomically write the new value of `var/active-slot`.
+3. Re-point both proxy devices' `connect` targets from the new state
+   (`incus config device set pg-proxy {main,staging} connect=…`). Re-pointing
+   restarts the forkproxy, so open TCP connections drop and clients reconnect —
+   the `host:port` endpoints are unchanged.
+4. Print new status.
 
-**Why `_promote_drain`, not a bare `PAUSE`.** `PAUSE` takes effect at once but
-only *returns* after every server connection is released. In **session**
-pooling a server stays bound to its client for the whole session, so a single
-idle-but-connected client (an app pool, a forgotten `psql`) makes a bare
-`PAUSE` block forever — this is a real stall we hit in practice, not a
-theoretical one. `_promote_drain` runs the `PAUSE` with a `PROMOTE_PAUSE_TIMEOUT`
-(default 10s) budget: if it drains in time, clients keep their TCP connection
-and get re-routed on their next query (the nice path); if it doesn't, we force
-the swap with `KILL`, which drops the lingering idle clients — they reconnect
-to the new backend on their next query. Promote can no longer hang.
-
-Total promote wall-clock: sub-second when nothing is holding a session open;
-up to `PROMOTE_PAUSE_TIMEOUT` when an idle client has to be forced off. Both
-port mappings flip together. (During the import workflow :5433 has no clients —
+There is no drain step. With no pool there is no session state to release, so
+promote is unconditionally sub-second and cannot hang. The only observable
+effect is that in-flight connections reconnect (onto the new active on :5432, or
+the new staging on :5433). During the import workflow :5433 has no clients —
 `pg_restore` is the only thing that talks to it and has already finished by
-step 4 — so its drain is instant.)
+step 4 — so nothing is disturbed there.
+
+`cmd_refresh` (run on every `make start`, so the setup survives a host reboot):
+re-pin each backend's static IP if it has drifted, then re-create-or-re-point
+the two host forwards from current state.
