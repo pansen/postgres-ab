@@ -6,14 +6,15 @@ Incus containers — natively on Linux, with copy-on-write snapshots (btrfs on
 Linux, ZFS under colima on macOS) — to give you:
 
 - **two long-lived Postgres backends** (`pg-dev-a`, `pg-dev-b`) with
-  independent ZFS snapshot timelines, so already-loaded states stay cheap to
+  independent snapshot timelines, so already-loaded states stay cheap to
   checkpoint and restore;
-- **one pgbouncer container** with two listeners on a stable IP, so
-  `pg_restore` can load a new dump on the staging backend through one port
-  while your app keeps querying the active backend on the other;
-- **a single command** (`make pg.promote`) to atomically swap which backend
-  is "active" — clients keep their TCP connection, the dataset underneath
-  changes.
+- **two stable host ports** (`:5432` active, `:5433` staging) served by a tiny
+  `pg-proxy` container, so `pg_restore` can load a new dump on the staging
+  backend through one port while your app keeps querying the active backend on
+  the other;
+- **a single command** (`make pg.promote`) to swap which backend is "active" —
+  the host:port endpoints never change; open connections just reconnect onto
+  the new dataset.
 
 Design rationale lives in [SPEC.md](SPEC.md). The scenarios below cover the
 day-to-day surface.
@@ -26,7 +27,7 @@ day-to-day surface.
 make deps                 # incus + jq, enable the daemon, join incus-admin (Fedora/dnf)
 cp .env.example .env      # edit PG_* if you don't like the defaults
 make start                # start the incus daemon, init storage/network, open the ports
-make pg.up                # provision pg-dev-a, pg-dev-b, pg-bouncer (~15 min)
+make pg.up                # provision pg-dev-a, pg-dev-b, pg-proxy (~15 min)
 make pg.endpoint          # prints connection info + a ready-to-paste .pgpass line
 ```
 
@@ -46,11 +47,12 @@ staging  host=<host-ip> port=5433 dbname=<PG_DB>   (import target / opposite of 
 ```
 
 Paste that single line into `~/.pgpass` and you're done with auth forever.
-`make start` publishes ports 5432/5433/5434 on the host (Incus `proxy` devices,
-`bind=host`) and opens them on firewalld, so they survive reboots, promotes and
-snapshot restores. The endpoint auto-picks your primary NIC's IP; override with
-`PG_HOST_IP` in `.env`. Internally the bouncer still keeps a pinned incusbr0 IP
-(override with `PG_BOUNCER_IP`), but clients never need it.
+`make start` publishes ports 5432/5433 on the host (Incus `proxy` devices,
+`bind=host` on the `pg-proxy` container) and opens them on firewalld, so they
+survive reboots, promotes and snapshot restores. The endpoint auto-picks your
+primary NIC's IP; override with `PG_HOST_IP` in `.env`. The backends keep pinned
+incusbr0 IPs that the proxy dials (override with `PG_BACKEND_A_IP`/`_B_IP`), but
+clients never need them.
 
 > **Security:** the database is now reachable by *anything on your LAN*, guarded
 > only by the `$PG_PASSWORD`. That's fine for a trusted home/office network and
@@ -72,16 +74,11 @@ Port **5433** is the staging backend — the opposite slot. Useful for
 ad-hoc exploration of "the other dataset" or for verifying a dump
 mid-import.
 
-Port **5434** is a pooler-free direct line to the *active* backend (an incus
-`proxy` device on the bouncer, not a pgbouncer listener). Same stable IP and
-same promote-tracking as :5432, but no session stickiness — so test suites
-that `CREATE`/`DROP` databases work here. Through the pooled :5432 they fail
-with `ObjectInUse` ("database is being accessed by other users"), because
-pgbouncer keeps an idle server connection to the just-used database.
-
-```shell
-make pg.backend.endpoint            # prints the :5434 dsn for your test config
-```
+There's no connection pooler in the path: each port is a plain TCP passthrough
+to the backend, so `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared
+statements and advisory locks all behave exactly as a direct connection.
+(That's why there's no separate "direct" port — the old `:5434` existed only to
+dodge pgbouncer's session-pooling `ObjectInUse`, which no longer applies.)
 
 Overview command
 
@@ -91,8 +88,8 @@ make pg.ip pg.status pg.snapshots
 
 ## Importing a fresh dump (the headline workflow)
 
-This is what this repo exists for. The import runs on staging through the
-bouncer; the active backend keeps serving live queries the entire time.
+This is what this repo exists for. The import runs on the staging backend
+(`:5433`); the active backend keeps serving live queries the entire time.
 
 ```shell
 # 1. Wipe staging back to its clean `initial` snapshot.
@@ -102,7 +99,7 @@ scripts/pg-dev-local staging.reset
      2026-06-01T17-20-21_dump_import
 Continue? [Y/n]
 
-# 2. Restore the dump through the bouncer's staging port (:5433).
+# 2. Restore the dump through the staging port (:5433).
 $ pg_restore --host=<host-ip> --port=5433 --dbname=$PG_DB \
            --jobs=4 your-dump.pgdump          # ~90 min, no blocking
 
@@ -112,10 +109,9 @@ $ psql -h <host-ip> -p 5433 -d $PG_DB -c '\dt'
 # 4. Checkpoint the loaded state on the staging slot.
 $ pg.staging.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
 
-# 5. Promote. Sub-second; clients keep their TCP connections through the
-#    bouncer; the dataset underneath flips. (If an idle client is holding a
-#    session open, promote waits PROMOTE_PAUSE_TIMEOUT=10s for it to drain,
-#    then forces it off so it can't stall — that client just reconnects.)
+# 5. Promote. Sub-second; the :5432 endpoint is unchanged, but open
+#    connections are dropped so clients reconnect onto the freshly imported
+#    dataset (the proxy re-points :5432 to the new active backend).
 $ make pg.promote
 ```
 
@@ -155,13 +151,13 @@ to stage multiple checkpoints before a promote.
 ```shell
 make pg.status        # active slot + container states
 make pg.endpoint      # both ports with their roles + .pgpass line
-make pg.bouncer.logs  # tail both pgbouncer instances
+make pg.logs          # tail the active backend's postgres log
 ```
 
 ## Tearing down
 
 ```shell
-make pg.down          # delete pg-dev-a, pg-dev-b, pg-bouncer (irreversible)
+make pg.down          # delete pg-dev-a, pg-dev-b, pg-proxy (irreversible)
 make stop             # stop the three containers, leave the incus daemon up
 make delete           # same as pg.down — destroy the containers + their snapshots
 make recreate         # delete, then start (re-provision with `make pg.up`)
