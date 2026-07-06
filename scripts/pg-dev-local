@@ -2,15 +2,21 @@
 set -euo pipefail
 # set -x
 
-# pg-dev-local — two PostgreSQL backends behind a dual-listener pgbouncer.
-# See SPEC.md for the design.
+# pg-dev-local — two PostgreSQL backends, two host ports, one tiny proxy.
 #
 #   pg-dev-a, pg-dev-b   long-lived backends with their own snapshot timelines
-#   pg-bouncer           one container, two pgbouncer instances:
-#                          :5432  active  (current data)
-#                          :5433  staging (import target / opposite of active)
-#                        cross-connect enforced by rendering both inis from
-#                        one state file (var/active-slot).
+#   pg-proxy             a bare container that hosts two host-bound incus
+#                        `proxy` devices — no software installed:
+#                          host :5432  → the *active*  backend's Postgres
+#                          host :5433  → the *staging* backend's Postgres
+#                        The forkproxies run on the host (bind=host) and dial
+#                        the backends' pinned incusbr0 IPs. `promote` just flips
+#                        var/active-slot and re-points the two `connect` targets.
+#
+# There is no pgbouncer: each port is a plain per-connection TCP passthrough,
+# indistinguishable from a direct connection (prepared statements, SET, LISTEN,
+# CREATE/DROP DATABASE all work), so no pooling, no userlist/SCRAM to maintain,
+# no PAUSE/RESUME drain on promote, and no separate "direct" port.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
@@ -20,43 +26,23 @@ PG_USER="${PG_USER:?PG_USER must be set in .env}"
 PG_DB="${PG_DB:?PG_DB must be set in .env}"
 PG_PASSWORD="${PG_PASSWORD:?PG_PASSWORD must be set in .env}"
 
-# Same secret for the bouncer admin user. Dev convenience: one .pgpass line
-# covers everything. SPEC.md says this loudly.
-PG_BOUNCER_ADMIN_PASSWORD="$PG_PASSWORD"
-
 IMAGE=images:ubuntu/24.04/cloud
 BACKEND_PREFIX=pg-dev
 BACKEND_A="${BACKEND_PREFIX}-a"
 BACKEND_B="${BACKEND_PREFIX}-b"
-BOUNCER=pg-bouncer
+PROXY=pg-proxy
 STATE_DIR="$REPO_ROOT/var"
 STATE_FILE="$STATE_DIR/active-slot"
 
-# A pooler-free direct line to the *active* backend. An incus `proxy` device
-# on the bouncer forwards this port (on the bouncer's stable IP) straight to
-# the active backend's Postgres — a per-connection TCP relay, not a pool. It
-# follows promote (we re-point its `connect` whenever active flips) yet, unlike
-# :5432/:5433, carries no session stickiness: a client disconnect tears down
-# the backend connection, so "DROP DATABASE" in test teardown succeeds instead
-# of failing with ObjectInUse. Use it for suites that CREATE/DROP databases.
-# Client-facing ports. On native Incus these are exposed on the *host* (see
-# _set_host_forwards) so LAN machines can reach Postgres at the host's IP —
-# not just the incusbr0-private bouncer IP. Override in .env if they clash
+# Client-facing ports, published on the *host* (see _set_host_forwards) so LAN
+# machines can reach Postgres at the host's IP. Override in .env if they clash
 # with something already listening on the host.
 ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"
 STAGING_PORT="${PG_STAGING_PORT:-5433}"
-DIRECT_PORT="${PG_DIRECT_PORT:-5434}"
 
-# incus proxy device names on the bouncer, one per host-exposed port.
-HOST_ACTIVE_DEVICE=hostactive
-HOST_STAGING_DEVICE=hoststaging
-DIRECT_DEVICE=pgdirect
-
-# How long promote lets PAUSE drain cleanly before forcing the swap with KILL.
-# PAUSE only *returns* once every server is released; in session pooling an
-# idle-but-connected client never releases on its own, so a bare PAUSE hangs
-# forever. See _promote_drain.
-PROMOTE_PAUSE_TIMEOUT="${PROMOTE_PAUSE_TIMEOUT:-10}"
+# incus proxy device names on pg-proxy, one per host-exposed port.
+MAIN_DEVICE=main
+STAGING_DEVICE=staging
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -77,23 +63,13 @@ _set_active() {
 }
 
 # ---------------------------------------------------------------------------
-# Bouncer helpers
+# Network helpers
 # ---------------------------------------------------------------------------
 
-_bouncer_ip() {
-    # Empty if pg-bouncer has no IPv4 (e.g. it's stopped). `|| true` so
-    # pipefail doesn't trip on grep finding nothing.
-    incus list "$BOUNCER" --format csv -c 4 2>/dev/null \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1 || true
-}
-
 # The host's primary LAN IPv4 — the address LAN clients use to reach the
-# host-forwarded ports (5432/5433/5434). The incusbr0-private bouncer IP is
-# only reachable from this host; the host-bound proxy devices republish the
-# ports on every host interface (listen 0.0.0.0), so any of the host's LAN
-# addresses works — we just report the primary one. Override with PG_HOST_IP
-# in .env if the auto-pick grabs the wrong NIC.
+# host-forwarded ports. The proxy devices listen on every host interface
+# (0.0.0.0), so any of the host's addresses works; we just report the primary
+# one. Override with PG_HOST_IP in .env if the auto-pick grabs the wrong NIC.
 _host_ip() {
     if [[ -n "${PG_HOST_IP:-}" ]]; then echo "$PG_HOST_IP"; return; fi
     local ip
@@ -120,25 +96,17 @@ _incusbr0_prefix() {
     echo "${prefix%%/*}"
 }
 
-# Derive a stable IP for the bouncer in the incusbr0 subnet (e.g. 10.x.x.10),
-# unless PG_BOUNCER_IP is set in .env.
-_pick_bouncer_ip() {
-    if [[ -n "${PG_BOUNCER_IP:-}" ]]; then
-        echo "$PG_BOUNCER_IP"
-        return
-    fi
-    echo "$(_incusbr0_prefix).10"
-}
-
-# Static IPs for the backends. Like the bouncer, the backends MUST keep a
-# stable address: pgbouncer reaches them by container name (host=pg-dev-a),
-# which Incus resolves from a dnsmasq DNS record built off the DHCP lease.
-# Dynamic leases — and thus those A records — are wiped on a VM reboot,
-# leaving pgbouncer unable to resolve the backend and every client stalled.
-# A pinned ipv4.address yields a STATIC lease that Incus regenerates on
-# daemon start, so the record survives. Override in .env if .11/.12 clash.
+# Static IPs for the backends. They MUST keep a stable address: the proxy
+# devices dial them by IP, and a pinned ipv4.address yields a STATIC lease that
+# Incus regenerates on daemon start (so the target survives a host reboot). A
+# dynamic lease could drift to a different address and break the forward.
+# Override in .env if .11/.12 clash.
 _pick_backend_a_ip() { echo "${PG_BACKEND_A_IP:-$(_incusbr0_prefix).11}"; }
 _pick_backend_b_ip() { echo "${PG_BACKEND_B_IP:-$(_incusbr0_prefix).12}"; }
+
+# The pinned IP of whichever backend is currently active / staging.
+_active_backend_ip()  { [[ "$(_active)" == a ]] && _pick_backend_a_ip || _pick_backend_b_ip; }
+_staging_backend_ip() { [[ "$(_active)" == a ]] && _pick_backend_b_ip || _pick_backend_a_ip; }
 
 # The current IPv4 of a container, or empty if it has none / doesn't exist.
 _container_ip() {
@@ -174,12 +142,10 @@ _wait_ipv4() {
 }
 
 # _repair_backend_ip <container> <wanted-ip>
-# Make sure <container> owns the pinned static IP <wanted-ip> and that the
-# bouncer resolves its name to it. This is the self-heal for backends that
-# predate IP pinning (their eth0 is unpinned, so they hold a DYNAMIC lease
-# whose DNS record c-ares resolves only intermittently → clients stall) or
-# whose lease has otherwise drifted. Fully idempotent: when everything is
-# already correct it touches nothing, so it's safe on every bouncer.reload.
+# Make sure <container> owns the pinned static IP <wanted-ip>. Self-heal for a
+# backend whose lease has drifted (e.g. provisioned before pinning). Idempotent:
+# when the address is already correct it touches nothing, so it's safe to run on
+# every `make start`.
 _repair_backend_ip() {
     local container="$1" want="$2"
     [[ -z "$want" ]] && return 0
@@ -203,94 +169,33 @@ _repair_backend_ip() {
         incus restart "$container"
         _wait_ipv4 "$container" "$want"
     fi
-
-    # 3) Keep an /etc/hosts entry in the bouncer in lockstep with the pin.
-    #    pgbouncer's c-ares resolver is flaky against the dual A/AAAA records
-    #    served by the systemd-resolved stub; a hosts entry makes resolution
-    #    deterministic and IPv4-only, and a static pin keeps it from staling.
-    if [[ "$(_state "$BOUNCER")" == "RUNNING" ]]; then
-        incus exec "$BOUNCER" -- bash -c "
-            sed -i '/[[:space:]]${container}\$/d' /etc/hosts
-            echo '${want} ${container}' >> /etc/hosts
-        "
-    fi
-}
-
-# _bouncer_admin <role: active|staging> <SQL...>
-# Admin access is the special `pgbouncer` virtual database on the same
-# listen_port as data — pgbouncer doesn't expose a separate admin port.
-_bouncer_admin() {
-    local role="$1"; shift
-    local port
-    case "$role" in
-        active)  port=5432 ;;
-        staging) port=5433 ;;
-        *) echo "bad role: $role" >&2; exit 1 ;;
-    esac
-    incus exec "$BOUNCER" -- env PGPASSWORD="$PG_BOUNCER_ADMIN_PASSWORD" \
-        psql -h 127.0.0.1 -p "$port" -U pgb_admin -d pgbouncer -c "$*"
-}
-
-# _render_ini <role: active|staging> <listen_port> <backend container name>
-_render_ini() {
-    local role="$1" port="$2" backend="$3"
-    incus exec "$BOUNCER" -- tee "/etc/pgbouncer/${role}.ini" > /dev/null <<EOF
-;; rendered by pg-dev-local — do not edit by hand
-[databases]
-${PG_DB} = host=${backend} dbname=${PG_DB}
-* = host=${backend}
-
-[pgbouncer]
-listen_addr = *
-listen_port = ${port}
-unix_socket_dir = /var/run/pgbouncer-${role}
-auth_type = scram-sha-256
-auth_file = /etc/pgbouncer/userlist.txt
-admin_users = pgb_admin
-stats_users = pgb_admin
-pool_mode = session
-server_reset_query = DISCARD ALL
-ignore_startup_parameters = extra_float_digits,statement_timeout,lock_timeout,idle_in_transaction_session_timeout,search_path,default_transaction_isolation,default_transaction_read_only,default_transaction_deferrable
-logfile = /var/log/pgbouncer/${role}.log
-pidfile = /var/run/pgbouncer/${role}.pid
-EOF
-}
-
-# The pinned IP of whichever backend is currently active.
-_active_backend_ip() {
-    if [[ "$(_active)" == a ]]; then _pick_backend_a_ip; else _pick_backend_b_ip; fi
 }
 
 # _ensure_host_proxy <device> <host-port> <connect-addr>
-# Create-or-re-point a *host-bound* incus proxy device on the bouncer. With
-# bind=host the forkproxy listens on the host's 0.0.0.0:<host-port>, so the
-# port is reachable from other LAN machines at the host's IP (open it on the
-# firewall too — `make firewall`). Idempotent: created once, then only its
-# `connect` target is updated on later calls.
+# Create-or-re-point a *host-bound* incus proxy device on pg-proxy. With
+# bind=host the forkproxy listens on the host's 0.0.0.0:<host-port> — reachable
+# from other LAN machines at the host's IP (open the firewall too: `make
+# firewall`) — and dials <connect-addr> from inside pg-proxy's netns. Idempotent:
+# created once, then only its `connect` target is updated on later calls.
 _ensure_host_proxy() {
     local dev="$1" port="$2" connect="$3"
-    if incus config device get "$BOUNCER" "$dev" connect >/dev/null 2>&1; then
-        incus config device set "$BOUNCER" "$dev" connect="$connect"
+    if incus config device get "$PROXY" "$dev" connect >/dev/null 2>&1; then
+        incus config device set "$PROXY" "$dev" connect="$connect"
     else
         echo "==> Adding host-forward proxy $(_host_ip):${port} → ${connect}..."
-        incus config device add "$BOUNCER" "$dev" proxy \
+        incus config device add "$PROXY" "$dev" proxy \
             listen="tcp:0.0.0.0:${port}" connect="$connect" bind=host >/dev/null
     fi
 }
 
-# Publish the bouncer's three ports on the host so LAN clients can connect at
-# the host's IP. Two point at the stable bouncer IP (pooled active :5432 /
-# staging :5433); the third is the pooler-free direct line to whichever backend
-# is active, so it is re-pointed on every promote. Idempotent; a no-op when the
-# bouncer isn't running. Called from up / promote / bouncer.reload (and thus on
+# Publish the two ports on the host: :ACTIVE_PORT → active backend, :STAGING_PORT
+# → staging backend. Re-pointed on every promote (active/staging swap). A no-op
+# when pg-proxy isn't running. Called from up / promote / refresh (and thus on
 # every `make start`), so the forwards are re-asserted after any host reboot.
 _set_host_forwards() {
-    [[ "$(_state "$BOUNCER")" == "RUNNING" ]] || return 0
-    local bip
-    bip=$(_bouncer_ip)
-    _ensure_host_proxy "$HOST_ACTIVE_DEVICE"  "$ACTIVE_PORT"  "tcp:${bip}:5432"
-    _ensure_host_proxy "$HOST_STAGING_DEVICE" "$STAGING_PORT" "tcp:${bip}:5433"
-    _ensure_host_proxy "$DIRECT_DEVICE"       "$DIRECT_PORT"  "tcp:$(_active_backend_ip):5432"
+    [[ "$(_state "$PROXY")" == "RUNNING" ]] || return 0
+    _ensure_host_proxy "$MAIN_DEVICE"    "$ACTIVE_PORT"  "tcp:$(_active_backend_ip):5432"
+    _ensure_host_proxy "$STAGING_DEVICE" "$STAGING_PORT" "tcp:$(_staging_backend_ip):5432"
 }
 
 # ---------------------------------------------------------------------------
@@ -306,7 +211,7 @@ _provision_backend() {
     echo "==> Waiting for IPv4 on $container..."
     _wait_ipv4 "$container"
 
-    echo "==> Pinning $container eth0 → $ip (static lease → durable DNS record)..."
+    echo "==> Pinning $container eth0 → $ip (static lease → stable proxy target)..."
     incus config device override "$container" eth0 ipv4.address="$ip"
     incus restart "$container"
     _wait_ipv4 "$container" "$ip"
@@ -378,103 +283,17 @@ SQL
     incus resume "$container"
 }
 
-_provision_bouncer() {
-    local bouncer_ip="$1"
+# pg-proxy is a bare container: no packages, no config. It exists only to host
+# the two host-bound proxy devices (added by _set_host_forwards). The forkproxies
+# run on the host and dial the backends over incusbr0 from pg-proxy's netns, so
+# pg-proxy just needs to be running with an incusbr0 address — its own IP is an
+# internal detail and need not be pinned.
+_provision_proxy() {
+    echo "==> Launching $PROXY (bare host-forward container)..."
+    incus launch --verbose "$IMAGE" "$PROXY"
 
-    echo "==> Launching $BOUNCER..."
-    incus launch --verbose "$IMAGE" "$BOUNCER"
-
-    echo "==> Waiting for IPv4 on $BOUNCER..."
-    _wait_ipv4 "$BOUNCER"
-
-    echo "==> Pinning $BOUNCER eth0 → $bouncer_ip..."
-    incus config device override "$BOUNCER" eth0 ipv4.address="$bouncer_ip"
-    incus restart "$BOUNCER"
-    _wait_ipv4 "$BOUNCER" "$bouncer_ip"
-
-    echo "==> Installing pgbouncer + psql client on $BOUNCER..."
-    incus exec --verbose "$BOUNCER" -- bash <<'SETUP'
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update -q
-apt-get install -y --no-install-recommends pgbouncer postgresql-client
-
-# The Debian package ships a single-instance unit. We replace it with a
-# template so we can run active and staging side by side.
-systemctl disable --now pgbouncer.service 2>/dev/null || true
-
-# /var/run is tmpfs and wiped on every boot, so a one-time mkdir wouldn't
-# survive a container/VM restart — pgbouncer would then fail to create its
-# unix socket and exit. Declare the socket/pid dirs via tmpfiles.d so systemd
-# recreates them on every boot. /var/log is persistent, so a mkdir is fine.
-cat > /etc/tmpfiles.d/pgbouncer-dev.conf <<'TMPFILES'
-d /run/pgbouncer          0755 postgres postgres -
-d /run/pgbouncer-active   0755 postgres postgres -
-d /run/pgbouncer-staging  0755 postgres postgres -
-TMPFILES
-systemd-tmpfiles --create /etc/tmpfiles.d/pgbouncer-dev.conf
-
-mkdir -p /var/log/pgbouncer
-chown postgres:postgres /var/log/pgbouncer
-
-cat > /etc/systemd/system/pgbouncer@.service <<'UNIT'
-[Unit]
-Description=pgbouncer (%i instance)
-After=network.target
-
-[Service]
-Type=simple
-User=postgres
-Group=postgres
-ExecStart=/usr/sbin/pgbouncer /etc/pgbouncer/%i.ini
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-SETUP
-
-    echo "==> Writing userlist.txt..."
-    incus exec "$BOUNCER" -- tee /etc/pgbouncer/userlist.txt > /dev/null <<EOF
-"$PG_USER" "$PG_PASSWORD"
-"pgb_admin" "$PG_BOUNCER_ADMIN_PASSWORD"
-EOF
-    incus exec "$BOUNCER" -- chown postgres:postgres /etc/pgbouncer/userlist.txt
-    incus exec "$BOUNCER" -- chmod 640 /etc/pgbouncer/userlist.txt
-
-    echo "==> Rendering pgbouncer inis (active→$BACKEND_A, staging→$BACKEND_B)..."
-    _render_ini active  5432 "$BACKEND_A"
-    _render_ini staging 5433 "$BACKEND_B"
-
-    echo "==> Enabling and starting pgbouncer@{active,staging}..."
-    incus exec "$BOUNCER" -- systemctl enable --now \
-        pgbouncer@active pgbouncer@staging
-
-    # Tiny readiness probe.
-    local tries=0
-    until _bouncer_admin active "SHOW VERSION;" >/dev/null 2>&1; do
-        tries=$((tries + 1))
-        if (( tries > 20 )); then
-            echo "ERROR: pgbouncer@active not responding on :5432" >&2
-            incus exec "$BOUNCER" -- journalctl -u pgbouncer@active --no-pager | tail -n 40 >&2
-            exit 1
-        fi
-        sleep 1
-    done
-    tries=0
-    until _bouncer_admin staging "SHOW VERSION;" >/dev/null 2>&1; do
-        tries=$((tries + 1))
-        if (( tries > 20 )); then
-            echo "ERROR: pgbouncer@staging not responding on :5433" >&2
-            incus exec "$BOUNCER" -- journalctl -u pgbouncer@staging --no-pager | tail -n 40 >&2
-            exit 1
-        fi
-        sleep 1
-    done
+    echo "==> Waiting for IPv4 on $PROXY..."
+    _wait_ipv4 "$PROXY"
 }
 
 # ---------------------------------------------------------------------------
@@ -482,35 +301,36 @@ EOF
 # ---------------------------------------------------------------------------
 
 cmd_up() {
-    if incus info pg-dev > /dev/null 2>&1; then
-        cat <<MSG
-NOTE: a legacy 'pg-dev' container exists alongside this setup. It won't
-conflict — the new system uses pg-dev-a, pg-dev-b, pg-bouncer — but it
+    for legacy in pg-dev pg-bouncer; do
+        if incus info "$legacy" > /dev/null 2>&1; then
+            cat <<MSG
+NOTE: a legacy '$legacy' container exists alongside this setup. It won't
+conflict — the current system uses pg-dev-a, pg-dev-b, pg-proxy — but it
 will sit there using disk/memory until you delete it:
 
-    incus delete pg-dev --force
+    incus delete $legacy --force
 
 Continuing in 1s...
 MSG
-        sleep 1
-    fi
+            sleep 1
+        fi
+    done
 
-    for c in "$BACKEND_A" "$BACKEND_B" "$BOUNCER"; do
+    for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
         if incus info "$c" > /dev/null 2>&1; then
             echo "Container '$c' already exists — run '$0 down' first."
             exit 1
         fi
     done
 
-    local bouncer_ip backend_a_ip backend_b_ip
-    bouncer_ip=$(_pick_bouncer_ip)
+    local backend_a_ip backend_b_ip
     backend_a_ip=$(_pick_backend_a_ip)
     backend_b_ip=$(_pick_backend_b_ip)
-    echo "==> Static IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip  $BOUNCER=$bouncer_ip"
+    echo "==> Static backend IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip"
 
     _provision_backend "$BACKEND_A" "$backend_a_ip"
     _provision_backend "$BACKEND_B" "$backend_b_ip"
-    _provision_bouncer "$bouncer_ip"
+    _provision_proxy
 
     _set_active a
     _set_host_forwards
@@ -522,7 +342,8 @@ MSG
 }
 
 cmd_down() {
-    for c in "$BOUNCER" "$BACKEND_A" "$BACKEND_B"; do
+    # pg-bouncer is listed for cleanup when upgrading from the old layout.
+    for c in "$PROXY" pg-bouncer "$BACKEND_A" "$BACKEND_B"; do
         incus delete "$c" --force 2>/dev/null || true
     done
     rm -f "$STATE_FILE"
@@ -533,12 +354,12 @@ cmd_status() {
     a=$(_active); s=$(_staging)
     echo "active slot: $a   (active = ${BACKEND_PREFIX}-${a}, staging = ${BACKEND_PREFIX}-${s})"
     echo
-    incus list '^(pg-dev-(a|b)|pg-bouncer)$'
+    incus list '^(pg-dev-(a|b)|pg-proxy)$'
 }
 
 cmd_endpoint() {
-    if [[ "$(_state "$BOUNCER")" != "RUNNING" ]]; then
-        echo "ERROR: pg-bouncer is not running — 'make start' (then 'make pg.up' if it was never provisioned)." >&2
+    if [[ "$(_state "$PROXY")" != "RUNNING" ]]; then
+        echo "ERROR: $PROXY is not running — 'make start' (then 'make pg.up' if it was never provisioned)." >&2
         exit 1
     fi
     local ip
@@ -555,56 +376,6 @@ If a LAN client can't connect, open the ports on the firewall: make firewall
 EOF
 }
 
-cmd_backend_endpoint() {
-    if [[ "$(_state "$BOUNCER")" != "RUNNING" ]]; then
-        echo "ERROR: pg-bouncer is not running — 'make start' (then 'make pg.up' if it was never provisioned)." >&2
-        exit 1
-    fi
-    local ip
-    ip=$(_host_ip)
-    cat <<EOF
-direct   host=$ip port=$DIRECT_PORT dbname=$PG_DB   (active backend, NO pooling)
-
-A stable, promote-aware TCP forward (an incus proxy device on the bouncer):
-the host/port never change and always route to whichever backend is active,
-but — unlike the pooled :5432 — it carries no session stickiness. A client
-disconnect tears down the backend connection, so test teardown's
-"DROP DATABASE" succeeds instead of failing with ObjectInUse.
-
-Use this for test suites that CREATE/DROP databases.
-
-DSN:
-    postgresql://$PG_USER@$ip:$DIRECT_PORT/$PG_DB
-EOF
-}
-
-# PAUSE that cannot hang. PAUSE takes effect immediately but only *returns*
-# once every server is released; in session pooling an idle-but-connected
-# client never releases, so a bare PAUSE waits forever. We give it
-# PROMOTE_PAUSE_TIMEOUT seconds to drain cleanly — in that path clients keep
-# their TCP connection and get re-routed on their next query — then force the
-# swap with KILL, which drops the lingering idle clients (they reconnect to the
-# new backend on their next query). Either way the db ends up paused, which the
-# RESUME later in cmd_promote clears.
-_promote_drain() {
-    local role="$1" port="$2"
-    incus exec "$BOUNCER" -- env PGPASSWORD="$PG_BOUNCER_ADMIN_PASSWORD" \
-        psql -h 127.0.0.1 -p "$port" -U pgb_admin -d pgbouncer \
-        -c "PAUSE $PG_DB;" >/dev/null 2>&1 &
-    local pid=$! waited=0
-    while kill -0 "$pid" 2>/dev/null; do
-        if (( waited >= PROMOTE_PAUSE_TIMEOUT )); then
-            kill "$pid" 2>/dev/null || true
-            echo "==> $role: PAUSE didn't drain in ${PROMOTE_PAUSE_TIMEOUT}s" \
-                 "(idle session clients) — forcing them off with KILL..."
-            _bouncer_admin "$role" "KILL $PG_DB;" >/dev/null
-            break
-        fi
-        sleep 1; waited=$((waited + 1))
-    done
-    wait "$pid" 2>/dev/null || true
-}
-
 cmd_promote() {
     local from to
     from=$(_active)
@@ -612,21 +383,12 @@ cmd_promote() {
 
     echo "==> Promoting: active $from → $to"
 
-    # Drain (or force) both listeners. Admin commands work while paused, so we
-    # can still RELOAD / RESUME below.
-    _promote_drain active  5432
-    _promote_drain staging 5433
-
-    _render_ini active  5432 "${BACKEND_PREFIX}-${to}"
-    _render_ini staging 5433 "${BACKEND_PREFIX}-${from}"
-
-    _bouncer_admin active  "RELOAD;"        >/dev/null
-    _bouncer_admin staging "RELOAD;"        >/dev/null
-    _bouncer_admin active  "RESUME $PG_DB;" >/dev/null
-    _bouncer_admin staging "RESUME $PG_DB;" >/dev/null
-
+    # Flip the pointer, then re-point both host forwards. Re-pointing a proxy
+    # device's `connect` restarts its forkproxy, so any open TCP connection is
+    # dropped — clients reconnect (to the new active on :$ACTIVE_PORT, or the
+    # new staging on :$STAGING_PORT). The host:port endpoints never change.
     _set_active "$to"
-    _set_host_forwards   # re-point the pooler-free :$DIRECT_PORT at the new active
+    _set_host_forwards
 
     echo "==> Promoted. Active: ${BACKEND_PREFIX}-${to}   Staging: ${BACKEND_PREFIX}-${from}"
     echo
@@ -766,17 +528,10 @@ cmd_staging_psql() { _psql "$(_c_staging)" "$@"; }
 cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
 cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
 
-_ip() {
-    # Empty if container has no IPv4 (stopped, frozen, just-launched).
-    incus list "$1" --format csv -c 4 2>/dev/null \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1 || true
-}
-
 # IPv4 when running; otherwise the lifecycle state (STOPPED, FROZEN, …).
 _ip_or_state() {
     local container="$1" ip
-    ip=$(_ip "$container")
+    ip=$(_container_ip "$container")
     if [[ -n "$ip" ]]; then
         echo "$ip"
     else
@@ -784,23 +539,22 @@ _ip_or_state() {
     fi
 }
 
-# Unified port + backend view for both slots. The bouncer endpoint
-# (host:port) is the client-facing fact; the backend column shows its
-# container IP when running, or its state (STOPPED, …) when not.
+# Unified port + backend view for both slots. The host endpoint (host:port) is
+# the client-facing fact; the backend column shows its container IP when
+# running, or its state (STOPPED, …) when not.
 cmd_ip() {
-    local a s info_a info_s bouncer_ip endpoint_a endpoint_s
+    local a s info_a info_s endpoint_a endpoint_s host_ip pstate
     a=$(_active); s=$(_staging)
     info_a=$(_ip_or_state "${BACKEND_PREFIX}-${a}")
     info_s=$(_ip_or_state "${BACKEND_PREFIX}-${s}")
-    bouncer_ip=$(_bouncer_ip)
-    if [[ -n "$bouncer_ip" ]]; then
-        local host_ip
+    pstate=$(_state "$PROXY")
+    if [[ "$pstate" == "RUNNING" ]]; then
         host_ip=$(_host_ip)
         endpoint_a="${host_ip}:${ACTIVE_PORT}"
         endpoint_s="${host_ip}:${STAGING_PORT}"
     else
-        endpoint_a="pg-bouncer $(_state "$BOUNCER")"
-        endpoint_s="pg-bouncer $(_state "$BOUNCER")"
+        endpoint_a="$PROXY ${pstate:-none}"
+        endpoint_s="$endpoint_a"
     fi
     printf '%-8s  %-22s  →  %-10s (%s)\n' \
         active  "$endpoint_a" "${BACKEND_PREFIX}-${a}" "$info_a"
@@ -811,35 +565,15 @@ cmd_ip() {
 cmd_logs()         { incus exec "$(_c_active)"  -- tail -f /var/log/postgresql/postgresql-17-main.log; }
 cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/postgresql-17-main.log; }
 
-cmd_bouncer_logs() {
-    incus exec "$BOUNCER" -- \
-        tail -f /var/log/pgbouncer/active.log /var/log/pgbouncer/staging.log
-}
-
-cmd_bouncer_reload() {
-    # Self-heal the backends' static IP pinning before reloading. Backends
-    # provisioned before pinning (or with a drifted lease) would otherwise
-    # leave pgbouncer unable to resolve them by name. Idempotent — a no-op
-    # when both backends already sit on their pinned addresses.
+# Re-pin the backends' static IPs (self-heal a drifted lease), then re-point the
+# host forwards from current state. Idempotent; run on every `make start` so the
+# forwards survive a host reboot. Also how a deployment provisioned before these
+# devices existed acquires them.
+cmd_refresh() {
     _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"
     _repair_backend_ip "$BACKEND_B" "$(_pick_backend_b_ip)"
-
-    # Re-render both inis from the current pointer state, then RELOAD both
-    # pgbouncer instances. Useful after a config change to _render_ini.
-    local a s
-    a=$(_active); s=$(_staging)
-    _render_ini active  5432 "${BACKEND_PREFIX}-${a}"
-    _render_ini staging 5433 "${BACKEND_PREFIX}-${s}"
-    _bouncer_admin active  "RELOAD;" >/dev/null
-    _bouncer_admin staging "RELOAD;" >/dev/null
-
-    # Create-or-re-point all three host-bound forwards in lockstep. This is
-    # also how existing deployments (provisioned before these devices existed)
-    # acquire them — and `make start` runs bouncer.reload, so they're
-    # re-asserted on every host boot.
     _set_host_forwards
-
-    echo "Reloaded pgbouncer@active and pgbouncer@staging."
+    echo "Refreshed host forwards (:$ACTIVE_PORT → active, :$STAGING_PORT → staging)."
 }
 
 # ---------------------------------------------------------------------------
@@ -899,17 +633,15 @@ usage() {
 Usage: $(basename "$0") <command> [args]
 
 Lifecycle:
-  up                              provision pg-dev-a, pg-dev-b, pg-bouncer
+  up                              provision pg-dev-a, pg-dev-b, pg-proxy
   down                            delete all three containers
   status                          show pointer + container states
-  endpoint                        print bouncer host/port roles + .pgpass line
-  backend-endpoint                print the stable, promote-aware, pooler-free
-                                  direct dsn (:$DIRECT_PORT) — use for tests
-                                  that CREATE/DROP databases
-  promote                         flip active↔staging on both bouncer instances
+  endpoint                        print host/port roles + .pgpass line
+  promote                         flip active↔staging (re-point both forwards)
+  refresh                         re-pin backend IPs + re-assert host forwards
 
 Both slots (rendered side by side):
-  ip                              bouncer endpoint → backend, for both slots
+  ip                              host endpoint → backend, for both slots
   snapshots                       snapshot lists for active and staging
 
 Active slot (whatever is currently active):
@@ -931,10 +663,6 @@ Staging slot (the other one):
   staging.stop                    stop staging backend
   staging.start                   start staging backend
 
-Bouncer:
-  bouncer.logs                    tail both pgbouncer logs
-  bouncer.reload                  re-render both inis from state and RELOAD
-
 Export / import (act on the active backend):
   export                          export active backend to var/<name>-<ts>.tar.gz
   import-last                     re-import most recent export of active backend
@@ -951,9 +679,9 @@ case "${1:-}" in
     up)             shift; cmd_up "$@" ;;
     down)           shift; cmd_down "$@" ;;
     status)         shift; cmd_status "$@" ;;
-    endpoint)         shift; cmd_endpoint "$@" ;;
-    backend-endpoint) shift; cmd_backend_endpoint "$@" ;;
-    promote)          shift; cmd_promote "$@" ;;
+    endpoint)       shift; cmd_endpoint "$@" ;;
+    promote)        shift; cmd_promote "$@" ;;
+    refresh)        shift; cmd_refresh "$@" ;;
 
     psql)           shift; cmd_psql "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
@@ -973,9 +701,6 @@ case "${1:-}" in
     staging.reset)        shift; cmd_staging_reset "$@" ;;
     staging.stop)         shift; cmd_staging_stop "$@" ;;
     staging.start)        shift; cmd_staging_start "$@" ;;
-
-    bouncer.logs)   shift; cmd_bouncer_logs "$@" ;;
-    bouncer.reload) shift; cmd_bouncer_reload "$@" ;;
 
     export)         shift; cmd_export "$@" ;;
     import-last)    shift; cmd_import_last "$@" ;;

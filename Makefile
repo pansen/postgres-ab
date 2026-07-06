@@ -3,8 +3,8 @@
 # Postgres ports are reachable from the LAN. See README.md.
 
 # Ports published on the host (LAN-wide). Keep in sync with pg-dev-local's
-# ACTIVE_PORT / STAGING_PORT / DIRECT_PORT.
-PG_PORTS := 5432-5434
+# ACTIVE_PORT / STAGING_PORT.
+PG_PORTS := 5432-5433
 
 -include .env
 export
@@ -69,10 +69,10 @@ _start:
 	@# Open the Postgres ports so other LAN hosts can connect.
 	@$(MAKE) firewall
 	@# Start any project containers that already exist (a no-op on a fresh host).
-	@for c in pg-dev-a pg-dev-b pg-bouncer; do incus start $$c >/dev/null 2>&1 || true; done
-	@# If the bouncer came up, re-assert its host forwards + backend IP pins.
-	@if [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
-		sleep 2 && $(MAKE) pg.bouncer.reload; \
+	@for c in pg-dev-a pg-dev-b pg-proxy; do incus start $$c >/dev/null 2>&1 || true; done
+	@# If the proxy came up, re-assert its host forwards + backend IP pins.
+	@if [ "$$(incus list pg-proxy --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
+		sleep 2 && $(MAKE) pg.refresh; \
 	fi
 	$(MAKE) status
 
@@ -108,7 +108,7 @@ status: status/incus pg.ip pg.snapshots
 # workloads on it) running. The counterpart to `make start`.
 .PHONY: stop
 stop:
-	@for c in pg-bouncer pg-dev-a pg-dev-b; do incus stop $$c 2>/dev/null || true; done
+	@for c in pg-proxy pg-dev-a pg-dev-b; do incus stop $$c 2>/dev/null || true; done
 	$(MAKE) status
 
 PG_DEV := scripts/pg-dev-local
@@ -131,13 +131,13 @@ pg.status:
 pg.endpoint:
 	@$(PG_DEV) endpoint
 
-.PHONY: pg.backend.endpoint
-pg.backend.endpoint:
-	@$(PG_DEV) backend-endpoint
-
 .PHONY: pg.promote
 pg.promote:
 	$(PG_DEV) promote
+
+.PHONY: pg.refresh
+pg.refresh:
+	$(PG_DEV) refresh
 
 # ----- active backend -----------------------------------------------------
 
@@ -212,18 +212,8 @@ pg.staging.stop:
 pg.staging.start:
 	$(PG_DEV) staging.start
 	sleep 1
-	$(PG_DEV) bouncer.reload
+	$(PG_DEV) refresh
 	$(MAKE) status
-
-# ----- bouncer ------------------------------------------------------------
-
-.PHONY: pg.bouncer.logs
-pg.bouncer.logs:
-	$(PG_DEV) bouncer.logs
-
-.PHONY: pg.bouncer.reload
-pg.bouncer.reload:
-	$(PG_DEV) bouncer.reload
 
 # ----- export / import (active backend) -----------------------------------
 
