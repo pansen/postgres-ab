@@ -40,6 +40,13 @@ STATE_FILE="$STATE_DIR/active-slot"
 ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"
 STAGING_PORT="${PG_STAGING_PORT:-5433}"
 
+# Resource caps applied to the two Postgres backends (the bare proxy keeps Incus
+# defaults). Read from .env; blank/unset → no explicit cap (inherit defaults).
+#   INCUS_CPU     vCPU count           → limits.cpu
+#   INCUS_MEMORY  gibibytes of RAM (n) → limits.memory=<n>GiB
+INCUS_CPU="${INCUS_CPU:-}"
+INCUS_MEMORY="${INCUS_MEMORY:-}"
+
 # incus proxy device names on pg-proxy, one per host-exposed port.
 MAIN_DEVICE=main
 STAGING_DEVICE=staging
@@ -202,11 +209,31 @@ _set_host_forwards() {
 # Provisioning
 # ---------------------------------------------------------------------------
 
+# Apply the configured CPU/memory caps to a backend container. Idempotent and
+# live — Incus applies limits.cpu / limits.memory to a running instance — so it
+# is safe to call at provision time and again from `refresh` after editing .env.
+# A blank INCUS_* leaves that limit untouched (Incus default). The trailing
+# `return 0` keeps a skipped-both run from tripping `set -e`.
+_apply_backend_limits() {
+    local container="$1"
+    if [[ -n "$INCUS_CPU" ]]; then
+        echo "==> Capping $container CPU → $INCUS_CPU vCPU..."
+        incus config set "$container" limits.cpu "$INCUS_CPU"
+    fi
+    if [[ -n "$INCUS_MEMORY" ]]; then
+        echo "==> Capping $container memory → ${INCUS_MEMORY}GiB..."
+        incus config set "$container" limits.memory "${INCUS_MEMORY}GiB"
+    fi
+    return 0
+}
+
 _provision_backend() {
     local container="$1" ip="$2"
 
     echo "==> Launching $container..."
     incus launch --verbose "$IMAGE" "$container"
+
+    _apply_backend_limits "$container"
 
     echo "==> Waiting for IPv4 on $container..."
     _wait_ipv4 "$container"
@@ -236,10 +263,10 @@ cat > /etc/postgresql/17/main/conf.d/99-dev.conf <<'PGCONF'
 listen_addresses = '*'
 dynamic_shared_memory_type = mmap
 
-shared_buffers = 2GB
+shared_buffers = 1GB
 effective_cache_size = 6GB
 work_mem = 32MB
-maintenance_work_mem = 512MB
+maintenance_work_mem = 1GB
 max_parallel_maintenance_workers = 4
 
 max_wal_size = 2GB
@@ -572,6 +599,9 @@ cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/p
 cmd_refresh() {
     _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"
     _repair_backend_ip "$BACKEND_B" "$(_pick_backend_b_ip)"
+    for c in "$BACKEND_A" "$BACKEND_B"; do
+        incus info "$c" >/dev/null 2>&1 && _apply_backend_limits "$c"
+    done
     _set_host_forwards
     echo "Refreshed host forwards (:$ACTIVE_PORT → active, :$STAGING_PORT → staging)."
 }
