@@ -261,7 +261,12 @@ apt-get install -y --no-install-recommends postgresql-17
 mkdir -p /etc/postgresql/17/main/conf.d
 cat > /etc/postgresql/17/main/conf.d/99-dev.conf <<'PGCONF'
 listen_addresses = '*'
-dynamic_shared_memory_type = mmap
+# posix → DSM lives in /dev/shm (RAM tmpfs, ~half of container RAM), not on the
+# data disk. Incus gives the container a large /dev/shm, so posix is safe here
+# and, unlike mmap, a full *data* disk fails a bulk load with a clean ENOSPC
+# error instead of SIGBUS-crashing a parallel worker (which takes the whole
+# cluster down mid-restore).
+dynamic_shared_memory_type = posix
 
 shared_buffers = 1GB
 effective_cache_size = 6GB
@@ -269,7 +274,12 @@ work_mem = 32MB
 maintenance_work_mem = 1GB
 max_parallel_maintenance_workers = 4
 
-max_wal_size = 2GB
+# Bulk loads (dump restores) write WAL at tens of MB/s; a small max_wal_size
+# forces a checkpoint every ~45s and each one flushes GBs of dirty buffers to
+# the CoW pool, stalling the COPY. 16GB + a long timeout ≈ checkpoints only
+# when genuinely needed. Disk cost is transient WAL in the pool (POOL_SIZE).
+max_wal_size = 16GB
+checkpoint_timeout = 30min
 checkpoint_completion_target = 0.8
 wal_level = minimal
 max_wal_senders = 0

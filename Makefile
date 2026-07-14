@@ -9,6 +9,14 @@ PG_PORTS := 5432-5433
 -include .env
 export
 
+# Size (GiB) of the default btrfs storage pool. It is a single loop-backed image
+# shared by all containers, so it must hold every backend's PGDATA + WAL + temp +
+# snapshots at once — a restore briefly needs old + new data side by side. The
+# Incus default (~30GiB) is far too small for real dumps and silently fills up
+# mid-restore (a full disk shows up as a Postgres "crash of another server
+# process", not a clean error). Override in .env if you need more/less.
+POOL_SIZE ?= 240
+
 # Install the host prerequisites and grant this user Incus access. Fedora/dnf;
 # adjust the package line for other distros. btrfs-progs lets `incus admin init`
 # build a copy-on-write pool (cheap snapshots) — the ZFS stand-in on Linux.
@@ -60,11 +68,36 @@ start:
 # The real bring-up. Assumes the incus daemon is reachable (see `start`).
 .PHONY: _start
 _start:
-	@# First-run init: create a storage pool + incusbr0 if none exist yet.
+	@# First-run init: create a storage pool + incusbr0 if none exist yet. Size
+	@# the btrfs loop pool to POOL_SIZE (the ~30GiB default fills up mid-restore).
+	@# Mark the disks dir NOCOW first: the loop image inherits it at creation, so
+	@# the host btrfs doesn't CoW+checksum every random write the pool makes into
+	@# the image (double-CoW halves Postgres bulk-load speed). Harmless on
+	@# non-btrfs hosts (chattr just fails); no effect on an image that already
+	@# exists — that needs an offline copy into a fresh +C file.
 	@if [ -z "$$(incus storage list --format csv 2>/dev/null)" ]; then \
-		echo "==> Initialising Incus (btrfs storage pool + incusbr0)..."; \
-		incus admin init --auto --storage-backend btrfs \
+		sudo chattr +C /var/lib/incus/disks 2>/dev/null || true; \
+		echo "==> Initialising Incus (btrfs storage pool $(POOL_SIZE)GiB + incusbr0)..."; \
+		incus admin init --auto --storage-backend btrfs --storage-create-loop $(POOL_SIZE) \
 			|| incus admin init --auto; \
+	fi
+	@# Disable CoW *inside* the pool too (same rationale, inner layer; snapshots
+	@# still work — post-snapshot writes CoW once). Data checksums are lost, fine
+	@# for throwaway dev DBs. Applies on next pool mount; idempotent.
+	@if [ "$$(incus storage get default btrfs.mount_options 2>/dev/null)" != "user_subvol_rm_allowed,nodatacow" ]; then \
+		incus storage set default btrfs.mount_options=user_subvol_rm_allowed,nodatacow 2>/dev/null || true; \
+	fi
+	@# Self-heal an existing loop pool that predates the sizing above (or an
+	@# earlier, smaller POOL_SIZE). Grow-only: btrfs loop pools can't shrink, so
+	@# a POOL_SIZE below the current size is left untouched. GiB → bytes for the
+	@# comparison ($(POOL_SIZE) * 2^30).
+	@cur=$$(incus storage get default size 2>/dev/null); \
+	if [ -n "$$cur" ] && [ "$${cur%GiB}" != "$$cur" ]; then \
+		curg=$${cur%GiB}; \
+		if [ "$$curg" -lt "$(POOL_SIZE)" ] 2>/dev/null; then \
+			echo "==> Growing default pool $${curg}GiB → $(POOL_SIZE)GiB..."; \
+			incus storage set default size=$(POOL_SIZE)GiB || true; \
+		fi; \
 	fi
 	@# Open the Postgres ports so other LAN hosts can connect.
 	@$(MAKE) firewall
