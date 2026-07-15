@@ -497,12 +497,89 @@ cmd_down() {
     rm -f "$STATE_FILE"
 }
 
+# Box-table renderer for cmd_status. Reads rows on stdin; columns are separated
+# by US (\037) and multi-line cells split on RS (\036). The first row is the
+# header (centered); data cells are left-aligned. Mirrors incus's own table
+# look (a border after every row) so the two outputs sit together naturally.
+_render_table() {
+    awk -v FSU=$'\037' -v SUB=$'\036' '
+    function rep(ch, n,   s) { s = ""; while (n-- > 0) s = s ch; return s }
+    function bord(   c, s) { s = "+"; for (c = 1; c <= ncol; c++) s = s rep("-", w[c] + 2) "+"; return s }
+    function ctr(str, width,   t, l) { t = width - length(str); l = int(t / 2); return rep(" ", l) str rep(" ", t - l) }
+    function prow(r,   i, c, val, line) {
+        for (i = 1; i <= ht[r]; i++) {
+            line = "|"
+            for (c = 1; c <= ncol; c++) {
+                val = (i <= ln[r, c]) ? cell[r, c, i] : ""
+                if (r == 1) line = line " " ctr(val, w[c]) " |"
+                else        line = line " " val rep(" ", w[c] - length(val)) " |"
+            }
+            print line
+        }
+    }
+    BEGIN { FS = FSU }
+    {
+        nr++
+        if (NF > ncol) ncol = NF
+        for (c = 1; c <= NF; c++) {
+            m = split($c, L, SUB)
+            if (m > ht[nr]) ht[nr] = m
+            ln[nr, c] = m
+            for (i = 1; i <= m; i++) {
+                cell[nr, c, i] = L[i]
+                if (length(L[i]) > w[c]) w[c] = length(L[i])
+            }
+        }
+        if (ht[nr] < 1) ht[nr] = 1
+        rows = nr
+    }
+    END {
+        print bord(); prow(1); print bord()
+        for (r = 2; r <= rows; r++) { prow(r); print bord() }
+    }
+    '
+}
+
+# One cmd_status row: NAME, STATE, client-facing ENDPOINT(s), and the
+# container's own internal IPs. Ports are the *role* mapping (constant across
+# promote), so they show even when the backend is stopped.
+_status_row() {
+    local c="$1" role="$2" bip="$3"
+    local RS=$'\036' US=$'\037'
+    local state endpoint ips
+    state=$(_state "$c"); [[ -z "$state" ]] && state="-"
+    if [[ -z "$bip" ]]; then
+        endpoint="-"
+    else
+        case "$role" in
+            active)  endpoint="${bip}:${ACTIVE_PORT} (direct)${RS}${bip}:${BOUNCER_ACTIVE_PORT} (pooled)" ;;
+            staging) endpoint="${bip}:${STAGING_PORT} (direct)${RS}${bip}:${BOUNCER_STAGING_PORT} (pooled)" ;;
+            *)       endpoint="${bip}" ;;
+        esac
+    fi
+    ips=$(incus list "$c" --format json 2>/dev/null \
+        | jq -r '.[0].state.network // {} | to_entries[] | select(.key != "lo") | .value.addresses[]? | select(.scope == "global") | .address' 2>/dev/null \
+        | paste -sd "$RS" -)
+    [[ -z "$ips" ]] && ips="-"
+    printf '%s%s%s%s%s%s%s\n' "$c" "$US" "$state" "$US" "$endpoint" "$US" "$ips"
+}
+
 cmd_status() {
-    local a s
+    local a s ca cs bip bstate
     a=$(_active); s=$(_staging)
-    echo "active slot: $a   (active = ${BACKEND_PREFIX}-${a}, staging = ${BACKEND_PREFIX}-${s})"
+    ca="${BACKEND_PREFIX}-${a}"; cs="${BACKEND_PREFIX}-${s}"
+    bip=$(_bouncer_ip)
+    bstate=$(_state "$BOUNCER"); [[ -z "$bstate" ]] && bstate="ABSENT"
+    echo "active slot: $a   (active = $ca, staging = $cs)"
+    # The bouncer hosts every endpoint below (its IP is the connection host),
+    # so it needs no table row of its own — just its liveness.
+    echo "pg-bouncer:  $bstate${bip:+ ($bip)}"
     echo
-    incus list '^(pg-dev-(a|b)|pg-bouncer)$'
+    {
+        printf 'NAME\037STATE\037ENDPOINT\037IPs\n'
+        _status_row "$ca" active  "$bip"
+        _status_row "$cs" staging "$bip"
+    } | _render_table
 }
 
 cmd_endpoint() {
