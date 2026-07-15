@@ -14,8 +14,91 @@ a colima VM running incus + ZFS to give you:
   is "active" — clients keep their TCP connection, the dataset underneath
   changes.
 
-Design rationale lives in [SPEC.md](SPEC.md). The scenarios below cover the
-day-to-day surface.
+See Design below for the container layout and the rationale behind it; the
+scenarios below that cover the day-to-day surface.
+
+# Design
+
+This exists for two things, both squarely in the local-development loop:
+making ~90-minute `pg_restore` imports non-blocking (a fresh dump loads on
+one backend while the other keeps serving live queries), and preserving
+snapshot/restore for testing migrations against an already-imported state,
+same as a single-backend setup would. Switching between "the database I was
+using" and "the freshly imported one" is a single command; the worst case is
+a reconnect.
+
+Explicitly **not** in scope: failover, replication, zero-downtime SLAs,
+protection against a malicious actor on the host (the colima VM is a trusted
+boundary), or multi-user concerns — one developer, one laptop. Anything that
+adds friction in the name of that kind of robustness — extra auth steps,
+credential rotation, certificate management — is out of scope.
+
+## Containers
+
+```
+                ┌────────────────────────────────────────────────┐
+client (app) ──►│ pg-bouncer  (stable IP 10.x.x.10)              │
+pg_restore  ──►│                                                │
+                │  DIRECT proxies (incus proxy devices):         │
+                │    :5432 ─ active   ─┐                          │
+                │    :5433 ─ staging  ─┼─ per-connection TCP relay │
+                │                       │  straight to the backend │
+                │  POOLED pgbouncer (session mode):              │
+                │    :5442 ─ active   ini ─┐                       │
+                │    :5443 ─ staging  ini ─┼─ cross-connect        │
+                │    (admin is the special │                       │
+                │     `pgbouncer` db on the│                       │
+                │     same port, pgb_admin)│                       │
+                └──────────────┬───────────┴────────────────────┘
+                               │
+                  ┌────────────┴────────────┐
+                  │ active  → active backend │
+                  │ staging → staging backend│
+                  ▼                         ▼
+              pg-dev-a                  pg-dev-b
+              (Postgres 17,             (Postgres 17,
+               own snapshots,            own snapshots,
+               own data)                 own data)
+```
+
+- `pg-bouncer` — one container, fixed identity, lives for the life of the
+  colima VM. See "Day to day: querying the database" below for what each
+  port is for.
+- `pg-dev-a` / `pg-dev-b` — symmetric, independently-installed Postgres 17
+  backends, both long-lived and always running. One is active, one is
+  staging; which is which flips on `make pg.promote`, and a container never
+  changes which role's data it holds until it's promoted.
+
+There's no third "transient" container during import — staging is always
+there, ready for the next dump.
+
+## Snapshots
+
+Snapshots are per backend container and never merge or copy between slots.
+Each backend gets an `initial` snapshot once, at provisioning time (clean
+role + database, no user data) — that's the target of `make pg.staging.reset`
+before every import. Everything after that is whatever you name it. A
+promote never touches snapshots; the previously-active slot keeps its full
+timeline as the rollback path.
+
+## Authentication
+
+One Postgres role (`$PG_USER`/`$PG_PASSWORD` from `.env`) covers application
+access, `pg_restore`, and ad-hoc psql through every port. The pgbouncer admin
+user (`pgb_admin`) shares the same password — one `.pgpass` line covers
+everything, forever. This is a deliberate dev-convenience tradeoff, not a
+privilege-separation model.
+
+Both pgbouncer pools run in session mode, so from a client's point of view
+they're indistinguishable from a direct connection (prepared statements,
+`SET`, advisory locks all behave normally) — except for the `ObjectInUse`
+caveat on `DROP DATABASE` noted below, which is why the primary ports are the
+pooler-free direct proxies instead.
+
+pgbouncer has no separate admin port — admin commands go through the special
+`pgbouncer` virtual database on the same `listen_port` as `pgb_admin`, e.g.
+`incus exec pg-bouncer -- psql -p 5442 -U pgb_admin -d pgbouncer -c 'SHOW
+POOLS;'`.
 
 # Scenarios
 
@@ -147,8 +230,7 @@ to stage multiple checkpoints before a promote.
 ## Inspecting state
 
 ```shell
-make pg.status        # active slot + container states
-make pg.status        # both ports with their roles + .pgpass line
+make pg.status        # pointer + container states + both ports/roles + .pgpass line
 make pg.bouncer.logs  # tail both pgbouncer instances
 ```
 
@@ -170,7 +252,3 @@ rebuild — slower than ZFS snapshots, but the only way out of the VM.
 ## Why a `Makefile` if you have a script
 
 Because I like the shell autocompletion of `make`.
-
-## Where's the design rationale
-
-[SPEC.md](SPEC.md).

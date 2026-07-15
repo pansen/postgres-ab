@@ -3,7 +3,7 @@ set -euo pipefail
 # set -x
 
 # pg-dev-local — two PostgreSQL backends behind a dual-listener pgbouncer.
-# See SPEC.md for the design.
+# See README.md's Design section for the rationale.
 #
 #   pg-dev-a, pg-dev-b   long-lived backends with their own snapshot timelines
 #   pg-bouncer           one container carrying both access paths:
@@ -23,7 +23,7 @@ PG_DB="${PG_DB:?PG_DB must be set in .env}"
 PG_PASSWORD="${PG_PASSWORD:?PG_PASSWORD must be set in .env}"
 
 # Same secret for the bouncer admin user. Dev convenience: one .pgpass line
-# covers everything. SPEC.md says this loudly.
+# covers everything. README.md's Design section says this loudly.
 PG_BOUNCER_ADMIN_PASSWORD="$PG_PASSWORD"
 
 IMAGE=images:ubuntu/24.04/cloud
