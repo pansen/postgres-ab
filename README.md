@@ -26,12 +26,8 @@ make deps                 # incus, colima, jq on macOS
 cp .env.example .env      # edit PG_* if you don't like the defaults
 make start                # boot colima with the incus runtime
 make pg.up                # provision pg-dev-a, pg-dev-b, pg-bouncer (~15 min)
-make pg.endpoint          # prints connection info + a ready-to-paste .pgpass line
+make pg.status            # prints connection info + a ready-to-paste .pgpass line
 ```
-
-`make pg.endpoint` prints something like (with `<bouncer-ip>` being .10 in
-whatever subnet `incus network get incusbr0 ipv4.address` reports — e.g.
-`192.168.100.10` if your bridge is on `192.168.100.0/24`):
 
 ```
 Direct (pooler-free, promote-aware — use for apps, tests, and imports):
@@ -152,7 +148,7 @@ to stage multiple checkpoints before a promote.
 
 ```shell
 make pg.status        # active slot + container states
-make pg.endpoint      # both ports with their roles + .pgpass line
+make pg.status        # both ports with their roles + .pgpass line
 make pg.bouncer.logs  # tail both pgbouncer instances
 ```
 

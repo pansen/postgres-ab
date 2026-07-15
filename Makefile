@@ -56,9 +56,6 @@ pg.down:
 .PHONY: pg.status
 pg.status:
 	$(PG_DEV) status
-
-.PHONY: pg.endpoint
-pg.endpoint:
 	@$(PG_DEV) endpoint
 
 .PHONY: pg.backend.endpoint
