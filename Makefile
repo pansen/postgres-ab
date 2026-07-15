@@ -8,13 +8,21 @@ deps:
 -include .env
 export
 
+# colima grows an existing VM disk on restart but never shrinks it, so this is
+# a safe floor: bumping it and re-running `make start` enlarges in place. The
+# default (colima's 60 GiB) is too small for a multi-GB database plus repeat
+# restores, 16 GB of transient WAL, and snapshots — a disk-full there surfaces
+# as a mysterious cluster crash, not a clean error. Override in .env if needed.
+COLIMA_DISK ?= 140   # GiB
+
 .PHONY: start
 start:
 	colima start \
 		--verbose \
 		--runtime=incus \
 		--memory $(COLIMA_MEMORY) \
-		--cpu $(COLIMA_CPU)
+		--cpu $(COLIMA_CPU) \
+		--disk $(COLIMA_DISK)
 	@if [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
 		sleep 2 && $(MAKE) pg.bouncer.reload; \
 	fi

@@ -293,15 +293,16 @@ apt-get install -y --no-install-recommends postgresql-17
 mkdir -p /etc/postgresql/17/main/conf.d
 cat > /etc/postgresql/17/main/conf.d/99-dev.conf <<'PGCONF'
 listen_addresses = '*'
-dynamic_shared_memory_type = mmap
+dynamic_shared_memory_type = posix
 
 shared_buffers = 2GB
 effective_cache_size = 6GB
 work_mem = 32MB
-maintenance_work_mem = 512MB
+maintenance_work_mem = 1GB
 max_parallel_maintenance_workers = 4
 
-max_wal_size = 2GB
+max_wal_size = 16GB
+checkpoint_timeout = 30min
 checkpoint_completion_target = 0.8
 wal_level = minimal
 max_wal_senders = 0
