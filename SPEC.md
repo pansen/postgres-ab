@@ -211,7 +211,7 @@ Plus the proxy-aware operations:
 | `make pg.endpoint`   | print both host ports and their roles + `.pgpass` line   |
 | `make pg.promote`    | flip active/staging: re-point both proxy forwards        |
 | `make pg.refresh`    | re-pin backend IPs + re-assert the host forwards         |
-| `make pg.status`     | print pointer + state of all three containers            |
+| `make status`        | versions, slot/proxy roles, per-backend table, snapshots  |
 
 `make pg.endpoint` prints both port mappings so a client always knows where
 to point what:

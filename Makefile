@@ -128,14 +128,11 @@ firewall:
 		echo "==> firewalld not active — skipping (open $(PG_PORTS)/tcp + trust incusbr0 yourself if you filter)."; \
 	fi
 
-.PHONY: status/incus
-status/incus:
-	incus version
-	incus list
-	incus info --resources | head -n5
-
+# The one status command: slot/proxy roles, a per-backend table (state,
+# client endpoint, snapshot count, container IPs), and the snapshot timelines.
 .PHONY: status
-status: status/incus pg.ip pg.snapshots
+status:
+	@$(PG_DEV) status
 
 # Stop the project containers, leaving the incus daemon (and any other
 # workloads on it) running. The counterpart to `make start`.
@@ -155,10 +152,6 @@ pg.up:
 .PHONY: pg.down
 pg.down:
 	$(PG_DEV) down
-
-.PHONY: pg.status
-pg.status:
-	$(PG_DEV) status
 
 .PHONY: pg.endpoint
 pg.endpoint:

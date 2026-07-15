@@ -83,7 +83,7 @@ dodge pgbouncer's session-pooling `ObjectInUse`, which no longer applies.)
 Overview command
 
 ```shell
-make pg.ip pg.status pg.snapshots
+make status
 ```
 
 ## Importing a fresh dump (the headline workflow)
@@ -149,7 +149,7 @@ to stage multiple checkpoints before a promote.
 ## Inspecting state
 
 ```shell
-make pg.status        # active slot + container states
+make status           # versions, slot/proxy roles, per-backend table, snapshots
 make pg.endpoint      # both ports with their roles + .pgpass line
 make pg.logs          # tail the active backend's postgres log
 ```
