@@ -34,10 +34,15 @@ whatever subnet `incus network get incusbr0 ipv4.address` reports — e.g.
 `192.168.100.10` if your bridge is on `192.168.100.0/24`):
 
 ```
-active   host=<bouncer-ip> port=5432 dbname=<PG_DB>   (current data)
-staging  host=<bouncer-ip> port=5433 dbname=<PG_DB>   (import target / opposite of active)
+Direct (pooler-free, promote-aware — use for apps, tests, and imports):
+  active   host=<bouncer-ip> port=5432 dbname=<PG_DB>   (current data)
+  staging  host=<bouncer-ip> port=5433 dbname=<PG_DB>   (import target / opposite of active)
 
-.pgpass line (one line, covers both ports):
+Pooled (pgbouncer, session mode — use when you need session pooling):
+  active   host=<bouncer-ip> port=5442 dbname=<PG_DB>
+  staging  host=<bouncer-ip> port=5443 dbname=<PG_DB>
+
+.pgpass line (one line, covers every port):
     <bouncer-ip>:*:*:<PG_USER>:<PG_PASSWORD>
 ```
 
@@ -48,7 +53,10 @@ the auto-pick by setting `PG_BOUNCER_IP` in `.env`.
 
 ## Day to day: querying the database
 
-Port **5432** always means *current data*. Pick whatever client you like:
+Port **5432** always means *current data*. It's a pooler-free direct line to
+the active backend (an incus `proxy` device on the bouncer, not a pgbouncer
+listener) — so it follows promote but carries no session stickiness, and test
+suites that `CREATE`/`DROP` databases work here. Pick whatever client you like:
 
 ```shell
 psql -h <bouncer-ip> -p 5432 -d $PG_DB        # any psql, any app
@@ -56,19 +64,20 @@ make pg.psql                                   # quick shell via incus exec
 make pg.logs                                   # tail postgres logs
 ```
 
-Port **5433** is the staging backend — the opposite slot. Useful for
-ad-hoc exploration of "the other dataset" or for verifying a dump
-mid-import.
+Port **5433** is the staging backend — the opposite slot, also a direct proxy.
+Useful for ad-hoc exploration of "the other dataset", for verifying a dump
+mid-import, and as a fast `pg_restore` target (no single-threaded pooler in the
+COPY path).
 
-Port **5434** is a pooler-free direct line to the *active* backend (an incus
-`proxy` device on the bouncer, not a pgbouncer listener). Same stable IP and
-same promote-tracking as :5432, but no session stickiness — so test suites
-that `CREATE`/`DROP` databases work here. Through the pooled :5432 they fail
-with `ObjectInUse` ("database is being accessed by other users"), because
-pgbouncer keeps an idle server connection to the just-used database.
+Ports **5442** (active) and **5443** (staging) are the pgbouncer session pools,
+for callers that specifically want pooling. Note the tradeoff of the pool:
+through it, test teardown's `DROP DATABASE` fails with `ObjectInUse` ("database
+is being accessed by other users"), because pgbouncer (`pool_mode=session`)
+keeps an idle server connection to the just-used database — which is exactly
+why the primary :5432/:5433 are the pooler-free proxies.
 
 ```shell
-make pg.backend.endpoint            # prints the :5434 dsn for your test config
+make pg.backend.endpoint            # prints the direct :5432/:5433 dsns
 ```
 
 Overview command
@@ -79,8 +88,9 @@ make pg.ip pg.status pg.snapshots
 
 ## Importing a fresh dump (the headline workflow)
 
-This is what this repo exists for. The import runs on staging through the
-bouncer; the active backend keeps serving live queries the entire time.
+This is what this repo exists for. The import runs on the staging backend
+(:5433, the pooler-free direct proxy — no single-threaded pgbouncer relay in
+the COPY path); the active backend keeps serving live queries the entire time.
 
 ```shell
 # 1. Wipe staging back to its clean `initial` snapshot.
@@ -90,7 +100,7 @@ scripts/pg-dev-local staging.reset
      2026-06-01T17-20-21_dump_import
 Continue? [Y/n]
 
-# 2. Restore the dump through the bouncer's staging port (:5433).
+# 2. Restore the dump through the staging port (:5433, pooler-free direct proxy).
 $ pg_restore --host=<bouncer-ip> --port=5433 --dbname=$PG_DB \
            --jobs=4 your-dump.pgdump          # ~90 min, no blocking
 

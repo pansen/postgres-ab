@@ -6,9 +6,11 @@ set -euo pipefail
 # See SPEC.md for the design.
 #
 #   pg-dev-a, pg-dev-b   long-lived backends with their own snapshot timelines
-#   pg-bouncer           one container, two pgbouncer instances:
-#                          :5432  active  (current data)
-#                          :5433  staging (import target / opposite of active)
+#   pg-bouncer           one container carrying both access paths:
+#                          :5432  active  direct proxy  (pooler-free)
+#                          :5433  staging direct proxy  (pooler-free)
+#                          :5442  active  pgbouncer     (session pool)
+#                          :5443  staging pgbouncer     (session pool)
 #                        cross-connect enforced by rendering both inis from
 #                        one state file (var/active-slot).
 
@@ -32,15 +34,24 @@ BOUNCER=pg-bouncer
 STATE_DIR="$REPO_ROOT/var"
 STATE_FILE="$STATE_DIR/active-slot"
 
-# A pooler-free direct line to the *active* backend. An incus `proxy` device
-# on the bouncer forwards this port (on the bouncer's stable IP) straight to
-# the active backend's Postgres — a per-connection TCP relay, not a pool. It
-# follows promote (we re-point its `connect` whenever active flips) yet, unlike
-# :5432/:5433, carries no session stickiness: a client disconnect tears down
-# the backend connection, so "DROP DATABASE" in test teardown succeeds instead
-# of failing with ObjectInUse. Use it for suites that CREATE/DROP databases.
-DIRECT_PORT="${PG_DIRECT_PORT:-5434}"
-DIRECT_DEVICE=pgdirect
+# Client-facing ports. The primary ports (:5432 active, :5433 staging) are
+# pooler-free *direct* lines — incus `proxy` devices on the bouncer that relay
+# a raw TCP connection straight to the backend's Postgres, no pgbouncer in the
+# path. They follow promote (we re-point each device's `connect` when active
+# flips) and carry no session stickiness: a client disconnect tears down the
+# backend connection, so "DROP DATABASE" in test teardown succeeds instead of
+# failing with ObjectInUse, and a bulk `pg_restore` isn't funneled through the
+# single-threaded pooler. pgbouncer moves up to the 544x range for callers that
+# still want session pooling (:5442 active, :5443 staging).
+ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"            # direct proxy → active backend
+STAGING_PORT="${PG_STAGING_PORT:-5433}"          # direct proxy → staging backend
+BOUNCER_ACTIVE_PORT="${PG_BOUNCER_ACTIVE_PORT:-5442}"
+BOUNCER_STAGING_PORT="${PG_BOUNCER_STAGING_PORT:-5443}"
+
+# The two direct-forward proxy devices on the bouncer (active + staging).
+DIRECT_ACTIVE_DEVICE=pgdirect-active
+DIRECT_STAGING_DEVICE=pgdirect-staging
+LEGACY_DIRECT_DEVICE=pgdirect                    # pre-migration single :5434 device
 
 # How long promote lets PAUSE drain cleanly before forcing the swap with KILL.
 # PAUSE only *returns* once every server is released; in session pooling an
@@ -172,8 +183,8 @@ _bouncer_admin() {
     local role="$1"; shift
     local port
     case "$role" in
-        active)  port=5432 ;;
-        staging) port=5433 ;;
+        active)  port=$BOUNCER_ACTIVE_PORT ;;
+        staging) port=$BOUNCER_STAGING_PORT ;;
         *) echo "bad role: $role" >&2; exit 1 ;;
     esac
     incus exec "$BOUNCER" -- env PGPASSWORD="$PG_BOUNCER_ADMIN_PASSWORD" \
@@ -205,26 +216,41 @@ pidfile = /var/run/pgbouncer/${role}.pid
 EOF
 }
 
-# The pinned IP of whichever backend is currently active.
+# The pinned IP of whichever backend is currently active / staging.
 _active_backend_ip() {
     if [[ "$(_active)" == a ]]; then _pick_backend_a_ip; else _pick_backend_b_ip; fi
 }
+_staging_backend_ip() {
+    if [[ "$(_staging)" == a ]]; then _pick_backend_a_ip; else _pick_backend_b_ip; fi
+}
 
-# Ensure the direct-forward proxy device exists on the bouncer and points at
-# the active backend. Idempotent: creates the device once, then just re-points
-# `connect` on subsequent calls (promote / bouncer.reload / VM boot). A no-op
-# when the bouncer isn't running.
+# Add-or-re-point one direct-forward proxy device (a raw TCP relay in the
+# bouncer's network namespace) toward a backend's Postgres. Idempotent: creates
+# the device once, then just re-points `connect` on later calls.
+_set_direct_device() {
+    local device="$1" listen_port="$2" ip="$3"
+    if incus config device get "$BOUNCER" "$device" connect >/dev/null 2>&1; then
+        incus config device set "$BOUNCER" "$device" connect="tcp:${ip}:5432"
+    else
+        echo "==> Adding direct-forward proxy $BOUNCER:$listen_port → ${ip}:5432..."
+        incus config device add "$BOUNCER" "$device" proxy \
+            listen="tcp:0.0.0.0:${listen_port}" connect="tcp:${ip}:5432" bind=instance >/dev/null
+    fi
+}
+
+# Ensure both direct-forward proxies exist and point at the right backends:
+# :5432 → active, :5433 → staging. Re-pointed on promote / bouncer.reload / VM
+# boot. A no-op when the bouncer isn't running.
+#
+# These bind the primary ports *inside* the bouncer's netns, so pgbouncer must
+# already have vacated them (it listens on :5442/:5443). Fresh provisioning
+# renders the bouncer inis on those ports before first start; a live migration
+# from the old scheme goes through cmd_bouncer_reload, which restarts pgbouncer
+# onto the new ports first.
 _set_direct_forward() {
     [[ "$(_state "$BOUNCER")" == "RUNNING" ]] || return 0
-    local ip
-    ip=$(_active_backend_ip)
-    if incus config device get "$BOUNCER" "$DIRECT_DEVICE" connect >/dev/null 2>&1; then
-        incus config device set "$BOUNCER" "$DIRECT_DEVICE" connect="tcp:${ip}:5432"
-    else
-        echo "==> Adding direct-forward proxy $BOUNCER:$DIRECT_PORT → ${ip}:5432..."
-        incus config device add "$BOUNCER" "$DIRECT_DEVICE" proxy \
-            listen="tcp:0.0.0.0:${DIRECT_PORT}" connect="tcp:${ip}:5432" bind=instance >/dev/null
-    fi
+    _set_direct_device "$DIRECT_ACTIVE_DEVICE"  "$ACTIVE_PORT"  "$(_active_backend_ip)"
+    _set_direct_device "$DIRECT_STAGING_DEVICE" "$STAGING_PORT" "$(_staging_backend_ip)"
 }
 
 # ---------------------------------------------------------------------------
@@ -389,8 +415,8 @@ EOF
     incus exec "$BOUNCER" -- chmod 640 /etc/pgbouncer/userlist.txt
 
     echo "==> Rendering pgbouncer inis (active→$BACKEND_A, staging→$BACKEND_B)..."
-    _render_ini active  5432 "$BACKEND_A"
-    _render_ini staging 5433 "$BACKEND_B"
+    _render_ini active  "$BOUNCER_ACTIVE_PORT"  "$BACKEND_A"
+    _render_ini staging "$BOUNCER_STAGING_PORT" "$BACKEND_B"
 
     echo "==> Enabling and starting pgbouncer@{active,staging}..."
     incus exec "$BOUNCER" -- systemctl enable --now \
@@ -401,7 +427,7 @@ EOF
     until _bouncer_admin active "SHOW VERSION;" >/dev/null 2>&1; do
         tries=$((tries + 1))
         if (( tries > 20 )); then
-            echo "ERROR: pgbouncer@active not responding on :5432" >&2
+            echo "ERROR: pgbouncer@active not responding on :$BOUNCER_ACTIVE_PORT" >&2
             incus exec "$BOUNCER" -- journalctl -u pgbouncer@active --no-pager | tail -n 40 >&2
             exit 1
         fi
@@ -411,7 +437,7 @@ EOF
     until _bouncer_admin staging "SHOW VERSION;" >/dev/null 2>&1; do
         tries=$((tries + 1))
         if (( tries > 20 )); then
-            echo "ERROR: pgbouncer@staging not responding on :5433" >&2
+            echo "ERROR: pgbouncer@staging not responding on :$BOUNCER_STAGING_PORT" >&2
             incus exec "$BOUNCER" -- journalctl -u pgbouncer@staging --no-pager | tail -n 40 >&2
             exit 1
         fi
@@ -486,10 +512,15 @@ cmd_endpoint() {
         exit 1
     fi
     cat <<EOF
-active   host=$ip port=5432 dbname=$PG_DB   (current data)
-staging  host=$ip port=5433 dbname=$PG_DB   (import target / opposite of active)
+Direct (pooler-free, promote-aware — use for apps, tests, and imports):
+  active   host=$ip port=$ACTIVE_PORT  dbname=$PG_DB   (current data)
+  staging  host=$ip port=$STAGING_PORT dbname=$PG_DB   (import target / opposite of active)
 
-.pgpass line (one line, covers both ports):
+Pooled (pgbouncer, session mode — use when you need session pooling):
+  active   host=$ip port=$BOUNCER_ACTIVE_PORT  dbname=$PG_DB
+  staging  host=$ip port=$BOUNCER_STAGING_PORT dbname=$PG_DB
+
+.pgpass line (one line, covers every port):
     $ip:*:*:$PG_USER:$PG_PASSWORD
 EOF
 }
@@ -502,18 +533,23 @@ cmd_backend_endpoint() {
         exit 1
     fi
     cat <<EOF
-direct   host=$ip port=$DIRECT_PORT dbname=$PG_DB   (active backend, NO pooling)
+direct   host=$ip port=$ACTIVE_PORT  dbname=$PG_DB   (active backend, NO pooling)
+direct   host=$ip port=$STAGING_PORT dbname=$PG_DB   (staging backend, NO pooling)
 
-A stable, promote-aware TCP forward (an incus proxy device on the bouncer):
-the host/port never change and always route to whichever backend is active,
-but — unlike the pooled :5432 — it carries no session stickiness. A client
-disconnect tears down the backend connection, so test teardown's
-"DROP DATABASE" succeeds instead of failing with ObjectInUse.
+The primary ports are stable, promote-aware TCP forwards (incus proxy devices
+on the bouncer): the host/port never change and always route to whichever
+backend fills that role, but — unlike the pooled :$BOUNCER_ACTIVE_PORT /
+:$BOUNCER_STAGING_PORT — they carry no session stickiness. A client disconnect
+tears down the backend connection, so test teardown's "DROP DATABASE" succeeds
+instead of failing with ObjectInUse, and a bulk pg_restore isn't relayed
+through the single-threaded pooler.
 
-Use this for test suites that CREATE/DROP databases.
+Use :$ACTIVE_PORT for test suites that CREATE/DROP databases, and :$STAGING_PORT
+as your fast pg_restore target.
 
-DSN:
-    postgresql://$PG_USER@$ip:$DIRECT_PORT/$PG_DB
+DSNs:
+    postgresql://$PG_USER@$ip:$ACTIVE_PORT/$PG_DB
+    postgresql://$PG_USER@$ip:$STAGING_PORT/$PG_DB
 EOF
 }
 
@@ -553,11 +589,11 @@ cmd_promote() {
 
     # Drain (or force) both listeners. Admin commands work while paused, so we
     # can still RELOAD / RESUME below.
-    _promote_drain active  5432
-    _promote_drain staging 5433
+    _promote_drain active  "$BOUNCER_ACTIVE_PORT"
+    _promote_drain staging "$BOUNCER_STAGING_PORT"
 
-    _render_ini active  5432 "${BACKEND_PREFIX}-${to}"
-    _render_ini staging 5433 "${BACKEND_PREFIX}-${from}"
+    _render_ini active  "$BOUNCER_ACTIVE_PORT"  "${BACKEND_PREFIX}-${to}"
+    _render_ini staging "$BOUNCER_STAGING_PORT" "${BACKEND_PREFIX}-${from}"
 
     _bouncer_admin active  "RELOAD;"        >/dev/null
     _bouncer_admin staging "RELOAD;"        >/dev/null
@@ -565,7 +601,7 @@ cmd_promote() {
     _bouncer_admin staging "RESUME $PG_DB;" >/dev/null
 
     _set_active "$to"
-    _set_direct_forward   # re-point the pooler-free :$DIRECT_PORT at the new active
+    _set_direct_forward   # re-point the pooler-free :5432/:5433 proxies at the new roles
 
     echo "==> Promoted. Active: ${BACKEND_PREFIX}-${to}   Staging: ${BACKEND_PREFIX}-${from}"
     echo
@@ -723,8 +759,8 @@ cmd_ip() {
     info_s=$(_ip_or_state "${BACKEND_PREFIX}-${s}")
     bouncer_ip=$(_bouncer_ip)
     if [[ -n "$bouncer_ip" ]]; then
-        endpoint_a="${bouncer_ip}:5432"
-        endpoint_s="${bouncer_ip}:5433"
+        endpoint_a="${bouncer_ip}:${ACTIVE_PORT}"
+        endpoint_s="${bouncer_ip}:${STAGING_PORT}"
     else
         endpoint_a="pg-bouncer $(_state "$BOUNCER")"
         endpoint_s="pg-bouncer $(_state "$BOUNCER")"
@@ -743,6 +779,31 @@ cmd_bouncer_logs() {
         tail -f /var/log/pgbouncer/active.log /var/log/pgbouncer/staging.log
 }
 
+# RELOAD pgbouncer@<role> if it already answers on its target admin port;
+# otherwise restart it and wait for it to come up. RELOAD re-reads
+# databases/auth but NOT listen_port, so moving the pooler onto a new port
+# (the 5432→5442 / 5433→5443 migration) requires a restart. In steady state
+# this is a plain zero-downtime RELOAD.
+_ensure_bouncer_listening() {
+    local role="$1" port="$2"
+    if _bouncer_admin "$role" "SHOW VERSION;" >/dev/null 2>&1; then
+        _bouncer_admin "$role" "RELOAD;" >/dev/null
+        return 0
+    fi
+    echo "==> pgbouncer@$role not on :$port yet — restarting to apply listen_port..."
+    incus exec "$BOUNCER" -- systemctl restart "pgbouncer@${role}"
+    local tries=0
+    until _bouncer_admin "$role" "SHOW VERSION;" >/dev/null 2>&1; do
+        tries=$((tries + 1))
+        if (( tries > 20 )); then
+            echo "ERROR: pgbouncer@$role not responding on :$port after restart" >&2
+            incus exec "$BOUNCER" -- journalctl -u "pgbouncer@${role}" --no-pager | tail -n 40 >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
 cmd_bouncer_reload() {
     # Self-heal the backends' static IP pinning before reloading. Backends
     # provisioned before pinning (or with a drifted lease) would otherwise
@@ -751,22 +812,27 @@ cmd_bouncer_reload() {
     _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"
     _repair_backend_ip "$BACKEND_B" "$(_pick_backend_b_ip)"
 
-    # Re-render both inis from the current pointer state, then RELOAD both
-    # pgbouncer instances. Useful after a config change to _render_ini.
+    # Re-render both inis from the current pointer state on the pgbouncer ports
+    # (:5442 active, :5443 staging), then RELOAD — or restart, when migrating
+    # the pooler off the old primary ports. Freeing :5432/:5433 here is also
+    # what lets the direct proxies below bind them inside the bouncer's netns.
     local a s
     a=$(_active); s=$(_staging)
-    _render_ini active  5432 "${BACKEND_PREFIX}-${a}"
-    _render_ini staging 5433 "${BACKEND_PREFIX}-${s}"
-    _bouncer_admin active  "RELOAD;" >/dev/null
-    _bouncer_admin staging "RELOAD;" >/dev/null
+    _render_ini active  "$BOUNCER_ACTIVE_PORT"  "${BACKEND_PREFIX}-${a}"
+    _render_ini staging "$BOUNCER_STAGING_PORT" "${BACKEND_PREFIX}-${s}"
+    _ensure_bouncer_listening active  "$BOUNCER_ACTIVE_PORT"
+    _ensure_bouncer_listening staging "$BOUNCER_STAGING_PORT"
 
-    # Create-or-re-point the pooler-free direct forward in lockstep. This is
-    # also how existing deployments (provisioned before this device existed)
-    # acquire it — and `make start` runs bouncer.reload, so it's re-asserted
-    # on every VM boot.
+    # Retire the pre-migration single direct device (old :5434) if present,
+    # then create-or-re-point the two direct-forward proxies (:5432 → active,
+    # :5433 → staging) in lockstep. This is also how existing deployments
+    # acquire the devices — and `make start` runs bouncer.reload, so they're
+    # re-asserted on every VM boot.
+    incus config device remove "$BOUNCER" "$LEGACY_DIRECT_DEVICE" >/dev/null 2>&1 || true
     _set_direct_forward
 
-    echo "Reloaded pgbouncer@active and pgbouncer@staging."
+    echo "Reloaded pgbouncer@active (:$BOUNCER_ACTIVE_PORT) and pgbouncer@staging (:$BOUNCER_STAGING_PORT)."
+    echo "Direct proxies: :$ACTIVE_PORT → active, :$STAGING_PORT → staging."
 }
 
 # ---------------------------------------------------------------------------
@@ -816,8 +882,10 @@ Lifecycle:
   status                          show pointer + container states
   endpoint                        print bouncer host/port roles + .pgpass line
   backend-endpoint                print the stable, promote-aware, pooler-free
-                                  direct dsn (:$DIRECT_PORT) — use for tests
-                                  that CREATE/DROP databases
+                                  direct dsns (:$ACTIVE_PORT active,
+                                  :$STAGING_PORT staging) — active for tests
+                                  that CREATE/DROP databases, staging for fast
+                                  pg_restore imports
   promote                         flip active↔staging on both bouncer instances
 
 Both slots (rendered side by side):
