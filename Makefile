@@ -23,8 +23,9 @@ start:
 		--memory $(COLIMA_MEMORY) \
 		--cpu $(COLIMA_CPU) \
 		--disk $(COLIMA_DISK)
-	@if [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
-		sleep 2 && $(MAKE) pg.bouncer.reload; \
+	@if [ "$$(incus list pg-proxy --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ] || \
+	    [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
+		sleep 2 && $(MAKE) pg.refresh; \
 	fi
 	$(MAKE) status
 
@@ -34,8 +35,12 @@ status/incus:
 	incus list
 	incus info --resources | head -n5
 
+# The one status command: pointer + proxy roles, a per-backend table (state,
+# client endpoint, snapshot count, container IPs), and the snapshot timelines
+# — pg-dev-local's own `status` now prints all of it.
 .PHONY: status
-status: status/incus pg.ip pg.snapshots
+status:
+	@$(PG_DEV) status
 
 .PHONY: stop
 stop:
@@ -58,13 +63,13 @@ pg.status:
 	$(PG_DEV) status
 	@$(PG_DEV) endpoint
 
-.PHONY: pg.backend.endpoint
-pg.backend.endpoint:
-	@$(PG_DEV) backend-endpoint
-
 .PHONY: pg.promote
 pg.promote:
 	$(PG_DEV) promote
+
+.PHONY: pg.refresh
+pg.refresh:
+	$(PG_DEV) refresh
 
 # ----- active backend -----------------------------------------------------
 
@@ -139,18 +144,8 @@ pg.staging.stop:
 pg.staging.start:
 	$(PG_DEV) staging.start
 	sleep 1
-	$(PG_DEV) bouncer.reload
+	$(PG_DEV) refresh
 	$(MAKE) status
-
-# ----- bouncer ------------------------------------------------------------
-
-.PHONY: pg.bouncer.logs
-pg.bouncer.logs:
-	$(PG_DEV) bouncer.logs
-
-.PHONY: pg.bouncer.reload
-pg.bouncer.reload:
-	$(PG_DEV) bouncer.reload
 
 # ----- export / import (active backend) -----------------------------------
 
