@@ -744,6 +744,18 @@ _restore() {
     fi
 
     incus snapshot restore "$container" "$name"
+
+    # `snapshot restore` rolls back the container *config* too. A snapshot
+    # taken before IP pinning existed carries an unpinned eth0, so restoring
+    # it silently drops the static lease and the backend drifts to a random
+    # DHCP address on next boot — while the direct proxies keep forwarding to
+    # the pinned IP. Re-assert the pin while the container is still stopped,
+    # so the static lease is in place on start.
+    case "$container" in
+        "$BACKEND_A") _repair_backend_ip "$container" "$(_pick_backend_a_ip)" ;;
+        "$BACKEND_B") _repair_backend_ip "$container" "$(_pick_backend_b_ip)" ;;
+    esac
+
     incus start "$container"
     echo "Restored $container to snapshot '$name'."
 }
