@@ -1,0 +1,30 @@
+FROM ubuntu:26.04
+
+ENV container=container
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      dbus \
+      dnsmasq-base \
+      incus-base \
+      jq \
+      systemd \
+      systemd-sysv \
+      xfsprogs \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN systemctl set-default multi-user.target \
+ && systemctl enable incus.socket incus.service incus-startup.service \
+ && systemctl mask \
+      console-getty.service \
+      dev-hugepages.mount \
+      sys-fs-fuse-connections.mount \
+      systemd-tmpfiles-setup.service \
+      systemd-update-utmp.service
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/usr/sbin/init"]

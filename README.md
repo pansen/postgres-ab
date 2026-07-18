@@ -1,246 +1,253 @@
-# Summary
+# Snapshottable PostgreSQL on Apple container machine
 
 Working with PostgreSQL dumps is painful when `pg_restore` takes ~90 minutes
-and your dev database is unreachable for the whole window. This repo wraps
-a colima VM running incus + ZFS to give you:
+and the development database is unreachable for the whole window. This repo
+runs Incus inside one persistent Apple container machine and provides:
 
-- **two long-lived Postgres backends** (`pg-dev-a`, `pg-dev-b`) with
-  independent ZFS snapshot timelines, so already-loaded states stay cheap to
-  checkpoint and restore;
-- **a tiny `pg-proxy` container** with two stable ports, so `pg_restore` can
-  load a new dump on the staging backend through one port while your app
-  keeps querying the active backend on the other;
-- **a single command** (`make pg.promote`) to atomically swap which backend
-  is "active" — clients keep their TCP connection, the dataset underneath
-  changes.
+- two long-lived PostgreSQL 17 backends (`pg-dev-a`, `pg-dev-b`) with
+  independent, copy-on-write snapshot timelines;
+- stable role ports on the Apple machine: `:5432` is active and `:5433` is
+  staging, so a new dump can load without interrupting the current dataset;
+- `make pg.promote` to switch the roles without copying data.
 
-See Design below for the container layout and the rationale behind it; the
-scenarios below that cover the day-to-day surface.
+This requires Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or
+newer. Install the signed package from the
+[Apple container releases](https://github.com/apple/container/releases).
 
-# Design
+## Design
 
-This exists for two things, both squarely in the local-development loop:
-making ~90-minute `pg_restore` imports non-blocking (a fresh dump loads on
-one backend while the other keeps serving live queries), and preserving
-snapshot/restore for testing migrations against an already-imported state,
-same as a single-backend setup would. Switching between "the database I was
-using" and "the freshly imported one" is a single command; the worst case is
-a reconnect.
-
-Explicitly **not** in scope: failover, replication, zero-downtime SLAs,
-protection against a malicious actor on the host (the colima VM is a trusted
-boundary), or multi-user concerns — one developer, one laptop. Anything that
-adds friction in the name of that kind of robustness — extra auth steps,
-credential rotation, certificate management — is out of scope.
-
-## Containers
-
-```
-                ┌────────────────────────────────────────────────┐
-client (app) ──►│ pg-proxy  (stable IP 10.x.x.10)                │
-pg_restore  ──►│  bare container — no software installed         │
-                │                                                │
-                │  incus proxy devices (bind=instance):          │
-                │    :5432 ─ active   ─┐                          │
-                │    :5433 ─ staging  ─┼─ per-connection TCP relay │
-                │                       │  straight to the backend │
-                └──────────────┬───────┴────────────────────────┘
-                               │
-                  ┌────────────┴────────────┐
-                  │ active  → active backend │
-                  │ staging → staging backend│
-                  ▼                         ▼
-              pg-dev-a                  pg-dev-b
-              (Postgres 17,             (Postgres 17,
-               own snapshots,            own snapshots,
-               own data)                 own data)
+```text
+macOS client
+    │
+    │ <apple-machine-ip>:5432 / :5433
+    ▼
+┌──────────────── Apple container machine ────────────────┐
+│ Incus host                                               │
+│                                                         │
+│ pg-proxy (bare Incus container, device owner)           │
+│   bind=host :5432 ─ active  ─┐                           │
+│   bind=host :5433 ─ staging ─┼─ raw TCP proxy devices   │
+│                              │                           │
+│                 ┌────────────┴────────────┐              │
+│                 ▼                         ▼              │
+│             pg-dev-a                  pg-dev-b           │
+│             PostgreSQL 17             PostgreSQL 17      │
+│                 │                         │              │
+│                 ▼                         ▼              │
+│          XFS slot a/current        XFS slot b/current    │
+│          + reflink snapshots       + reflink snapshots   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-- `pg-proxy` — one bare container, fixed identity, lives for the life of the
-  colima VM. It has no software installed at all: it exists only to host the
-  two `proxy` devices, whose forkproxies run inside its network namespace and
-  dial the backends' pinned incusbr0 IPs directly. `bind=instance` makes each
-  forkproxy listen on pg-proxy's own pinned IP (not the colima VM's host
-  address) — that pinned IP is the one address clients ever need.
-- `pg-dev-a` / `pg-dev-b` — symmetric, independently-installed Postgres 17
-  backends, both long-lived and always running. One is active, one is
-  staging; which is which flips on `make pg.promote`, and a container never
-  changes which role's data it holds until it's promoted.
+The Apple machine is the persistent outer Linux environment. The Makefile
+runs `scripts/pg-dev-local` as root inside it, where the Incus socket and the
+database storage are available. The repository remains on macOS and is visible
+at the same `/Users/...` path through the machine's home mount, so `.env`, the
+active-slot pointer, and exports live outside the machine.
 
-There's no third "transient" container during import — staging is always
-there, ready for the next dump.
+### Networking
 
-There is no connection pooler in the path: each port is a plain per-connection
-TCP passthrough, indistinguishable from a direct connection. `CREATE`/`DROP
-DATABASE`, `LISTEN`/`NOTIFY`, prepared statements and advisory locks all
-behave exactly as they would against Postgres directly — no pgbouncer
-`ObjectInUse` surprises on `DROP DATABASE`, no userlist/SCRAM file to keep in
-sync, no PAUSE/RESUME drain to orchestrate on promote. `promote` is just:
-flip `var/active-slot`, then re-point each proxy device's `connect` target —
-which restarts its forkproxy, so any open TCP connection drops and the client
-reconnects onto the new backend. The host:port endpoints themselves never
-change.
+The nested `incusbr0` subnet is not routed to macOS. The two Incus proxy
+devices therefore use `bind=host`: they listen on the Apple machine's own IP
+and connect to pinned `.11`/`.12` addresses on the nested bridge. `make
+pg.status` discovers and prints the current machine IP; do not use a backend's
+10.x Incus address from macOS.
 
-### Migrating from the old pgbouncer layout
+There is no connection pooler. Each port is a per-connection TCP passthrough,
+so `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory
+locks, and parallel `pg_restore` behave like direct PostgreSQL connections.
+Promoting re-points both proxy devices. Updating them may drop existing TCP
+sessions, so clients should reconnect; the role ports themselves do not change.
 
-Earlier versions of this repo ran a `pg-bouncer` container with direct proxy
-ports *and* pgbouncer session-pool ports (`:5442`/`:5443`). That's gone: the
-pooled ports are removed, and the container is renamed to the bare `pg-proxy`
-described above. The migration is automatic and one-time — the first `make
-pg.refresh` (which `make start` also runs whenever a proxy container is found
-RUNNING) or `make pg.up` detects a leftover `pg-bouncer` container, deletes
-it, and provisions `pg-proxy` at the same pinned IP, so the client-facing
-endpoint doesn't change.
+### Snapshots on Apple's stock kernel
 
-## Snapshots
+Apple 1.1's recommended container-machine kernel lacks the Btrfs, ZFS, and
+DM-thin stack needed by Incus's optimized snapshot backends. Incus therefore
+falls back to `dir`, whose snapshots are full directory copies—not practical
+for repeated multi-gigabyte PostgreSQL checkpoints.
 
-Snapshots are per backend container and never merge or copy between slots.
-Each backend gets an `initial` snapshot once, at provisioning time (clean
-role + database, no user data) — that's the target of `make pg.staging.reset`
-before every import. Everything after that is whatever you name it. A
-promote never touches snapshots; the previously-active slot keeps its full
-timeline as the rollback path.
+`scripts/apple-machine-init` instead creates a sparse XFS loop filesystem
+(140 GiB by default) inside the machine root disk. Apple's 1.1 boot examples
+show a 512 GiB root device, but that size is not a documented compatibility
+guarantee. PostgreSQL data for each slot is mounted from the XFS filesystem,
+and snapshot commands use reflink copies. Creating a checkpoint is fast and
+consumes additional blocks only as the live dataset and snapshots diverge.
 
-## Authentication
+Snapshots cover PostgreSQL data, not the disposable Ubuntu container root.
+PostgreSQL configuration is provisioned identically in both containers. Every
+snapshot stops PostgreSQL cleanly before cloning the data and starts it again
+afterward. Restoring an older snapshot retains the original workflow's
+timeline semantics: snapshots newer than the target are shown and deleted
+after confirmation.
 
-One Postgres role (`$PG_USER`/`$PG_PASSWORD` from `.env`) covers application
-access, `pg_restore`, and ad-hoc psql through every port — one `.pgpass` line
-covers everything, forever. This is a deliberate dev-convenience tradeoff, not
-a privilege-separation model.
+The XFS size is a logical ceiling; the backing file is sparse. Apple container
+CLI 1.1 does not offer a machine disk-size flag. `PG_DATA_DISK_SIZE` affects
+first creation only and does not resize an existing XFS store.
 
-# Scenarios
+### Scope and safety model
 
-## Once, after cloning
+This is a local-development tool for one trusted developer and laptop. It is
+not replication, automatic failover, a zero-downtime service, or a hardened
+multi-user deployment. PostgreSQL durability features such as `fsync` are
+deliberately disabled for import speed. Snapshots are checkpoints on the same
+physical disk, not backups.
+
+## First setup
 
 ```shell
-make deps                 # incus, colima, jq on macOS
-cp .env.example .env      # edit PG_* if you don't like the defaults
-make start                # boot colima with the incus runtime
-make pg.up                # provision pg-dev-a, pg-dev-b, pg-proxy (~15 min)
-make pg.status            # prints connection info + a ready-to-paste .pgpass line
+make deps
+cp .env.example .env
+# edit credentials/resources if desired
+
+make start     # first run builds and creates the persistent Apple machine
+make pg.up     # provisions both PostgreSQL backends and the proxy
+make pg.status
 ```
 
+The first `make start` builds an Ubuntu 26.04 machine image containing systemd,
+Incus, jq, and XFS tools. Later starts reuse the named persistent machine.
+`make pg.up` installs PostgreSQL 17 in two nested Ubuntu 24.04 containers and
+can take several minutes.
+
+Status prints endpoints similar to:
+
+```text
+active   host=192.168.64.2 port=5432 dbname=<PG_DB>
+staging  host=192.168.64.2 port=5433 dbname=<PG_DB>
+
+.pgpass line:
+    192.168.64.2:*:*:<PG_USER>:<PG_PASSWORD>
+
+psql commands:
+  active:  psql --host=192.168.64.2 --port=5432 --username=<PG_USER> --dbname=<PG_DB>
+  staging: psql --host=192.168.64.2 --port=5433 --username=<PG_USER> --dbname=<PG_DB>
 ```
-active   host=<proxy-ip> port=5432 dbname=<PG_DB>   (current data)
-staging  host=<proxy-ip> port=5433 dbname=<PG_DB>   (import target / opposite of active)
 
-.pgpass line (one line, covers both ports):
-    <proxy-ip>:*:*:<PG_USER>:<PG_PASSWORD>
-```
+Put the printed line in `~/.pgpass`. If the Apple machine receives a different
+IP later, rerun `make pg.status` and update the host field. `PG_MACHINE_IP` can
+override only the address printed by the script when a routed alias is used.
 
-Paste that single line into `~/.pgpass` and you're done with auth forever.
-The proxy IP is pinned at the device level — it survives reboots, promotes,
-snapshot restores, everything short of `make pg.down`. Override the auto-pick
-by setting `PG_PROXY_IP` in `.env` (the legacy `PG_BOUNCER_IP` name still
-works too).
+## Day-to-day workflow
 
-## Day to day: querying the database
-
-Port **5432** always means *current data*. It's a pooler-free direct line to
-the active backend (an incus `proxy` device on pg-proxy) — so it follows
-promote but carries no session stickiness, and test suites that
-`CREATE`/`DROP` databases work here. Pick whatever client you like:
+Port 5432 always means the active/current dataset. Port 5433 always means the
+opposite staging dataset.
 
 ```shell
-psql -h <proxy-ip> -p 5432 -d $PG_DB        # any psql, any app
-make pg.psql                                   # quick shell via incus exec
-make pg.logs                                   # tail postgres logs
+make start
+make pg.status
+make pg.psql
+make pg.logs
 ```
 
-Port **5433** is the staging backend — the opposite slot, also a direct proxy.
-Useful for ad-hoc exploration of "the other dataset", for verifying a dump
-mid-import, and as a fast `pg_restore` target (no single-threaded pooler in the
-COPY path).
-
-Overview command
+Load a fresh dump without blocking the active database:
 
 ```shell
-make pg.ip pg.status pg.snapshots
+# 1. Reset staging to its clean initial checkpoint.
+make pg.staging.reset
+
+# 2. Import through the staging port printed by `make pg.status`.
+pg_restore --host=<machine-ip> --port=5433 --dbname="$PG_DB" \
+  --jobs=4 your-dump.pgdump
+
+# 3. Verify and checkpoint staging.
+psql -h <machine-ip> -p 5433 -d "$PG_DB" -c '\dt'
+make pg.staging.snapshot name="$(date +%Y-%m-%dT%H-%M-%S)_dump_import"
+
+# 4. Swap roles. Open connections reconnect; host and ports stay the same.
+make pg.promote
 ```
 
-## Importing a fresh dump (the headline workflow)
+If the new data is bad, `make pg.promote` again immediately points `:5432`
+back to the previous backend and its untouched timeline.
 
-This is what this repo exists for. The import runs on the staging backend
-(:5433, the pooler-free direct proxy); the active backend keeps serving live
-queries the entire time.
+## Snapshot and restore commands
+
+Unprefixed commands operate on the active physical slot:
 
 ```shell
-# 1. Wipe staging back to its clean `initial` snapshot.
-$ make pg.staging.reset
-scripts/pg-dev-local staging.reset
-==> Snapshots on pg-dev-a that will be deleted:
-     2026-06-01T17-20-21_dump_import
-Continue? [Y/n]
-
-# 2. Restore the dump through the staging port (:5433, pooler-free direct proxy).
-$ pg_restore --host=<proxy-ip> --port=5433 --dbname=$PG_DB \
-           --jobs=4 your-dump.pgdump          # ~90 min, no blocking
-
-# 3. Sanity-check the loaded data while still on staging.
-$ psql -h <proxy-ip> -p 5433 -d $PG_DB -c '\dt'
-
-# 4. Checkpoint the loaded state on the staging slot.
-$ pg.staging.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_dump_import
-
-# 5. Promote. Sub-second; the :5432 endpoint is unchanged, but open
-#    connections are dropped so clients reconnect onto the freshly imported
-#    dataset (re-pointing a proxy device's `connect` restarts its forkproxy).
-$ make pg.promote
+make pg.snapshot name="$(date +%Y-%m-%dT%H-%M-%S)_before-migration"
+make pg.restore name=<snapshot>
+make pg.restore-last
+make pg.snapshots
 ```
 
-After `pg.promote`, apps on :5432 see the freshly imported data. The
-previously active backend is now reachable on :5433 with its full snapshot
-timeline intact, ready to be rolled back to or wiped for the next import.
-
-## Rolling back a bad import
-
-You promoted, ran the app, and the new data is broken. The previous backend
-is untouched on :5433. One command undoes the promote:
+The staging slot has the parallel command family:
 
 ```shell
-make pg.promote          # flips back — :5432 now points at the old data again
+make pg.staging.snapshot name=<snapshot>
+make pg.staging.restore name=<snapshot>
+make pg.staging.restore-last
+make pg.staging.reset
+make pg.staging.stop
+make pg.staging.start
 ```
 
-No data is regenerated. The pointer just inverts.
-
-## Snapshotting / restoring during normal dev
-
-Each backend has its own snapshot timeline. The unprefixed commands act on
-whichever slot is currently active:
+`force=1` replaces a same-named snapshot:
 
 ```shell
-make pg.snapshot name=$(date +%Y-%m-%dT%H-%M-%S)_before-migration
-# ... run a destructive migration ...
-make pg.restore name=$(date +%Y-%m-%dT%H-%M-%S)_before-migration
-make pg.restore-last                  # most recent snapshot, no confirmation
-make pg.snapshots                     # list
+make pg.snapshot name=before-test force=1
 ```
 
-The `pg.staging.*` family mirrors these for the staging slot, if you want
-to stage multiple checkpoints before a promote.
+Snapshot names may contain letters, digits, dots, underscores, and hyphens.
 
-## Inspecting state
+## Inspecting and entering the environments
 
 ```shell
-make pg.status        # pointer + container states + both ports/roles + .pgpass line
-make pg.refresh        # re-pin backend IPs + re-assert proxy forwards (also runs the pg-bouncer→pg-proxy migration if needed)
+make status               # endpoints, roles, states, IPs, timelines
+make status/incus         # Incus versions/resources/list
+make pg.ip                # compact endpoint → backend mapping
+make pg.refresh           # repair internal IP pins and proxy targets
+make machine.status       # Apple machine JSON
+make machine.shell        # shell as the mapped macOS user
+make machine.shell.root   # root shell for diagnostics
+make pg.shell             # shell in the active PostgreSQL container
 ```
 
-## Tearing down
+## Export, deletion, and recovery
+
+Snapshots disappear with the Apple machine. `make pg.export` writes a recovery
+tarball under the host repository's `var/` directory containing both Incus
+backends, the proxy, active-slot state, and the unmounted sparse XFS image.
+Archiving the filesystem image preserves its shared reflink extents instead of
+expanding each checkpoint into a full independent copy:
 
 ```shell
-make pg.down          # delete pg-dev-a, pg-dev-b, pg-proxy (irreversible)
-make stop             # stop colima
-make delete           # nuke colima entirely; rebuild fresh with `make recreate`
+make pg.export
+
+# Restore over the current complete setup, or after rebuilding an empty
+# outer machine:
+make recreate
+make pg.import-last
 ```
 
-Snapshots live inside the colima VM. `make delete` loses them all.
-`make pg.export` / `make pg.import-last` serialise the *active* backend
-(data + snapshots) to a tarball under `var/`, which survives a colima
-rebuild — slower than ZFS snapshots, but the only way out of the VM.
+Exports are intentionally much slower and larger than reflink checkpoints.
+Use them before deleting or recreating the outer machine. Import accepts an
+empty Incus host or a complete three-container setup and rolls back on a
+failed validation/startup; it refuses a partial setup. Keep enough free disk
+for the extracted sparse XFS image and the previous image during the swap.
 
-# Questions
+```shell
+make stop          # stop the persistent Apple machine; keep all data
+make system.stop   # also stop Apple's container services
+make pg.down       # delete all three Incus containers AND both XFS slot trees
+make delete        # delete the outer machine and everything inside it
+make recreate      # delete, rebuild, and start a fresh outer machine
+```
 
-## Why a `Makefile` if you have a script
+`make delete`, `make recreate`, and `make pg.down` are destructive. Host-side
+exports under `var/` survive outer-machine deletion.
 
-Because I like the shell autocompletion of `make`.
+## Configuration
+
+See `.env.example`. The main settings are:
+
+- `MACHINE_NAME`, `MACHINE_CPUS`, `MACHINE_MEMORY` — persistent Apple machine;
+- `PG_DATA_DISK_SIZE` — first-creation XFS logical size;
+- `PG_ACTIVE_PORT`, `PG_STAGING_PORT` — client-facing role ports;
+- `PG_BACKEND_A_IP`, `PG_BACKEND_B_IP` — optional nested bridge pins;
+- `PG_MACHINE_IP` — optional printed client-address override.
+
+## Why a Makefile if there is a script?
+
+Shell completion for `make` targets is convenient; the script contains the
+actual lifecycle logic.

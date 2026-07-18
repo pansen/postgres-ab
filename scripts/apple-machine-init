@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Idempotent bootstrap for the persistent Apple container machine. The stock
+# Apple kernel has XFS and loop devices built in, but lacks the Btrfs, ZFS, and
+# DM-thin stack used by Incus's optimized snapshot backends. A sparse XFS loop
+# filesystem therefore supplies CoW reflinks for the PostgreSQL data timelines
+# while Incus uses `dir` for the comparatively small container root filesystems.
+
+DATA_IMAGE=/var/lib/pg-dev-local.xfs
+DATA_ROOT=/var/lib/pg-dev-local
+DATA_SIZE=${PG_DATA_DISK_SIZE:-140G}
+FSTAB_ENTRY="$DATA_IMAGE $DATA_ROOT xfs loop,nofail 0 0"
+image_tmp=
+loop_device=
+
+# `container machine run` can accept a command a few hundred milliseconds
+# after PID 1 starts, before systemd's private/system bus is listening. Wait
+# for the manager instead of racing the first boot of a freshly created VM.
+systemd_ready=0
+for _ in $(seq 1 60); do
+    if [[ "$(ps -p 1 -o comm= | xargs)" == systemd ]] \
+        && systemctl show --property=Version >/dev/null 2>&1; then
+        systemd_ready=1
+        break
+    fi
+    sleep 0.5
+done
+if (( systemd_ready == 0 )); then
+    echo "ERROR: systemd did not become ready within 30 seconds." >&2
+    echo "       PID 1: $(ps -p 1 -o comm=,args= 2>/dev/null || echo unavailable)" >&2
+    exit 1
+fi
+
+_bootstrap_cleanup() {
+    local status="$?"
+    trap - EXIT
+    set +e
+    if [[ -n "$loop_device" ]]; then
+        losetup --detach "$loop_device"
+    fi
+    if [[ -n "$image_tmp" ]]; then
+        rm -f -- "$image_tmp"
+    fi
+    exit "$status"
+}
+
+trap _bootstrap_cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! command -v incus >/dev/null 2>&1 \
+    || ! command -v dnsmasq >/dev/null 2>&1 \
+    || ! command -v mkfs.xfs >/dev/null 2>&1 \
+    || ! command -v jq >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y --no-install-recommends dnsmasq-base incus-base jq xfsprogs
+fi
+
+systemctl enable --now incus.socket incus.service
+
+if [[ ! -e "$DATA_IMAGE" ]]; then
+    echo "==> Creating sparse $DATA_SIZE XFS data store at $DATA_IMAGE..."
+    image_tmp="${DATA_IMAGE}.creating.$$"
+    loop_device=
+    rm -f "$image_tmp"
+    truncate -s "$DATA_SIZE" "$image_tmp"
+    loop_device=$(losetup --find --show "$image_tmp")
+    if mkfs.xfs -q -m reflink=1 "$loop_device"; then
+        losetup --detach "$loop_device"
+        loop_device=
+        mv "$image_tmp" "$DATA_IMAGE"
+        image_tmp=
+    else
+        result=$?
+        losetup --detach "$loop_device" 2>/dev/null || true
+        loop_device=
+        rm -f "$image_tmp"
+        image_tmp=
+        exit "$result"
+    fi
+fi
+
+mkdir -p "$DATA_ROOT"
+if ! grep -Fqx "$FSTAB_ENTRY" /etc/fstab; then
+    printf '%s\n' "$FSTAB_ENTRY" >> /etc/fstab
+fi
+if ! mountpoint -q "$DATA_ROOT"; then
+    loop_device=$(losetup --find --show --read-only "$DATA_IMAGE")
+    image_type=$(blkid --probe --output value --match-tag TYPE "$loop_device" 2>/dev/null || true)
+    losetup --detach "$loop_device"
+    loop_device=
+    if [[ "$image_type" != xfs ]]; then
+        echo "ERROR: existing $DATA_IMAGE is not a valid XFS filesystem; refusing to overwrite it." >&2
+        exit 1
+    fi
+    mount "$DATA_ROOT"
+fi
+
+if ! xfs_info "$DATA_ROOT" | grep -q 'reflink=1'; then
+    echo "ERROR: $DATA_ROOT is not an XFS filesystem with reflinks enabled." >&2
+    exit 1
+fi
+
+# Fail early if the running kernel/filesystem cannot actually perform the CoW
+# operation that the database snapshot implementation relies on.
+probe_source="$DATA_ROOT/.reflink-probe-source"
+probe_copy="$DATA_ROOT/.reflink-probe-copy"
+printf 'reflink probe\n' > "$probe_source"
+if ! cp --reflink=always "$probe_source" "$probe_copy"; then
+    rm -f "$probe_source" "$probe_copy"
+    echo "ERROR: XFS reflink copies are unavailable on $DATA_ROOT." >&2
+    exit 1
+fi
+rm -f "$probe_source" "$probe_copy"
+
+# A freshly installed daemon has no pool/network/profile devices. Configure
+# those once without disturbing an already initialized experimental machine.
+if ! incus storage list --format csv -c n 2>/dev/null | grep -qx default; then
+    incus storage create default dir
+fi
+if ! incus network list --format csv -c n 2>/dev/null | grep -qx incusbr0; then
+    incus network create incusbr0 \
+        ipv4.address=auto ipv4.nat=true \
+        ipv6.address=auto ipv6.nat=true
+fi
+if ! incus profile device get default root path >/dev/null 2>&1; then
+    incus profile device add default root disk path=/ pool=default
+fi
+if ! incus profile device get default eth0 network >/dev/null 2>&1; then
+    incus profile device add default eth0 nic network=incusbr0 name=eth0
+fi
+
+mkdir -p "$DATA_ROOT/a/current" "$DATA_ROOT/a/snapshots"
+mkdir -p "$DATA_ROOT/b/current" "$DATA_ROOT/b/snapshots"
+
+echo "Apple machine ready: Incus $(incus version | awk '/Server version/ { print $3 }')"
+echo "PostgreSQL data store: $DATA_ROOT ($(df -h --output=size,used,avail "$DATA_ROOT" | tail -n1 | xargs))"

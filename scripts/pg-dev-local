@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 # set -x
 
 # pg-dev-local — two PostgreSQL backends, two client-facing ports, one tiny
@@ -10,11 +10,10 @@ set -euo pipefail
 #                        devices — no software installed:
 #                          :5432  → the *active*  backend's Postgres
 #                          :5433  → the *staging* backend's Postgres
-#                        Clients connect to pg-proxy's own pinned incusbr0 IP
-#                        (default .10), reachable from macOS through the
-#                        colima VM's bridged network. `promote` just flips
-#                        var/active-slot and re-points the two `connect`
-#                        targets.
+#                        The devices bind on the Apple machine host, because
+#                        macOS cannot route to the nested incusbr0 subnet.
+#                        Clients connect to the machine IP; `promote` flips
+#                        var/active-slot and re-points the two targets.
 #
 # There is no pgbouncer: each port is a plain per-connection TCP passthrough,
 # indistinguishable from a direct connection (prepared statements, SET, LISTEN,
@@ -36,6 +35,39 @@ BACKEND_B="${BACKEND_PREFIX}-b"
 PROXY=pg-proxy
 STATE_DIR="$REPO_ROOT/var"
 STATE_FILE="$STATE_DIR/active-slot"
+DATA_ROOT=/var/lib/pg-dev-local
+DATA_IMAGE=/var/lib/pg-dev-local.xfs
+MUTATION_LOCK=/run/lock/pg-dev-local.lock
+SIGNAL_CLEANUP=
+
+# State-changing commands install a short-lived cleanup callback while they
+# own stopped containers, temporary data trees, or an unmounted filesystem.
+# Bash resolves locals dynamically, so the callback can safely use the state
+# tracked by the command that installed it.
+_handle_signal() {
+    local status="$1"
+    trap - ERR HUP INT TERM
+    set +eu
+    if [[ -n "$SIGNAL_CLEANUP" ]] && declare -F "$SIGNAL_CLEANUP" >/dev/null; then
+        "$SIGNAL_CLEANUP"
+    fi
+    exit "$status"
+}
+
+_handle_error() {
+    local status="$1"
+    trap - ERR HUP INT TERM
+    set +eu
+    if [[ -n "$SIGNAL_CLEANUP" ]] && declare -F "$SIGNAL_CLEANUP" >/dev/null; then
+        "$SIGNAL_CLEANUP"
+    fi
+    exit "$status"
+}
+
+trap '_handle_error $?' ERR
+trap '_handle_signal 129' HUP
+trap '_handle_signal 130' INT
+trap '_handle_signal 143' TERM
 
 # Client-facing ports. Both are pooler-free *direct* lines — incus `proxy`
 # devices on pg-proxy that relay a raw TCP connection straight to the
@@ -67,6 +99,34 @@ _set_active() {
     tmp="$(mktemp "$STATE_FILE.XXXXXX")"
     printf '%s\n' "$new" > "$tmp"
     mv "$tmp" "$STATE_FILE"
+    if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+        chown "$HOST_UID:$HOST_GID" "$STATE_DIR" "$STATE_FILE" 2>/dev/null || true
+    fi
+}
+
+_slot_for_container() {
+    case "$1" in
+        "$BACKEND_A") echo a ;;
+        "$BACKEND_B") echo b ;;
+        *) echo "ERROR: unknown backend container '$1'" >&2; exit 1 ;;
+    esac
+}
+
+_data_current()   { echo "$DATA_ROOT/$(_slot_for_container "$1")/current"; }
+_data_snapshots() { echo "$DATA_ROOT/$(_slot_for_container "$1")/snapshots"; }
+
+_acquire_mutation_lock() {
+    mkdir -p "$(dirname "$MUTATION_LOCK")"
+    exec 9>"$MUTATION_LOCK"
+    flock 9
+}
+
+_require_data_store() {
+    if [[ ! -f "$DATA_IMAGE" \
+        || "$(findmnt -T "$DATA_ROOT" -n -o FSTYPE 2>/dev/null || true)" != xfs ]]; then
+        echo "ERROR: $DATA_ROOT is not mounted from the XFS data store; run 'make machine' first." >&2
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -74,11 +134,14 @@ _set_active() {
 # ---------------------------------------------------------------------------
 
 _proxy_ip() {
-    # Empty if pg-proxy has no IPv4 (e.g. it's stopped). `|| true` so
-    # pipefail doesn't trip on grep finding nothing.
-    incus list "$PROXY" --format csv -c 4 2>/dev/null \
-        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
-        | head -1 || true
+    # The nested incusbr0 addresses are not routed to macOS. Proxy devices
+    # therefore bind on the Incus host, which is this Apple machine's eth0.
+    if [[ -n "${PG_MACHINE_IP:-}" ]]; then
+        echo "$PG_MACHINE_IP"
+        return
+    fi
+    ip -4 -o addr show dev eth0 2>/dev/null \
+        | awk '{ split($4, a, "/"); print a[1]; exit }'
 }
 
 # RUNNING / STOPPED / FROZEN / … — empty if the container doesn't exist.
@@ -98,24 +161,9 @@ _incusbr0_prefix() {
     echo "${prefix%%/*}"
 }
 
-# Derive a stable IP for pg-proxy in the incusbr0 subnet (e.g. 10.x.x.10).
-# PG_PROXY_IP wins if set; PG_BOUNCER_IP is accepted as a legacy fallback for
-# .env files that predate the pgbouncer removal.
-_pick_proxy_ip() {
-    if [[ -n "${PG_PROXY_IP:-}" ]]; then
-        echo "$PG_PROXY_IP"
-        return
-    fi
-    if [[ -n "${PG_BOUNCER_IP:-}" ]]; then
-        echo "$PG_BOUNCER_IP"
-        return
-    fi
-    echo "$(_incusbr0_prefix).10"
-}
-
 # Static IPs for the backends. They MUST keep a stable address: the proxy
 # devices dial them by IP, and a pinned ipv4.address yields a STATIC lease
-# that Incus regenerates on daemon start (so the target survives a colima VM
+# that Incus regenerates on daemon start (so the target survives a machine
 # reboot). A dynamic lease could drift to a different address and break the
 # forward. Override in .env if .11/.12 clash.
 _pick_backend_a_ip() { echo "${PG_BACKEND_A_IP:-$(_incusbr0_prefix).11}"; }
@@ -166,19 +214,22 @@ _staging_backend_ip() {
     if [[ "$(_staging)" == a ]]; then _pick_backend_a_ip; else _pick_backend_b_ip; fi
 }
 
-# Add-or-re-point one proxy device (a raw TCP relay inside pg-proxy's own
-# network namespace, bind=instance so it listens on pg-proxy's own pinned
-# incusbr0 IP — not the colima VM's host address) toward a backend's Postgres.
-# Idempotent: creates the device once, then just re-points `connect` on later
-# calls.
+# Add-or-re-point one proxy device. `bind=host` puts its listener on the Apple
+# machine's eth0 (reachable from macOS); the Incus host namespace can also
+# dial the backend's pinned incusbr0 address. Existing bind=instance devices
+# from the Colima layout are replaced in place.
 _ensure_proxy_device() {
     local device="$1" listen_port="$2" ip="$3"
-    if incus config device get "$PROXY" "$device" connect >/dev/null 2>&1; then
-        incus config device set "$PROXY" "$device" connect="tcp:${ip}:5432"
+    local bind
+    bind=$(incus config device get "$PROXY" "$device" bind 2>/dev/null || true)
+    if [[ "$bind" == host ]]; then
+        incus config device set "$PROXY" "$device" \
+            listen="tcp:0.0.0.0:${listen_port}" connect="tcp:${ip}:5432" || return
     else
+        incus config device remove "$PROXY" "$device" >/dev/null 2>&1 || true
         echo "==> Adding proxy $PROXY:$listen_port → ${ip}:5432..."
         incus config device add "$PROXY" "$device" proxy \
-            listen="tcp:0.0.0.0:${listen_port}" connect="tcp:${ip}:5432" bind=instance >/dev/null
+            listen="tcp:0.0.0.0:${listen_port}" connect="tcp:${ip}:5432" bind=host >/dev/null || return
     fi
 }
 
@@ -192,11 +243,12 @@ _ensure_proxy_device() {
 _set_forwards() {
     [[ "$(_state "$PROXY")" == "RUNNING" ]] || return 0
     for legacy in pgdirect-active pgdirect-staging pgdirect; do
-        incus config device get "$PROXY" "$legacy" connect >/dev/null 2>&1 \
-            && incus config device remove "$PROXY" "$legacy" >/dev/null
+        if incus config device get "$PROXY" "$legacy" connect >/dev/null 2>&1; then
+            incus config device remove "$PROXY" "$legacy" >/dev/null || return
+        fi
     done
-    _ensure_proxy_device "$MAIN_DEVICE"    "$ACTIVE_PORT"  "$(_active_backend_ip)"
-    _ensure_proxy_device "$STAGING_DEVICE" "$STAGING_PORT" "$(_staging_backend_ip)"
+    _ensure_proxy_device "$MAIN_DEVICE"    "$ACTIVE_PORT"  "$(_active_backend_ip)" || return
+    _ensure_proxy_device "$STAGING_DEVICE" "$STAGING_PORT" "$(_staging_backend_ip)" || return
 }
 
 # ---------------------------------------------------------------------------
@@ -205,9 +257,21 @@ _set_forwards() {
 
 _provision_backend() {
     local container="$1" ip="$2"
+    local data_dir
+    data_dir=$(_data_current "$container")
 
-    echo "==> Launching $container..."
-    incus launch --verbose "$IMAGE" "$container"
+    echo "==> Launching $container from $IMAGE..."
+    echo "    The first backend downloads and unpacks the Ubuntu image; later launches reuse it."
+    # `incus launch` accepts optional YAML configuration on stdin. The outer
+    # Apple `container machine run --interactive` keeps stdin open, so without
+    # this redirect Incus waits forever before it creates an operation.
+    incus launch --verbose "$IMAGE" "$container" </dev/null
+
+    echo "==> Attaching XFS-reflinked PostgreSQL data at $data_dir..."
+    mkdir -p "$data_dir"
+    incus exec "$container" -- mkdir -p /var/lib/postgresql
+    incus config device add "$container" pgdata disk \
+        source="$data_dir" path=/var/lib/postgresql shift=true
 
     echo "==> Waiting for IPv4 on $container..."
     until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
@@ -284,32 +348,19 @@ CREATE DATABASE "$PG_DB" OWNER "$PG_USER";
 SQL
 
     echo "==> Snapshotting $container @ initial..."
-    incus pause "$container"
-    incus snapshot create "$container" initial
-    incus resume "$container"
+    _snapshot "$container" initial
 }
 
-# pg-proxy is a bare container: no packages, no config. It exists only to host
-# the two proxy devices (added by _set_forwards). The forkproxies run inside
-# pg-proxy's own netns and dial the backends over incusbr0, so pg-proxy just
-# needs a pinned incusbr0 address of its own — that's the address clients
-# connect to.
+# pg-proxy is a bare container: no packages, no config. It exists only to own
+# the two proxy devices (added by _set_forwards). With bind=host, both their
+# listeners and backend connections live in the Apple machine host namespace.
 _provision_proxy() {
-    local ip="$1"
-
-    echo "==> Launching $PROXY (bare proxy container)..."
-    incus launch --verbose "$IMAGE" "$PROXY"
+    echo "==> Launching $PROXY from the cached Ubuntu image (bare proxy container)..."
+    incus launch --verbose "$IMAGE" "$PROXY" </dev/null
 
     echo "==> Waiting for IPv4 on $PROXY..."
     until incus list "$PROXY" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
         sleep 2
-    done
-
-    echo "==> Pinning $PROXY eth0 → $ip..."
-    incus config device override "$PROXY" eth0 ipv4.address="$ip"
-    incus restart "$PROXY"
-    until incus list "$PROXY" --format csv -c 4 | grep -q "$ip"; do
-        sleep 1
     done
 }
 
@@ -318,6 +369,8 @@ _provision_proxy() {
 # ---------------------------------------------------------------------------
 
 cmd_up() {
+    _require_data_store
+
     if incus info pg-dev > /dev/null 2>&1; then
         cat <<MSG
 NOTE: a legacy 'pg-dev' container exists alongside this setup. It won't
@@ -331,10 +384,8 @@ MSG
         sleep 1
     fi
 
-    # A legacy pg-bouncer container would otherwise squat the .10 IP that
-    # pg-proxy wants to pin.
     if incus info pg-bouncer > /dev/null 2>&1; then
-        echo "==> Legacy pg-bouncer container found — deleting it to free its pinned IP..."
+        echo "==> Legacy pg-bouncer container found — deleting it..."
         incus delete pg-bouncer --force
     fi
 
@@ -345,15 +396,14 @@ MSG
         fi
     done
 
-    local proxy_ip backend_a_ip backend_b_ip
-    proxy_ip=$(_pick_proxy_ip)
+    local backend_a_ip backend_b_ip
     backend_a_ip=$(_pick_backend_a_ip)
     backend_b_ip=$(_pick_backend_b_ip)
-    echo "==> Static IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip  $PROXY=$proxy_ip"
+    echo "==> Static backend IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip"
 
     _provision_backend "$BACKEND_A" "$backend_a_ip"
     _provision_backend "$BACKEND_B" "$backend_b_ip"
-    _provision_proxy "$proxy_ip"
+    _provision_proxy
 
     _set_active a
     _set_forwards
@@ -365,9 +415,26 @@ MSG
 }
 
 cmd_down() {
+    _require_data_store
     # pg-bouncer is listed for cleanup when upgrading from the old layout.
     for c in "$PROXY" pg-bouncer "$BACKEND_A" "$BACKEND_B"; do
-        incus delete "$c" --force 2>/dev/null || true
+        if incus info "$c" >/dev/null 2>&1; then
+            incus delete "$c" --force
+        fi
+    done
+    for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
+        if incus info "$c" >/dev/null 2>&1; then
+            echo "ERROR: $c still exists; refusing to remove its backing data." >&2
+            exit 1
+        fi
+    done
+    for slot in a b; do
+        local path="$DATA_ROOT/$slot"
+        [[ "$path" == "$DATA_ROOT/"[ab] ]] || {
+            echo "ERROR: refusing to remove unexpected data path '$path'" >&2
+            exit 1
+        }
+        rm -rf -- "$path"
     done
     rm -f "$STATE_FILE"
 }
@@ -419,8 +486,7 @@ _render_table() {
 # the container's own bridge IPs. ENDPOINT is the published proxy-ip:port — the
 # *role* mapping (constant across promote), so it shows even when the backend
 # is stopped. The backend's own IP isn't repeated here (it's in the IPs column
-# and, being on incusbr0, isn't reachable off pg-proxy anyway). One incus call
-# feeds both the IPs and the snapshot count.
+# and, being on incusbr0, isn't reachable from macOS anyway).
 _status_row() {
     local c="$1" role="$2" proxy_ip="$3"
     local RS=$'\036' US=$'\037'
@@ -436,8 +502,7 @@ _status_row() {
         | jq -r '.[0].state.network // {} | to_entries[] | select(.key != "lo") | .value.addresses[]? | select(.scope == "global") | .address' 2>/dev/null \
         | paste -sd "$RS" -)
     [[ -z "$ips" ]] && ips="-"
-    snaps=$(printf '%s' "$json" | jq -r '.[0].snapshots | length' 2>/dev/null)
-    [[ -z "$snaps" || "$snaps" == "null" ]] && snaps=0
+    snaps=$(_snapshot_count "$c")
     printf '%s%s%s%s%s%s%s%s%s\n' \
         "$c" "$US" "$state" "$US" "$endpoint" "$US" "$snaps" "$US" "$ips"
 }
@@ -456,11 +521,8 @@ cmd_status() {
     incus version 2>/dev/null
     echo
     echo "active slot: $a   (active = $ca, staging = $cs)"
-    # pg-proxy hosts every client-facing endpoint below (its pinned IP is the
-    # connection host), so it needs no table row of its own — just its
-    # liveness and where it publishes. When it's down the published ports
-    # aren't live, but the role→port mapping still holds, so the table keeps
-    # showing them.
+    # pg-proxy owns every client-facing proxy device below, but bind=host puts
+    # the listeners on the Apple machine address shown here.
     if [[ "$pstate" == "RUNNING" ]]; then
         echo "pg-proxy:    $pstate  ($proxy_ip → :$ACTIVE_PORT active, :$STAGING_PORT staging)"
     else
@@ -473,7 +535,13 @@ cmd_status() {
         _status_row "$cs" staging "$proxy_ip"
     } | _render_table
     echo
-    cmd_snapshots
+    cmd_snapshots --with-psql
+}
+
+_print_psql_command() {
+    local label="$1" ip="$2" port="$3"
+    printf '%spsql --host=%q --port=%q --username=%q --dbname=%q\n' \
+        "$label" "$ip" "$port" "$PG_USER" "$PG_DB"
 }
 
 cmd_endpoint() {
@@ -490,21 +558,57 @@ staging  host=$ip port=$STAGING_PORT dbname=$PG_DB   (import target / opposite o
 .pgpass line (one line, covers both ports):
     $ip:*:*:$PG_USER:$PG_PASSWORD
 EOF
+
+    echo
+    echo "psql commands:"
+    _print_psql_command "  active:  " "$ip" "$ACTIVE_PORT"
+    _print_psql_command "  staging: " "$ip" "$STAGING_PORT"
 }
 
 cmd_promote() {
-    local from to
+    local from to result=0 pointer_flipped=0
     from=$(_active)
     to=$(_staging)
 
     echo "==> Promoting: active $from → $to"
 
+    if [[ "$(_state "$PROXY")" != RUNNING \
+        || "$(_state "${BACKEND_PREFIX}-${from}")" != RUNNING \
+        || "$(_state "${BACKEND_PREFIX}-${to}")" != RUNNING ]]; then
+        echo "ERROR: proxy and both backends must be RUNNING before promotion." >&2
+        exit 1
+    fi
+
+    _promote_signal_cleanup() {
+        set +e
+        if (( pointer_flipped == 1 )); then
+            _set_active "$from"
+            _set_forwards
+        fi
+    }
+    SIGNAL_CLEANUP=_promote_signal_cleanup
+
     # Flip the pointer, then re-point both forwards. Re-pointing a proxy
     # device's `connect` restarts its forkproxy, so any open TCP connection is
     # dropped — clients reconnect (to the new active on :$ACTIVE_PORT, or the
     # new staging on :$STAGING_PORT). The endpoints themselves never change.
+    pointer_flipped=1
     _set_active "$to"
-    _set_forwards
+    if _set_forwards; then
+        result=0
+    else
+        result=$?
+        echo "ERROR: proxy update failed; restoring active slot $from..." >&2
+        _set_active "$from"
+        pointer_flipped=0
+        _set_forwards || echo "ERROR: proxy rollback also failed; run 'make pg.refresh'." >&2
+        SIGNAL_CLEANUP=
+        unset -f _promote_signal_cleanup
+        return "$result"
+    fi
+    pointer_flipped=0
+    SIGNAL_CLEANUP=
+    unset -f _promote_signal_cleanup
 
     echo "==> Promoted. Active: ${BACKEND_PREFIX}-${to}   Staging: ${BACKEND_PREFIX}-${from}"
     echo
@@ -523,73 +627,454 @@ _pg_wait_ready() {
         if (( tries > 30 )); then
             echo "ERROR: Postgres on $container not ready after ${tries}s" >&2
             incus exec "$container" -- journalctl -u postgresql@17-main --no-pager | tail -n 40 >&2
-            exit 1
+            return 1
         fi
         sleep 1
     done
 }
 
+_stop_verified() {
+    local container="$1" state
+    state=$(_state "$container")
+    if [[ -z "$state" ]]; then
+        echo "ERROR: container '$container' does not exist." >&2
+        return 1
+    fi
+    if [[ "$state" != STOPPED ]]; then
+        incus stop "$container" --force || return
+    fi
+    state=$(_state "$container")
+    if [[ "$state" != STOPPED ]]; then
+        echo "ERROR: $container is $state, not STOPPED; refusing to touch its data." >&2
+        return 1
+    fi
+}
+
+_stop_graceful_verified() {
+    local container="$1" state
+    state=$(_state "$container")
+    if [[ -z "$state" ]]; then
+        echo "ERROR: container '$container' does not exist." >&2
+        return 1
+    fi
+    if [[ "$state" != STOPPED ]]; then
+        incus stop "$container" || return
+    fi
+    state=$(_state "$container")
+    if [[ "$state" != STOPPED ]]; then
+        echo "ERROR: $container is $state, not STOPPED." >&2
+        return 1
+    fi
+}
+
+_validate_snapshot_name() {
+    local name="$1"
+    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        echo "ERROR: snapshot names may contain only letters, digits, '.', '_' and '-'" >&2
+        exit 1
+    fi
+}
+
+# Creation-ordered records as: epoch<TAB>name. Snapshot directory mtimes are
+# touched only after a successful copy, so they are reliable ordering metadata.
+_snapshot_records() {
+    local container="$1" snapshots
+    snapshots=$(_data_snapshots "$container")
+    [[ -d "$snapshots" ]] || return 0
+    find "$snapshots" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@\t%f\n' | sort -n
+}
+
+_snapshot_count() {
+    local container="$1" count
+    count=$(_snapshot_records "$container" | wc -l | tr -d ' ')
+    echo "${count:-0}"
+}
+
+_slot_recovery_artifact() {
+    local container="$1" current snapshots artifact
+    current=$(_data_current "$container")
+    snapshots=$(_data_snapshots "$container")
+    artifact=$(find "$(dirname "$current")" -maxdepth 1 -type d \
+        -name 'current.restore-*' -print -quit 2>/dev/null || true)
+    if [[ -z "$artifact" ]]; then
+        artifact=$(find "$snapshots" -maxdepth 1 -type d \
+            \( -name '.*.tmp.*' -o -name '.*.replaced.*' -o -name '.restore-prune.*' \) \
+            -print -quit 2>/dev/null || true)
+    fi
+    if [[ -n "$artifact" ]]; then
+        echo "$artifact"
+    fi
+}
+
 _snapshot() {
     local container="$1" name="$2" force="${3:-}"
-    if [[ "$force" == "--force" ]]; then
-        incus snapshot delete "$container" "$name" 2>/dev/null || true
+    local current snapshots target tmp replaced result=0 cleanup_result=0
+    local target_existed=0 snapshot_committed=0
+    _require_data_store
+    _validate_snapshot_name "$name"
+    current=$(_data_current "$container")
+    snapshots=$(_data_snapshots "$container")
+    target="$snapshots/$name"
+    tmp="$snapshots/.${name}.tmp.$$"
+    replaced="$snapshots/.${name}.replaced.$$"
+
+    local recovery_artifact
+    recovery_artifact=$(_slot_recovery_artifact "$container")
+    if [[ -n "$recovery_artifact" ]]; then
+        echo "ERROR: unresolved snapshot/restore recovery data exists at $recovery_artifact" >&2
+        return 1
     fi
-    # Cleanly stop Postgres so the snapshot captures a properly shut-down
-    # cluster (pg_control marked clean). Otherwise `incus pause` freezes it
-    # mid-flight and every restore pays for WAL replay / crash recovery.
-    incus exec "$container" -- systemctl stop postgresql@17-main
-    incus snapshot create "$container" "$name"
-    incus exec "$container" -- systemctl start postgresql@17-main
-    _pg_wait_ready "$container"
+
+    _snapshot_signal_cleanup() {
+        local cleanup_status=0 restore_errexit=0
+        [[ $- == *e* ]] && restore_errexit=1
+        set +e
+        rm -rf -- "$tmp"
+        if (( snapshot_committed == 0 )); then
+            if (( target_existed == 1 )) && [[ -e "$replaced" ]]; then
+                if [[ -e "$target" ]]; then
+                    rm -rf -- "$target" || cleanup_status=$?
+                fi
+                if [[ ! -e "$target" ]]; then
+                    mv "$replaced" "$target" || cleanup_status=$?
+                fi
+            elif (( target_existed == 0 )) && [[ -e "$target" ]]; then
+                rm -rf -- "$target" || cleanup_status=$?
+            fi
+        elif [[ -e "$replaced" ]]; then
+            rm -rf -- "$replaced" || cleanup_status=$?
+        fi
+
+        if [[ "$(_state "$container")" == RUNNING ]]; then
+            if ! incus exec "$container" -- systemctl is-active --quiet postgresql@17-main; then
+                incus exec "$container" -- systemctl start postgresql@17-main \
+                    && _pg_wait_ready "$container" || cleanup_status=$?
+            fi
+        else
+            cleanup_status=1
+        fi
+        if (( cleanup_status != 0 )); then
+            echo "ERROR: snapshot cleanup was incomplete; inspect $target and $replaced." >&2
+        fi
+        (( restore_errexit == 1 )) && set -e
+        return "$cleanup_status"
+    }
+
+    mkdir -p "$current" "$snapshots"
+    if [[ -e "$target" && "$force" != "--force" ]]; then
+        echo "ERROR: snapshot '$name' already exists on $container (pass force=1 to replace it)." >&2
+        exit 1
+    fi
+    [[ -e "$target" ]] && target_existed=1
+    if [[ "$(_state "$container")" != RUNNING ]] \
+        || ! incus exec "$container" -- systemctl is-active --quiet postgresql@17-main; then
+        echo "ERROR: $container and PostgreSQL must be running before taking a snapshot." >&2
+        return 1
+    fi
+    SIGNAL_CLEANUP=_snapshot_signal_cleanup
+
+    # Stop PostgreSQL cleanly, then make a same-filesystem XFS CoW clone. This
+    # is effectively instant and consumes blocks only as current/snapshot data
+    # diverge, unlike Incus's stock-kernel `dir` snapshots.
+    rm -rf -- "$tmp" "$replaced"
+    mkdir "$tmp"
+    if incus exec "$container" -- systemctl stop postgresql@17-main; then
+        :
+    else
+        result=$?
+    fi
+    if (( result == 0 )) \
+        && cp -a --reflink=always --sparse=auto "$current/." "$tmp/" \
+        && touch "$tmp"; then
+        if [[ -e "$target" ]]; then
+            if mv "$target" "$replaced" && mv "$tmp" "$target"; then
+                result=0
+            else
+                result=$?
+                [[ -e "$target" ]] || mv "$replaced" "$target" 2>/dev/null || true
+            fi
+        elif mv "$tmp" "$target"; then
+            result=0
+        else
+            result=$?
+        fi
+    else
+        result=$?
+    fi
+    if (( result != 0 )); then
+        _snapshot_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _snapshot_signal_cleanup
+        echo "ERROR: failed to create reflink snapshot '$name' on $container." >&2
+        (( cleanup_result == 0 )) || echo "ERROR: automatic snapshot rollback was incomplete." >&2
+        return "$result"
+    fi
+
+    if incus exec "$container" -- systemctl start postgresql@17-main \
+        && _pg_wait_ready "$container"; then
+        snapshot_committed=1
+    else
+        result=$?
+        _snapshot_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _snapshot_signal_cleanup
+        echo "ERROR: PostgreSQL did not restart cleanly; the previous named snapshot was restored." >&2
+        (( cleanup_result == 0 )) || echo "ERROR: automatic snapshot rollback was incomplete." >&2
+        return "$result"
+    fi
+
+    rm -rf -- "$tmp" "$replaced"
+    SIGNAL_CLEANUP=
+    unset -f _snapshot_signal_cleanup
     echo "Snapshot '$name' created on $container."
 }
 
 _restore() {
     local container="$1" name="$2"
-    incus stop "$container" --force 2>/dev/null || true
+    local current snapshots target after reply new old failed prune snap
+    local result=0 cleanup_result=0 container_was_running=0 restore_committed=0
+    _require_data_store
+    _validate_snapshot_name "$name"
+    current=$(_data_current "$container")
+    snapshots=$(_data_snapshots "$container")
+    target="$snapshots/$name"
+    new="${current}.restore-new.$$"
+    old="${current}.restore-old.$$"
+    failed="${current}.restore-failed.$$"
+    prune="$snapshots/.restore-prune.$$"
 
-    # ZFS requires removing snapshots taken after the target before restoring.
-    local after
-    after=$(incus snapshot list "$container" -f json \
-        | jq -r --arg name "$name" '
-            . as $all
-            | ($all | map(.name) | index($name)) as $idx
-            | if $idx == null then [] else $all[$idx+1:] end
-            | .[].name
-        ')
+    local recovery_artifact
+    recovery_artifact=$(_slot_recovery_artifact "$container")
+    if [[ -n "$recovery_artifact" ]]; then
+        echo "ERROR: unresolved snapshot/restore recovery data exists at $recovery_artifact" >&2
+        return 1
+    fi
+
+    _restore_signal_cleanup() {
+        local cleanup_status=0 restore_errexit=0 candidate_moved=0
+        [[ $- == *e* ]] && restore_errexit=1
+        set +e
+        rm -rf -- "$new" || cleanup_status=$?
+
+        if (( restore_committed == 0 )); then
+            if [[ -d "$old" ]]; then
+                if [[ "$(_state "$container")" != STOPPED ]]; then
+                    _stop_verified "$container" || cleanup_status=$?
+                fi
+                if [[ "$(_state "$container")" == STOPPED ]]; then
+                    if [[ -e "$current" ]]; then
+                        if mv "$current" "$failed"; then
+                            candidate_moved=1
+                        else
+                            cleanup_status=$?
+                        fi
+                    fi
+                    if [[ ! -e "$current" ]]; then
+                        if mv "$old" "$current"; then
+                            if (( candidate_moved == 1 )); then
+                                rm -rf -- "$failed" || cleanup_status=$?
+                            fi
+                        else
+                            cleanup_status=$?
+                            if (( candidate_moved == 1 )) && [[ ! -e "$current" ]]; then
+                                mv "$failed" "$current" || cleanup_status=$?
+                            fi
+                        fi
+                    fi
+                else
+                    cleanup_status=1
+                fi
+            fi
+
+            if [[ -d "$prune" ]]; then
+                for snap in "$prune"/*; do
+                    [[ -e "$snap" ]] || continue
+                    if [[ -e "$snapshots/$(basename "$snap")" ]]; then
+                        cleanup_status=1
+                        continue
+                    fi
+                    mv "$snap" "$snapshots/$(basename "$snap")" || cleanup_status=$?
+                done
+                if find "$prune" -mindepth 1 -print -quit | grep -q .; then
+                    cleanup_status=1
+                else
+                    rmdir "$prune" || cleanup_status=$?
+                fi
+            fi
+
+            if (( container_was_running == 1 )); then
+                if [[ "$(_state "$container")" != RUNNING ]]; then
+                    incus start "$container" || cleanup_status=$?
+                fi
+                if [[ "$(_state "$container")" == RUNNING ]]; then
+                    _pg_wait_ready "$container" || cleanup_status=$?
+                fi
+            fi
+        else
+            rm -rf -- "$old" "$failed" "$prune" || cleanup_status=$?
+        fi
+
+        if (( cleanup_status != 0 )); then
+            echo "ERROR: restore cleanup was incomplete; preserved recovery paths:" >&2
+            echo "       $current" >&2
+            echo "       $old" >&2
+            echo "       $failed" >&2
+            echo "       $prune" >&2
+        fi
+        (( restore_errexit == 1 )) && set -e
+        return "$cleanup_status"
+    }
+
+    if [[ ! -d "$target" ]]; then
+        echo "ERROR: snapshot '$name' does not exist on $container." >&2
+        exit 1
+    fi
+
+    # Preserve the original timeline semantics: restoring an older checkpoint
+    # discards every later one after confirmation, even though XFS itself does
+    # not impose ZFS's rollback restriction.
+    after=$(_snapshot_records "$container" \
+        | awk -F '\t' -v target="$name" '$2 == target { seen=1; next } seen { print $2 }')
     if [[ -n "$after" ]]; then
         echo "==> Snapshots on $container that will be deleted:"
         echo "$after" | sed 's/^/     /'
-        local reply
-        read -r -p "Continue? [Y/n] " reply
+        printf 'Continue? [Y/n] ' >&2
+        read -r reply
         [[ "${reply:-Y}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
-        while IFS= read -r snap; do
-            incus snapshot delete "$container" "$snap"
-        done <<< "$after"
     fi
 
-    incus snapshot restore "$container" "$name"
+    [[ "$(_state "$container")" == RUNNING ]] && container_was_running=1
+    SIGNAL_CLEANUP=_restore_signal_cleanup
 
-    # `snapshot restore` rolls back the container *config* too. A snapshot
-    # taken before IP pinning existed carries an unpinned eth0, so restoring
-    # it silently drops the static lease and the backend drifts to a random
-    # DHCP address on next boot — while the proxy devices keep forwarding to
-    # the pinned IP. Re-assert the pin while the container is still stopped,
-    # so the static lease is in place on start.
-    case "$container" in
+    # Build the candidate while the current database is still serving. Both
+    # paths are on the same XFS filesystem, so the final rename window is tiny.
+    rm -rf -- "$new"
+    mkdir "$new"
+    if cp -a --reflink=always --sparse=auto "$target/." "$new/"; then
+        result=0
+    else
+        result=$?
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        echo "ERROR: failed to stage reflink snapshot '$name' on $container." >&2
+        (( cleanup_result == 0 )) || echo "ERROR: automatic restore cleanup was incomplete." >&2
+        return "$result"
+    fi
+
+    # From this point cleanup uses actual Incus state and path existence as the
+    # transaction record, avoiding signal windows between a command and a flag
+    # assignment. These names include this process ID and must not pre-exist.
+    for snap in "$old" "$failed" "$prune"; do
+        if [[ -e "$snap" ]]; then
+            rm -rf -- "$new"
+            echo "ERROR: refusing restore because recovery path '$snap' already exists." >&2
+            return 1
+        fi
+    done
+    if _stop_graceful_verified "$container"; then
+        result=0
+    else
+        result=$?
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        return "$result"
+    fi
+
+    # Repair networking before touching the data, so a configuration failure
+    # cannot strand an otherwise intact current dataset.
+    if case "$container" in
         "$BACKEND_A") _repair_backend_ip "$container" "$(_pick_backend_a_ip)" ;;
         "$BACKEND_B") _repair_backend_ip "$container" "$(_pick_backend_b_ip)" ;;
-    esac
+    esac; then
+        result=0
+    else
+        result=$?
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        echo "ERROR: failed to repair networking before restore; current data was not changed." >&2
+        (( cleanup_result == 0 )) || echo "ERROR: automatic restore cleanup was incomplete." >&2
+        return "$result"
+    fi
 
-    incus start "$container"
+    if mv "$current" "$old" && mv "$new" "$current"; then
+        result=0
+    else
+        result=$?
+    fi
+
+    if (( result != 0 )); then
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        echo "ERROR: failed to install reflink snapshot '$name' on $container." >&2
+        (( cleanup_result == 0 )) || echo "ERROR: automatic restore rollback was incomplete." >&2
+        return "$result"
+    fi
+
+    if incus start "$container" && _pg_wait_ready "$container"; then
+        result=0
+    else
+        result=$?
+        echo "ERROR: restored data did not start cleanly; rolling back to the pre-restore state..." >&2
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        if (( cleanup_result != 0 )); then
+            echo "ERROR: automatic restore rollback was incomplete." >&2
+        fi
+        return "$result"
+    fi
+
+    # Stage timeline pruning with reversible renames. The restore commits only
+    # after PostgreSQL is healthy and every newer snapshot has moved aside.
+    if mkdir "$prune"; then
+        :
+    else
+        result=$?
+    fi
+    if (( result == 0 )) && [[ -n "$after" ]]; then
+        while IFS= read -r snap; do
+            if mv "$snapshots/$snap" "$prune/$snap"; then
+                :
+            else
+                result=$?
+                break
+            fi
+        done <<< "$after"
+    fi
+    if (( result != 0 )); then
+        echo "ERROR: failed to stage timeline pruning; rolling back the restore..." >&2
+        _restore_signal_cleanup || cleanup_result=$?
+        SIGNAL_CLEANUP=
+        unset -f _restore_signal_cleanup
+        (( cleanup_result == 0 )) || echo "ERROR: automatic restore rollback was incomplete." >&2
+        return "$result"
+    fi
+
+    # Commit only after PostgreSQL and the complete timeline transition proved
+    # healthy. From here the restored state is authoritative.
+    restore_committed=1
+    if rm -rf -- "$old" "$failed" "$prune"; then
+        result=0
+    else
+        result=$?
+    fi
+    SIGNAL_CLEANUP=
+    unset -f _restore_signal_cleanup
+    if (( result != 0 )); then
+        echo "ERROR: restore committed, but temporary rollback data could not be removed." >&2
+        return "$result"
+    fi
     echo "Restored $container to snapshot '$name'."
 }
 
 _restore_last() {
     local container="$1"
     local name
-    name=$(incus snapshot list "$container" -f json \
-        | jq -r 'if length == 0 then empty else sort_by(.created_at) | last | .name end')
+    name=$(_snapshot_records "$container" | tail -n1 | cut -f2-)
     if [[ -z "$name" ]]; then
         echo "No snapshots on $container."
         exit 1
@@ -613,7 +1098,17 @@ cmd_restore_last() { _restore_last "$(_c_active)"; }
 # `make status` (which calls this) from failing on a fresh host before pg.up.
 _snapshot_list() {
     if incus info "$1" >/dev/null 2>&1; then
-        incus snapshot list "$1"
+        local records epoch name created
+        records=$(_snapshot_records "$1")
+        if [[ -z "$records" ]]; then
+            echo "(no snapshots)"
+            return
+        fi
+        printf '%-36s %s\n' NAME CREATED_AT
+        while IFS=$'\t' read -r epoch name; do
+            created=$(date --date="@${epoch}" '+%Y-%m-%d %H:%M:%S %z')
+            printf '%-36s %s\n' "$name" "$created"
+        done <<< "$records"
     else
         echo "(not provisioned — run 'make pg.up')"
     fi
@@ -621,12 +1116,23 @@ _snapshot_list() {
 
 # Unified listing for both slots.
 cmd_snapshots() {
-    local a s
+    local with_psql="${1:-}" a s proxy_ip
     a=$(_active); s=$(_staging)
+    if [[ "$with_psql" == --with-psql ]]; then
+        proxy_ip=$(_proxy_ip)
+    fi
     echo "─── active  (${BACKEND_PREFIX}-${a}) ───"
+    if [[ "$with_psql" == --with-psql ]]; then
+        _print_psql_command "$ " "$proxy_ip" "$ACTIVE_PORT"
+        echo
+    fi
     _snapshot_list "${BACKEND_PREFIX}-${a}"
     echo
     echo "─── staging (${BACKEND_PREFIX}-${s}) ───"
+    if [[ "$with_psql" == --with-psql ]]; then
+        _print_psql_command "$ " "$proxy_ip" "$STAGING_PORT"
+        echo
+    fi
     _snapshot_list "${BACKEND_PREFIX}-${s}"
 }
 
@@ -695,17 +1201,21 @@ cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/p
 
 # Re-pin the backends' static IPs (self-heal a drifted lease), then re-point
 # the proxy forwards from current state. Idempotent; run on every `make
-# start` so the forwards survive a colima VM reboot.
+# start` so the forwards survive an Apple machine reboot.
 #
 # Also the one-time migration path from the old pgbouncer layout: if pg-proxy
 # doesn't exist yet but a legacy pg-bouncer container does, replace it with a
-# bare pg-proxy pinned to the same IP, so the client-facing endpoint doesn't
-# change.
+# bare pg-proxy. The client-facing Apple machine endpoint does not change.
 cmd_refresh() {
     if ! incus info "$PROXY" >/dev/null 2>&1 && incus info pg-bouncer >/dev/null 2>&1; then
-        echo "==> Migrating: replacing legacy pg-bouncer with a bare pg-proxy (same pinned IP)..."
+        echo "==> Migrating: replacing legacy pg-bouncer with a bare pg-proxy..."
         incus delete pg-bouncer --force
-        _provision_proxy "$(_pick_proxy_ip)"
+    fi
+    if ! incus info "$PROXY" >/dev/null 2>&1 \
+        && incus info "$BACKEND_A" >/dev/null 2>&1 \
+        && incus info "$BACKEND_B" >/dev/null 2>&1; then
+        echo "==> Recreating missing $PROXY..."
+        _provision_proxy
     fi
 
     _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"
@@ -715,36 +1225,469 @@ cmd_refresh() {
 }
 
 # ---------------------------------------------------------------------------
-# Export / import (operate on the active backend)
+# Full export / import (both slots + proxy + raw reflink-preserving XFS image)
 # ---------------------------------------------------------------------------
 
 cmd_export() {
+    _require_data_store
     mkdir -p "$REPO_ROOT/var"
-    local container
-    container=$(_c_active)
-    local file
-    file="$REPO_ROOT/var/${container}-$(date +%Y-%m-%dT%H-%M-%S).tar.gz"
-    echo "==> Pausing $container for consistent export..."
-    incus pause "$container"
-    incus export "$container" "$file"
-    incus resume "$container"
-    echo "Exported to $file"
+    local c tmp= partial= file base result=0 restart_result=0 mount_result=0 unmounted=0
+    local was_a=0 was_b=0 was_proxy=0
+
+    for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
+        if ! incus info "$c" >/dev/null 2>&1; then
+            echo "ERROR: cannot export: $c does not exist." >&2
+            return 1
+        fi
+    done
+    [[ "$(_state "$BACKEND_A")" == RUNNING ]] && was_a=1
+    [[ "$(_state "$BACKEND_B")" == RUNNING ]] && was_b=1
+    [[ "$(_state "$PROXY")" == RUNNING ]] && was_proxy=1
+
+    tmp=$(mktemp -d /var/tmp/pg-dev-export.XXXXXX)
+    partial=$(mktemp "$REPO_ROOT/var/.pg-dev-all-$(date +%Y-%m-%dT%H-%M-%S).XXXXXX.tar.gz")
+    base=$(basename "$partial")
+    file="$REPO_ROOT/var/${base#.}"
+    printf '1\n' > "$tmp/format-version"
+    _active > "$tmp/active-slot"
+
+    _export_signal_cleanup() {
+        set +e
+        if ! mountpoint -q "$DATA_ROOT"; then
+            if mount "$DATA_ROOT"; then
+                unmounted=0
+            fi
+        fi
+        if mountpoint -q "$DATA_ROOT"; then
+            if (( was_a == 1 )) && [[ "$(_state "$BACKEND_A")" != RUNNING ]]; then
+                incus start "$BACKEND_A" && _pg_wait_ready "$BACKEND_A"
+            fi
+            if (( was_b == 1 )) && [[ "$(_state "$BACKEND_B")" != RUNNING ]]; then
+                incus start "$BACKEND_B" && _pg_wait_ready "$BACKEND_B"
+            fi
+            if (( was_proxy == 1 )) && [[ "$(_state "$PROXY")" != RUNNING ]]; then
+                incus start "$PROXY"
+            fi
+            _set_forwards
+        fi
+        [[ -n "$tmp" ]] && rm -rf -- "$tmp"
+        [[ -n "$partial" ]] && rm -f -- "$partial"
+    }
+    SIGNAL_CLEANUP=_export_signal_cleanup
+
+    echo "==> Stopping pg-dev containers for a consistent full export..."
+    for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
+        if [[ "$(_state "$c")" != STOPPED ]]; then
+            if _stop_graceful_verified "$c"; then
+                :
+            else
+                result=$?
+                break
+            fi
+        fi
+    done
+
+    if (( result == 0 )); then
+        for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
+            if incus export "$c" "$tmp/${c}.tar.gz"; then
+                :
+            else
+                result=$?
+                break
+            fi
+        done
+    fi
+
+    # Archive the unmounted sparse XFS image itself. This preserves all shared
+    # reflink extents exactly instead of expanding every snapshot into a full
+    # logical copy.
+    if (( result == 0 )); then
+        if umount "$DATA_ROOT"; then
+            unmounted=1
+        else
+            result=$?
+        fi
+    fi
+    if (( result == 0 )); then
+        if tar --sparse -czf "$partial" \
+            -C "$tmp" format-version active-slot \
+                "${BACKEND_A}.tar.gz" "${BACKEND_B}.tar.gz" "${PROXY}.tar.gz" \
+            -C "$(dirname "$DATA_IMAGE")" "$(basename "$DATA_IMAGE")"; then
+            :
+        else
+            result=$?
+        fi
+    fi
+    if (( unmounted == 1 )); then
+        if mount "$DATA_ROOT"; then
+            unmounted=0
+        else
+            mount_result=$?
+            (( result != 0 )) || result=$mount_result
+        fi
+    fi
+
+    if mountpoint -q "$DATA_ROOT"; then
+        if (( was_a == 1 )) && [[ "$(_state "$BACKEND_A")" != RUNNING ]]; then
+            incus start "$BACKEND_A" && _pg_wait_ready "$BACKEND_A" || restart_result=$?
+        fi
+        if (( was_b == 1 )) && [[ "$(_state "$BACKEND_B")" != RUNNING ]]; then
+            incus start "$BACKEND_B" && _pg_wait_ready "$BACKEND_B" || restart_result=$?
+        fi
+        if (( was_proxy == 1 )) && [[ "$(_state "$PROXY")" != RUNNING ]]; then
+            incus start "$PROXY" || restart_result=$?
+        fi
+        if (( restart_result == 0 )); then
+            _set_forwards || restart_result=$?
+        fi
+    else
+        restart_result=${mount_result:-1}
+        (( restart_result != 0 )) || restart_result=1
+        echo "ERROR: $DATA_ROOT is not mounted; PostgreSQL containers were left stopped." >&2
+    fi
+
+    rm -rf -- "$tmp"
+    if (( result != 0 )); then
+        rm -f -- "$partial"
+        SIGNAL_CLEANUP=
+        unset -f _export_signal_cleanup
+        echo "ERROR: export failed." >&2
+        return "$result"
+    fi
+    if mv "$partial" "$file"; then
+        :
+    else
+        result=$?
+        rm -f -- "$partial"
+        SIGNAL_CLEANUP=
+        unset -f _export_signal_cleanup
+        echo "ERROR: failed to commit export archive '$file'." >&2
+        return "$result"
+    fi
+    SIGNAL_CLEANUP=
+    unset -f _export_signal_cleanup
+    if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
+        chown "$HOST_UID:$HOST_GID" "$STATE_DIR" "$file" 2>/dev/null || true
+    fi
+    echo "Exported both slots, timelines, and Incus containers to $file"
+    if (( restart_result != 0 )); then
+        echo "ERROR: export succeeded, but one or more containers did not restart cleanly." >&2
+        return "$restart_result"
+    fi
 }
 
 cmd_import_last() {
-    local container
-    container=$(_c_active)
-    local file
-    file=$(ls -t "$REPO_ROOT/var/${container}-"*.tar.gz 2>/dev/null | head -1)
+    _require_data_store
+    local file tmp= new_image loop_device= image_type= imported_slot previous_slot result=0 cleanup_result=0
+    local old_image= old_a= old_b= old_proxy= c stale_instance= stale_image= stale_data=
+    local was_a=0 was_b=0 was_proxy=0
+    local had_setup=0 existing_count=0
+    local import_mutation_started=0
+    file=$(ls -t "$REPO_ROOT/var/pg-dev-all-"*.tar.gz 2>/dev/null | head -1 || true)
     if [[ -z "$file" ]]; then
-        echo "No export found for $container in var/."
+        echo "No full Apple-machine export found in var/."
         exit 1
     fi
     echo "==> Importing from $file..."
-    incus delete "$container" --force 2>/dev/null || true
-    incus import "$file"
-    incus start "$container"
-    echo "Imported and started $container"
+
+    tmp=$(mktemp -d /var/lib/pg-dev-import.XXXXXX)
+    _import_signal_cleanup() {
+        local cleanup_status=0
+        set +e
+        if [[ -n "$loop_device" ]]; then
+            if losetup --detach "$loop_device"; then
+                loop_device=
+            else
+                cleanup_status=$?
+            fi
+        fi
+        if (( import_mutation_started == 1 )) \
+            && declare -F _rollback_import >/dev/null; then
+            _rollback_import || cleanup_status=$?
+        fi
+        if (( cleanup_status == 0 )); then
+            [[ -n "$tmp" ]] && rm -rf -- "$tmp"
+        else
+            echo "ERROR: import recovery data remains at $tmp" >&2
+        fi
+        return "$cleanup_status"
+    }
+    SIGNAL_CLEANUP=_import_signal_cleanup
+
+    if ! tar --sparse -xzf "$file" -C "$tmp"; then
+        rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        echo "ERROR: failed to extract '$file'; the running setup was not changed." >&2
+        return 1
+    fi
+    new_image="$tmp/$(basename "$DATA_IMAGE")"
+    imported_slot=$(tr -d '\n' < "$tmp/active-slot" 2>/dev/null || true)
+    if [[ "$(tr -d '\n' < "$tmp/format-version" 2>/dev/null || true)" != 1 \
+        || ! "$imported_slot" =~ ^[ab]$ \
+        || ! -f "$new_image" \
+        || ! -f "$tmp/${BACKEND_A}.tar.gz" \
+        || ! -f "$tmp/${BACKEND_B}.tar.gz" \
+        || ! -f "$tmp/${PROXY}.tar.gz" ]]; then
+        rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        echo "ERROR: '$file' is not a complete pg-dev full export." >&2
+        return 1
+    fi
+
+    if loop_device=$(losetup --find --show --read-only "$new_image"); then
+        image_type=$(blkid --probe --output value --match-tag TYPE "$loop_device" 2>/dev/null || true)
+        if [[ "$image_type" == xfs ]] && xfs_repair -n "$loop_device" >/dev/null; then
+            result=0
+        else
+            result=$?
+        fi
+        if losetup --detach "$loop_device"; then
+            loop_device=
+        else
+            result=$?
+        fi
+    else
+        result=$?
+    fi
+    if (( result != 0 )) || [[ "$image_type" != xfs ]]; then
+        if [[ -n "$loop_device" ]] && ! losetup --detach "$loop_device"; then
+            SIGNAL_CLEANUP=
+            unset -f _import_signal_cleanup
+            echo "ERROR: could not detach validation loop device $loop_device; temporary data remains at $tmp." >&2
+            return 1
+        fi
+        loop_device=
+        rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        echo "ERROR: exported XFS image failed validation; the running setup was not changed." >&2
+        return 1
+    fi
+
+    old_a="${BACKEND_A}-import-old-$$"
+    old_b="${BACKEND_B}-import-old-$$"
+    old_proxy="${PROXY}-import-old-$$"
+    old_image="${DATA_IMAGE}.import-old.$$"
+    previous_slot=$(_active)
+    [[ "$(_state "$BACKEND_A")" == RUNNING ]] && was_a=1
+    [[ "$(_state "$BACKEND_B")" == RUNNING ]] && was_b=1
+    [[ "$(_state "$PROXY")" == RUNNING ]] && was_proxy=1
+
+    # Uses Bash's dynamic scoping to access the state flags above. Every
+    # destructive stage keeps its predecessor until this rollback is no longer
+    # needed.
+    _rollback_import() {
+        local rollback_result=0 restore_errexit=0
+        [[ $- == *e* ]] && restore_errexit=1
+        set +e
+        echo "==> Restoring the pre-import machine state..." >&2
+        if (( had_setup == 0 )) || incus info "$old_proxy" >/dev/null 2>&1; then
+            if incus info "$PROXY" >/dev/null 2>&1; then
+                incus delete "$PROXY" --force || rollback_result=$?
+            fi
+        fi
+        if (( had_setup == 0 )) || incus info "$old_a" >/dev/null 2>&1; then
+            if incus info "$BACKEND_A" >/dev/null 2>&1; then
+                incus delete "$BACKEND_A" --force || rollback_result=$?
+            fi
+        fi
+        if (( had_setup == 0 )) || incus info "$old_b" >/dev/null 2>&1; then
+            if incus info "$BACKEND_B" >/dev/null 2>&1; then
+                incus delete "$BACKEND_B" --force || rollback_result=$?
+            fi
+        fi
+
+        # old_image is the image-swap transaction record. It exists only after
+        # the original image was safely unmounted and renamed.
+        if (( rollback_result == 0 )) && [[ -e "$old_image" ]]; then
+            if mountpoint -q "$DATA_ROOT"; then
+                umount "$DATA_ROOT" || rollback_result=$?
+            fi
+            if (( rollback_result == 0 )) && [[ -e "$DATA_IMAGE" ]]; then
+                mv "$DATA_IMAGE" "$tmp/failed-$(basename "$DATA_IMAGE")" \
+                    || rollback_result=$?
+            fi
+            if (( rollback_result == 0 )); then
+                mv "$old_image" "$DATA_IMAGE" || rollback_result=$?
+            fi
+            if (( rollback_result == 0 )); then
+                mount "$DATA_ROOT" || rollback_result=$?
+            fi
+        elif (( rollback_result == 0 )) && ! mountpoint -q "$DATA_ROOT"; then
+            # Unmount completed, but the original image rename did not.
+            mount "$DATA_ROOT" || rollback_result=$?
+        fi
+
+        if incus info "$old_a" >/dev/null 2>&1; then
+            incus move "$old_a" "$BACKEND_A" || rollback_result=$?
+        fi
+        if incus info "$old_b" >/dev/null 2>&1; then
+            incus move "$old_b" "$BACKEND_B" || rollback_result=$?
+        fi
+        if incus info "$old_proxy" >/dev/null 2>&1; then
+            incus move "$old_proxy" "$PROXY" || rollback_result=$?
+        fi
+        _set_active "$previous_slot" || rollback_result=$?
+
+        if (( rollback_result == 0 )) && mountpoint -q "$DATA_ROOT"; then
+            if (( was_a == 1 )) && [[ "$(_state "$BACKEND_A")" != RUNNING ]]; then
+                incus start "$BACKEND_A" && _pg_wait_ready "$BACKEND_A" || rollback_result=$?
+            fi
+            if (( was_b == 1 )) && [[ "$(_state "$BACKEND_B")" != RUNNING ]]; then
+                incus start "$BACKEND_B" && _pg_wait_ready "$BACKEND_B" || rollback_result=$?
+            fi
+            if (( was_proxy == 1 )) && [[ "$(_state "$PROXY")" != RUNNING ]]; then
+                incus start "$PROXY" || rollback_result=$?
+            fi
+            _set_forwards || rollback_result=$?
+        fi
+        if (( rollback_result != 0 )); then
+            echo "ERROR: automatic import rollback was incomplete; preserved recovery state:" >&2
+            echo "       $tmp" >&2
+            echo "       $old_image" >&2
+            echo "       $old_a  $old_b  $old_proxy" >&2
+        fi
+        (( restore_errexit == 1 )) && set -e
+        return "$rollback_result"
+    }
+
+    for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
+        incus info "$c" >/dev/null 2>&1 && existing_count=$((existing_count + 1))
+    done
+    if (( existing_count != 0 && existing_count != 3 )); then
+        rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        unset -f _rollback_import
+        echo "ERROR: cannot import safely over a partial setup ($existing_count of 3 containers exist)." >&2
+        return 1
+    fi
+    if (( existing_count == 3 )); then
+        had_setup=1
+    fi
+
+    stale_instance=$(incus list --format csv -c n 2>/dev/null \
+        | awk '/-import-old-[0-9]+$/ { print; exit }')
+    stale_image=$(find "$(dirname "$DATA_IMAGE")" -maxdepth 1 -type f \
+        -name "$(basename "$DATA_IMAGE").import-old.*" -print -quit)
+    if (( had_setup == 0 )); then
+        stale_data=$(find "$DATA_ROOT/a" "$DATA_ROOT/b" -mindepth 1 \
+            ! -path "$DATA_ROOT/a/current" ! -path "$DATA_ROOT/a/snapshots" \
+            ! -path "$DATA_ROOT/b/current" ! -path "$DATA_ROOT/b/snapshots" \
+            -print -quit 2>/dev/null || true)
+    fi
+    if [[ -n "$stale_instance" || -n "$stale_image" || -n "$stale_data" ]]; then
+        rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        unset -f _rollback_import
+        echo "ERROR: stale import recovery state or unowned PostgreSQL data exists; refusing to overwrite it." >&2
+        [[ -n "$stale_instance" ]] && echo "       instance: $stale_instance" >&2
+        [[ -n "$stale_image" ]] && echo "       image:    $stale_image" >&2
+        [[ -n "$stale_data" ]] && echo "       data:     $stale_data" >&2
+        return 1
+    fi
+
+    import_mutation_started=1
+    if (( had_setup == 1 )); then
+        for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
+            if _stop_graceful_verified "$c"; then :; else result=$?; break; fi
+        done
+    fi
+    if (( result != 0 )); then
+        if _rollback_import; then
+            cleanup_result=0
+        else
+            cleanup_result=$?
+        fi
+        import_mutation_started=0
+        (( cleanup_result == 0 )) && rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        unset -f _rollback_import
+        return "$result"
+    fi
+
+    # Keep the old instances under temporary names until the imported pair has
+    # booted and both PostgreSQL servers pass readiness checks.
+    if (( had_setup == 1 )); then
+        if incus move "$BACKEND_A" "$old_a"; then :; else result=$?; fi
+    fi
+    if (( result == 0 && had_setup == 1 )); then
+        if incus move "$BACKEND_B" "$old_b"; then :; else result=$?; fi
+    fi
+    if (( result == 0 && had_setup == 1 )); then
+        if incus move "$PROXY" "$old_proxy"; then :; else result=$?; fi
+    fi
+    if (( result == 0 )); then
+        if umount "$DATA_ROOT"; then :; else result=$?; fi
+    fi
+    if (( result == 0 )); then
+        if mv "$DATA_IMAGE" "$old_image"; then :; else result=$?; fi
+    fi
+    if (( result == 0 )); then
+        if mv "$new_image" "$DATA_IMAGE"; then :; else result=$?; fi
+    fi
+    if (( result == 0 )); then
+        if mount "$DATA_ROOT"; then :; else result=$?; fi
+    fi
+    if (( result == 0 )) && [[ ! -d "$DATA_ROOT/a/current" || ! -d "$DATA_ROOT/a/snapshots" \
+        || ! -d "$DATA_ROOT/b/current" || ! -d "$DATA_ROOT/b/snapshots" ]]; then
+        echo "ERROR: imported XFS image is missing one or more slot directories." >&2
+        result=1
+    fi
+
+    if (( result == 0 )); then if incus import "$tmp/${BACKEND_A}.tar.gz"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if incus import "$tmp/${BACKEND_B}.tar.gz"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if incus import "$tmp/${PROXY}.tar.gz"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if _repair_backend_ip "$BACKEND_B" "$(_pick_backend_b_ip)"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if _set_active "$imported_slot"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if incus start "$BACKEND_A" && _pg_wait_ready "$BACKEND_A"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if incus start "$BACKEND_B" && _pg_wait_ready "$BACKEND_B"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if incus start "$PROXY"; then :; else result=$?; fi; fi
+    if (( result == 0 )); then if _set_forwards; then :; else result=$?; fi; fi
+
+    if (( result != 0 )); then
+        echo "ERROR: import failed; rolling back the previous machine state..." >&2
+        if _rollback_import; then
+            cleanup_result=0
+        else
+            cleanup_result=$?
+        fi
+        import_mutation_started=0
+        (( cleanup_result == 0 )) && rm -rf -- "$tmp"
+        SIGNAL_CLEANUP=
+        unset -f _import_signal_cleanup
+        unset -f _rollback_import
+        if (( cleanup_result != 0 )); then
+            echo "ERROR: recovery data remains at $tmp" >&2
+        fi
+        return "$result"
+    fi
+
+    # The imported setup is now healthy and forwarding both role ports. Make
+    # it authoritative before deleting the rollback copies; an interrupt from
+    # here onward leaves the new setup intact and, at worst, old remnants for
+    # a later manual cleanup.
+    import_mutation_started=0
+    SIGNAL_CLEANUP=
+    unset -f _import_signal_cleanup
+    if (( had_setup == 1 )); then
+        incus delete "$old_proxy" --force || cleanup_result=$?
+        incus delete "$old_a" --force || cleanup_result=$?
+        incus delete "$old_b" --force || cleanup_result=$?
+    fi
+    rm -f -- "$old_image" || cleanup_result=$?
+    rm -rf -- "$tmp" || cleanup_result=$?
+    unset -f _rollback_import
+    if (( cleanup_result != 0 )); then
+        echo "ERROR: import committed, but one or more rollback copies could not be removed." >&2
+        return "$cleanup_result"
+    fi
+    echo "Imported and started both PostgreSQL slots and their snapshot timelines."
 }
 
 # ---------------------------------------------------------------------------
@@ -757,9 +1700,9 @@ Usage: $(basename "$0") <command> [args]
 
 Lifecycle:
   up                              provision pg-dev-a, pg-dev-b, pg-proxy
-  down                            delete all three containers
+  down                            delete containers and both XFS data trees
   status                          show pointer + container states
-  endpoint                        print proxy host/port roles + .pgpass line
+  endpoint                        print endpoints, .pgpass, and psql commands
   promote                         flip active↔staging (re-point both forwards)
   refresh                         re-pin backend IPs + re-assert proxy forwards
 
@@ -771,7 +1714,7 @@ Active slot (whatever is currently active):
   psql [args]                     psql via incus exec into active backend
   shell                           bash into active backend
   logs                            tail postgres logs on active backend
-  snapshot <name> [--force]       create a snapshot on active backend
+  snapshot <name> [--force]       create an XFS reflink snapshot on active backend
   restore <name>                  restore active backend to a snapshot
   restore-last                    restore active backend to its most recent snapshot
 
@@ -786,11 +1729,19 @@ Staging slot (the other one):
   staging.stop                    stop staging backend
   staging.start                   start staging backend
 
-Export / import (act on the active backend):
-  export                          export active backend to var/<name>-<ts>.tar.gz
-  import-last                     re-import most recent export of active backend
+Export / import (full setup):
+  export                          export both slots, timelines, and proxy
+  import-last                     restore the most recent full export
 EOF
 }
+
+case "${1:-}" in
+    up|down|promote|refresh|snapshot|restore|restore-last|\
+    staging.snapshot|staging.restore|staging.restore-last|staging.reset|\
+    staging.stop|staging.start|export|import-last)
+        _acquire_mutation_lock
+        ;;
+esac
 
 case "${1:-}" in
     up)             shift; cmd_up "$@" ;;

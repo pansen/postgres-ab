@@ -1,57 +1,121 @@
-packages := incus colima jq
-
-.PHONY: deps
-deps:
-	HOMEBREW_NO_AUTO_UPDATE=1 brew install $(packages)
-	HOMEBREW_NO_AUTO_UPDATE=1 brew upgrade $(packages)
-
 -include .env
 export
 
-# colima grows an existing VM disk on restart but never shrinks it, so this is
-# a safe floor: bumping it and re-running `make start` enlarges in place. The
-# default (colima's 60 GiB) is too small for a multi-GB database plus repeat
-# restores, 16 GB of transient WAL, and snapshots — a disk-full there surfaces
-# as a mysterious cluster crash, not a clean error. Override in .env if needed.
-COLIMA_DISK ?= 140   # GiB
+MACHINE_NAME ?= pg
+MACHINE_IMAGE ?= local/pg-incus-machine:26.04
+MACHINE_CPUS ?= 4
+MACHINE_MEMORY ?= 12G
+
+# Apple container CLI 1.1 does not expose a machine disk-size setting. This is
+# the logical size of the sparse XFS loop filesystem used for cheap PostgreSQL
+# data snapshots inside the machine's root disk.
+PG_DATA_DISK_SIZE ?= 140G
+
+PG_DEV_SCRIPT := ./scripts/pg-dev-local
+MACHINE_RUN := container machine run --name $(MACHINE_NAME) --root --interactive \
+	--workdir "$(CURDIR)" \
+	--env HOST_UID=$(shell id -u) \
+	--env HOST_GID=$(shell id -g) \
+	--env PG_DATA_DISK_SIZE=$(PG_DATA_DISK_SIZE) --
+MACHINE_RUN_TTY := container machine run --name $(MACHINE_NAME) --root --interactive --tty \
+	--workdir "$(CURDIR)" \
+	--env HOST_UID=$(shell id -u) \
+	--env HOST_GID=$(shell id -g) \
+	--env PG_DATA_DISK_SIZE=$(PG_DATA_DISK_SIZE) --
+PG_DEV := $(MACHINE_RUN) $(PG_DEV_SCRIPT)
+PG_DEV_TTY := $(MACHINE_RUN_TTY) $(PG_DEV_SCRIPT)
+
+.PHONY: deps
+deps:
+	@command -v container >/dev/null || { \
+		echo "Apple's container CLI is required: https://github.com/apple/container/releases" >&2; \
+		exit 1; \
+	}
+	@version="$$(container --version | awk '{ print $$4 }')"; \
+	major="$${version%%.*}"; rest="$${version#*.}"; minor="$${rest%%.*}"; \
+	case "$$major.$$minor" in (*[!0-9.]*|.*|*.) \
+		echo "Cannot parse Apple container CLI version '$$version'." >&2; exit 1;; esac; \
+	if [ "$$major" -lt 1 ] || { [ "$$major" -eq 1 ] && [ "$$minor" -lt 1 ]; }; then \
+		echo "Apple container CLI 1.1 or newer is required (found $$version)." >&2; \
+		exit 1; \
+	fi
+	container --version
+
+.PHONY: system.start
+system.start: deps
+	container system start --enable-kernel-install
+
+.PHONY: machine.image
+machine.image: system.start
+	container build --tag $(MACHINE_IMAGE) --file Dockerfile.machine .
+
+# Create the persistent Linux machine once, then bootstrap its Incus daemon and
+# XFS reflink store on every run. `machine set` is intentionally harmless while
+# running; changed resources take effect after the next stop/start.
+.PHONY: machine
+machine: system.start
+	@if ! container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
+		$(MAKE) machine.image; \
+		container machine create \
+			--name $(MACHINE_NAME) \
+			--cpus $(MACHINE_CPUS) \
+			--memory $(MACHINE_MEMORY) \
+			--home-mount rw \
+			--set-default \
+			$(MACHINE_IMAGE); \
+	fi
+	container machine set --name $(MACHINE_NAME) \
+		cpus=$(MACHINE_CPUS) memory=$(MACHINE_MEMORY) home-mount=rw
+	container machine set-default $(MACHINE_NAME)
+	# Apple 1.1 cannot attach an interactive exec while a machine is making its
+	# first transition from stopped to running. Boot it non-interactively, then
+	# let the guest bootstrap wait for systemd's bus below.
+	container machine run --name $(MACHINE_NAME) --root -- true
+	$(MACHINE_RUN) ./scripts/apple-machine-init
+
+.PHONY: machine.shell
+machine.shell: machine
+	container machine run --name $(MACHINE_NAME) --interactive --tty
+
+.PHONY: machine.shell.root
+machine.shell.root: machine
+	container machine run --name $(MACHINE_NAME) --root --interactive --tty
+
+.PHONY: machine.status
+machine.status: system.start
+	container machine inspect $(MACHINE_NAME)
 
 .PHONY: start
-start:
-	colima start \
-		--verbose \
-		--runtime=incus \
-		--memory $(COLIMA_MEMORY) \
-		--cpu $(COLIMA_CPU) \
-		--disk $(COLIMA_DISK)
-	@if [ "$$(incus list pg-proxy --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ] || \
-	    [ "$$(incus list pg-bouncer --format csv -c s 2>/dev/null | head -1)" = "RUNNING" ]; then \
-		sleep 2 && $(MAKE) pg.refresh; \
-	fi
+start: machine
+	$(PG_DEV) refresh
 	$(MAKE) status
 
 .PHONY: status/incus
-status/incus:
-	incus version
-	incus list
-	incus info --resources | head -n5
+status/incus: machine
+	$(MACHINE_RUN) incus version
+	$(MACHINE_RUN) incus list
+	$(MACHINE_RUN) incus info --resources
 
-# The one status command: pointer + proxy roles, a per-backend table (state,
-# client endpoint, snapshot count, container IPs), and the snapshot timelines
-# — pg-dev-local's own `status` now prints all of it.
+# The one status command: pointer + proxy roles, per-backend state/endpoints,
+# snapshot counts and snapshot timelines.
 .PHONY: status
-status:
+status: machine
 	@$(PG_DEV) status
 
 .PHONY: stop
 stop:
-	colima stop --verbose
+	@if container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
+		container machine stop $(MACHINE_NAME); \
+	fi
 
-PG_DEV := scripts/pg-dev-local
+.PHONY: system.stop
+system.stop: stop
+	container system stop
 
 # ----- lifecycle ----------------------------------------------------------
 
 .PHONY: pg.up
-pg.up:
+pg.up: machine
 	$(PG_DEV) up
 
 .PHONY: pg.down
@@ -75,11 +139,11 @@ pg.refresh:
 
 .PHONY: pg.psql
 pg.psql:
-	$(PG_DEV) psql
+	$(PG_DEV_TTY) psql
 
 .PHONY: pg.shell
 pg.shell:
-	$(PG_DEV) shell
+	$(PG_DEV_TTY) shell
 
 .PHONY: pg.ip
 pg.ip:
@@ -87,7 +151,7 @@ pg.ip:
 
 .PHONY: pg.logs
 pg.logs:
-	$(PG_DEV) logs
+	$(PG_DEV_TTY) logs
 
 .PHONY: pg.snapshot
 pg.snapshot:
@@ -109,15 +173,15 @@ pg.snapshots:
 
 .PHONY: pg.staging.psql
 pg.staging.psql:
-	$(PG_DEV) staging.psql
+	$(PG_DEV_TTY) staging.psql
 
 .PHONY: pg.staging.shell
 pg.staging.shell:
-	$(PG_DEV) staging.shell
+	$(PG_DEV_TTY) staging.shell
 
 .PHONY: pg.staging.logs
 pg.staging.logs:
-	$(PG_DEV) staging.logs
+	$(PG_DEV_TTY) staging.logs
 
 .PHONY: pg.staging.snapshot
 pg.staging.snapshot:
@@ -147,7 +211,7 @@ pg.staging.start:
 	$(PG_DEV) refresh
 	$(MAKE) status
 
-# ----- export / import (active backend) -----------------------------------
+# ----- full export / import -----------------------------------------------
 
 .PHONY: pg.export
 pg.export:
@@ -157,11 +221,18 @@ pg.export:
 pg.import-last:
 	$(PG_DEV) import-last
 
-# ----- colima ------------------------------------------------------------
+# ----- destructive outer-machine lifecycle -------------------------------
 
 .PHONY: delete
-delete:
-	colima delete --force
+delete: system.start
+	@if container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
+		container machine delete $(MACHINE_NAME); \
+	fi
 
 .PHONY: recreate
 recreate: delete start
+
+.PHONY: check
+check:
+	bash -n scripts/apple-machine-init scripts/pg-dev-local
+	@$(MAKE) --no-print-directory -n deps >/dev/null

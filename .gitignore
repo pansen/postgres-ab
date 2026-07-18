@@ -1,3 +1,4 @@
 /.zed
 .env
 /var/active-slot
+/var/*.tar.gz
