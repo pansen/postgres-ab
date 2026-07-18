@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Guest stdin from an Apple `machine run --interactive` session is a pipe
+# (not a TTY) that the host holds open for the session's lifetime. incus
+# `storage create` / `network create` read YAML config from any non-TTY
+# stdin until EOF, so they block forever on it. This bootstrap is strictly
+# non-interactive: detach stdin so those reads hit EOF immediately.
+exec </dev/null
+
 # Idempotent bootstrap for the persistent Apple container machine. The stock
 # Apple kernel has XFS and loop devices built in, but lacks the Btrfs, ZFS, and
 # DM-thin stack used by Incus's optimized snapshot backends. A sparse XFS loop
@@ -79,6 +86,18 @@ fi
 
 systemctl enable --now incus.socket incus.service
 
+# incusd's first start (cert generation, database init, kernel feature
+# probing) can lag well behind the systemd start job, and the incus CLI
+# blocks silently on the unix socket until the daemon answers. Wait for
+# readiness with a bound so a wedged daemon fails loudly instead of
+# hanging the bootstrap.
+if ! incus admin waitready --timeout 90; then
+    echo "ERROR: incusd did not become ready within 90 seconds." >&2
+    systemctl status incus.service --no-pager >&2 || true
+    journalctl -u incus.service --no-pager -n 50 >&2 || true
+    exit 1
+fi
+
 if [[ ! -e "$DATA_IMAGE" ]]; then
     echo "==> Creating sparse $DATA_SIZE XFS data store at $DATA_IMAGE..."
     image_tmp="${DATA_IMAGE}.creating.$$"
@@ -86,7 +105,7 @@ if [[ ! -e "$DATA_IMAGE" ]]; then
     rm -f "$image_tmp"
     truncate -s "$DATA_SIZE" "$image_tmp"
     loop_device=$(losetup --find --show "$image_tmp")
-    if mkfs.xfs -q -m reflink=1 "$loop_device"; then
+    if mkfs.xfs -m reflink=1 "$loop_device"; then
         losetup --detach "$loop_device"
         loop_device=
         mv "$image_tmp" "$DATA_IMAGE"
@@ -101,6 +120,7 @@ if [[ ! -e "$DATA_IMAGE" ]]; then
     fi
 fi
 
+echo "==> Mounting and verifying $DATA_ROOT..."
 mkdir -p "$DATA_ROOT"
 if ! grep -Fqx "$FSTAB_ENTRY" /etc/fstab; then
     printf '%s\n' "$FSTAB_ENTRY" >> /etc/fstab
@@ -165,6 +185,7 @@ else
     fi
 fi
 
+echo "==> Configuring Incus storage, network, and profile..."
 # A freshly installed daemon has no pool/network/profile devices. Configure
 # those once without disturbing an already initialized experimental machine.
 if ! incus storage list --format csv -c n 2>/dev/null | grep -qx default; then
