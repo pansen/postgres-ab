@@ -20,13 +20,24 @@ loop_device=
 # as soon as the manager forks, which is *before* the system D-Bus bus is up,
 # so it does not actually close the race. `systemctl is-system-running
 # --wait` blocks until the boot transaction has fully settled -- which
-# includes dbus.socket -- so use that instead.
+# includes dbus.socket -- but only once it can reach the bus at all: if the
+# exec session lands before the bus socket exists, it fails instantly with
+# "Failed to connect to system scope bus" instead of waiting. Retry until
+# the bus answers (empty output = connect failure), then trust --wait.
 if [[ "$(ps -p 1 -o comm= | xargs)" != systemd ]]; then
     echo "ERROR: PID 1 is not systemd; refusing to continue." >&2
     echo "       PID 1: $(ps -p 1 -o comm=,args= 2>/dev/null || echo unavailable)" >&2
     exit 1
 fi
-system_state=$(timeout 90 systemctl is-system-running --wait 2>/dev/null || true)
+system_state=$(timeout 90 bash -c '
+    while :; do
+        state=$(systemctl is-system-running --wait 2>/dev/null || true)
+        if [[ -n "$state" ]]; then
+            printf "%s" "$state"
+            exit 0
+        fi
+        sleep 1
+    done' || true)
 # "degraded" is the permanent steady state here: Apple's guest kernel has no
 # loadable-module support, so systemd-modules-load.service always fails with
 # "Failed to initialize libkmod context: Operation not supported" and holds
