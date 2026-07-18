@@ -17,12 +17,20 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
+# These units either fail outright or stall waiting for hardware that
+# doesn't exist under Apple's `container` guest virtualization: no console
+# gettys are attached, no hugepages/fuse-connections kernel interfaces are
+# exposed, and (crucially) the guest kernel has no loadable-module support at
+# all, so anything that tries to load a module fails immediately. Masking
+# them avoids both boot-time stalls and permanent `systemctl
+# is-system-running` degradation from units that can never succeed here.
 RUN systemctl set-default multi-user.target \
  && systemctl enable incus.socket incus.service incus-startup.service \
  && systemctl mask \
       console-getty.service \
       dev-hugepages.mount \
       sys-fs-fuse-connections.mount \
+      systemd-modules-load.service \
       systemd-tmpfiles-setup.service \
       systemd-update-utmp.service
 

@@ -15,20 +15,27 @@ image_tmp=
 loop_device=
 
 # `container machine run` can accept a command a few hundred milliseconds
-# after PID 1 starts, before systemd's private/system bus is listening. Wait
-# for the manager instead of racing the first boot of a freshly created VM.
-systemd_ready=0
-for _ in $(seq 1 60); do
-    if [[ "$(ps -p 1 -o comm= | xargs)" == systemd ]] \
-        && systemctl show --property=Version >/dev/null 2>&1; then
-        systemd_ready=1
-        break
-    fi
-    sleep 0.5
-done
-if (( systemd_ready == 0 )); then
-    echo "ERROR: systemd did not become ready within 30 seconds." >&2
+# after PID 1 starts, before systemd's private/system bus is listening.
+# `systemctl show --property=Version` succeeds against /run/systemd/private
+# as soon as the manager forks, which is *before* the system D-Bus bus is up,
+# so it does not actually close the race. `systemctl is-system-running
+# --wait` blocks until the boot transaction has fully settled -- which
+# includes dbus.socket -- so use that instead.
+if [[ "$(ps -p 1 -o comm= | xargs)" != systemd ]]; then
+    echo "ERROR: PID 1 is not systemd; refusing to continue." >&2
     echo "       PID 1: $(ps -p 1 -o comm=,args= 2>/dev/null || echo unavailable)" >&2
+    exit 1
+fi
+system_state=$(timeout 90 systemctl is-system-running --wait 2>/dev/null || true)
+# "degraded" is the permanent steady state here: Apple's guest kernel has no
+# loadable-module support, so systemd-modules-load.service always fails with
+# "Failed to initialize libkmod context: Operation not supported" and holds
+# the system at "degraded" forever. Treat running/degraded as ready; anything
+# else (including an empty result from a 90s timeout) is a hard failure.
+if [[ "$system_state" != running && "$system_state" != degraded ]]; then
+    echo "ERROR: systemd did not settle within 90 seconds (state: ${system_state:-timeout})." >&2
+    systemctl is-system-running >&2 || true
+    systemctl --failed --no-legend >&2 || true
     exit 1
 fi
 
@@ -115,6 +122,37 @@ if ! cp --reflink=always "$probe_source" "$probe_copy"; then
     exit 1
 fi
 rm -f "$probe_source" "$probe_copy"
+
+# PG_DATA_DISK_SIZE was only consulted above when the image didn't exist yet,
+# so raising it after the first boot would otherwise be silently ignored.
+# Grow the backing image and the XFS filesystem in place when it has been
+# raised; shrinking a live XFS filesystem isn't supported, so just warn.
+requested_bytes=$(numfmt --from=iec "$DATA_SIZE" 2>/dev/null || true)
+if [[ -z "$requested_bytes" ]]; then
+    echo "WARNING: could not parse PG_DATA_DISK_SIZE=$DATA_SIZE; skipping resize check." >&2
+else
+    current_bytes=$(stat -c %s "$DATA_IMAGE")
+    if (( requested_bytes > current_bytes )); then
+        echo "==> Growing data store to $DATA_SIZE..."
+        df_before=$(df --output=size "$DATA_ROOT" | tail -n1 | xargs)
+        truncate -s "$DATA_SIZE" "$DATA_IMAGE"
+        grow_loop_device=$(losetup -j "$DATA_IMAGE" | cut -d: -f1 | head -n1)
+        if [[ -z "$grow_loop_device" ]]; then
+            echo "ERROR: could not find the loop device backing $DATA_IMAGE." >&2
+            exit 1
+        fi
+        losetup -c "$grow_loop_device"
+        xfs_growfs "$DATA_ROOT" >/dev/null
+        df_after=$(df --output=size "$DATA_ROOT" | tail -n1 | xargs)
+        if (( df_after <= df_before )); then
+            echo "ERROR: $DATA_ROOT did not grow after xfs_growfs (before: ${df_before}, after: ${df_after})." >&2
+            exit 1
+        fi
+        echo "PostgreSQL data store grown: $DATA_ROOT ($(df -h --output=size,used,avail "$DATA_ROOT" | tail -n1 | xargs))"
+    elif (( requested_bytes < current_bytes )); then
+        echo "WARNING: PG_DATA_DISK_SIZE=$DATA_SIZE is smaller than the current data store; shrinking is unsupported, staying at the current size." >&2
+    fi
+fi
 
 # A freshly installed daemon has no pool/network/profile devices. Configure
 # those once without disturbing an already initialized experimental machine.

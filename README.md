@@ -53,6 +53,16 @@ and connect to pinned `.11`/`.12` addresses on the nested bridge. `make
 pg.status` discovers and prints the current machine IP; do not use a backend's
 10.x Incus address from macOS.
 
+The client endpoint address is the machine's IP on macOS's internal
+virtualization bridge (`bridge100`, host side `192.168.64.1/24`) — a
+host-only NAT network whose leases come from macOS's built-in DHCP server
+(`bootpd`), not from your LAN's DHCP. The endpoint is therefore reachable
+only from this Mac, and the lease is **not pinned**: it can change after a
+macOS reboot or machine recreation. Re-check with `make pg.status` after
+reboots, and update any saved `.pgpass` entries or connection strings
+accordingly. `PG_MACHINE_IP` in `.env` overrides only what is printed by the
+script; it does not pin the actual IP.
+
 There is no connection pooler. Each port is a per-connection TCP passthrough,
 so `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory
 locks, and parallel `pg_restore` behave like direct PostgreSQL connections.
@@ -78,11 +88,15 @@ PostgreSQL configuration is provisioned identically in both containers. Every
 snapshot stops PostgreSQL cleanly before cloning the data and starts it again
 afterward. Restoring an older snapshot retains the original workflow's
 timeline semantics: snapshots newer than the target are shown and deleted
-after confirmation.
+after confirmation (interactively you get a [Y/n] prompt, but non-interactively
+you must pass `force=1`, e.g. `make pg.restore name=foo force=1`, because stdin
+cannot answer prompts through the machine transport).
 
 The XFS size is a logical ceiling; the backing file is sparse. Apple container
-CLI 1.1 does not offer a machine disk-size flag. `PG_DATA_DISK_SIZE` affects
-first creation only and does not resize an existing XFS store.
+CLI 1.1 does not offer a machine disk-size flag. `PG_DATA_DISK_SIZE` is only
+used at first creation; to grow it later, raise the value in `.env` and the next
+`make start` will expand the sparse XFS store online via `xfs_growfs`. Shrinking
+the store is not supported.
 
 ### Scope and safety model
 
@@ -157,6 +171,8 @@ make pg.staging.snapshot name="$(date +%Y-%m-%dT%H-%M-%S)_dump_import"
 make pg.promote
 ```
 
+`make pg.promote` requires the proxy and **both backends to be running**. If
+the staging backend is stopped, start it first with `make pg.staging.start`.
 If the new data is bad, `make pg.promote` again immediately points `:5432`
 back to the previous backend and its untouched timeline.
 
@@ -220,6 +236,10 @@ make recreate
 make pg.import-last
 ```
 
+`make pg.import-last` only reads the full-setup `pg-dev-all-*.tar.gz` archives
+produced by this version; per-container exports from the old Colima setup are
+not importable.
+
 Exports are intentionally much slower and larger than reflink checkpoints.
 Use them before deleting or recreating the outer machine. Import accepts an
 empty Incus host or a complete three-container setup and rolls back on a
@@ -235,7 +255,21 @@ make recreate      # delete, rebuild, and start a fresh outer machine
 ```
 
 `make delete`, `make recreate`, and `make pg.down` are destructive. Host-side
-exports under `var/` survive outer-machine deletion.
+exports under `var/` survive outer-machine deletion. If a leftover experimental
+machine from early testing exists (e.g. one created by hand named `pg`), it is
+unrelated to this setup and can be reclaimed with `container machine delete
+<name>`.
+
+## Constraints & gotchas
+
+**Repository location:** The repository must live under your macOS home directory.
+The Apple container machine only mounts `$HOME` (home-mount), and every make
+target executes the repo's scripts inside the machine via that mount. A repo
+outside `$HOME` fails with a raw missing-directory error.
+
+**systemd status:** `systemctl is-system-running` inside the machine reports
+`degraded` permanently. This is expected and harmless—Apple's guest kernel has
+no loadable-module support, so `systemd-modules-load` can never succeed.
 
 ## Configuration
 

@@ -44,7 +44,7 @@ SIGNAL_CLEANUP=
 # own stopped containers, temporary data trees, or an unmounted filesystem.
 # Bash resolves locals dynamically, so the callback can safely use the state
 # tracked by the command that installed it.
-_handle_signal() {
+_handle_exit() {
     local status="$1"
     trap - ERR HUP INT TERM
     set +eu
@@ -54,20 +54,10 @@ _handle_signal() {
     exit "$status"
 }
 
-_handle_error() {
-    local status="$1"
-    trap - ERR HUP INT TERM
-    set +eu
-    if [[ -n "$SIGNAL_CLEANUP" ]] && declare -F "$SIGNAL_CLEANUP" >/dev/null; then
-        "$SIGNAL_CLEANUP"
-    fi
-    exit "$status"
-}
-
-trap '_handle_error $?' ERR
-trap '_handle_signal 129' HUP
-trap '_handle_signal 130' INT
-trap '_handle_signal 143' TERM
+trap '_handle_exit $?' ERR
+trap '_handle_exit 129' HUP
+trap '_handle_exit 130' INT
+trap '_handle_exit 143' TERM
 
 # Client-facing ports. Both are pooler-free *direct* lines — incus `proxy`
 # devices on pg-proxy that relay a raw TCP connection straight to the
@@ -121,9 +111,13 @@ _acquire_mutation_lock() {
     flock 9
 }
 
+_data_store_mounted() {
+    [[ -f "$DATA_IMAGE" \
+        && "$(findmnt -T "$DATA_ROOT" -n -o FSTYPE 2>/dev/null || true)" == xfs ]]
+}
+
 _require_data_store() {
-    if [[ ! -f "$DATA_IMAGE" \
-        || "$(findmnt -T "$DATA_ROOT" -n -o FSTYPE 2>/dev/null || true)" != xfs ]]; then
+    if ! _data_store_mounted; then
         echo "ERROR: $DATA_ROOT is not mounted from the XFS data store; run 'make machine' first." >&2
         return 1
     fi
@@ -140,8 +134,10 @@ _proxy_ip() {
         echo "$PG_MACHINE_IP"
         return
     fi
+    # `|| true`: don't let a missing eth0 (e.g. no interface yet) trip the ERR
+    # trap — callers already fall back to "?" / state text on empty output.
     ip -4 -o addr show dev eth0 2>/dev/null \
-        | awk '{ split($4, a, "/"); print a[1]; exit }'
+        | awk '{ split($4, a, "/"); print a[1]; exit }' || true
 }
 
 # RUNNING / STOPPED / FROZEN / … — empty if the container doesn't exist.
@@ -236,17 +232,8 @@ _ensure_proxy_device() {
 # Ensure both proxy devices exist and point at the right backends: :5432 →
 # active, :5433 → staging. Re-pointed on promote / refresh / VM boot. A no-op
 # when pg-proxy isn't running.
-#
-# Also retires the pre-refactor pgbouncer-era device names if present, so a
-# deployment that still carries them (e.g. mid-migration) converges on the
-# current main/staging pair instead of accumulating stale devices.
 _set_forwards() {
     [[ "$(_state "$PROXY")" == "RUNNING" ]] || return 0
-    for legacy in pgdirect-active pgdirect-staging pgdirect; do
-        if incus config device get "$PROXY" "$legacy" connect >/dev/null 2>&1; then
-            incus config device remove "$PROXY" "$legacy" >/dev/null || return
-        fi
-    done
     _ensure_proxy_device "$MAIN_DEVICE"    "$ACTIVE_PORT"  "$(_active_backend_ip)" || return
     _ensure_proxy_device "$STAGING_DEVICE" "$STAGING_PORT" "$(_staging_backend_ip)" || return
 }
@@ -254,6 +241,22 @@ _set_forwards() {
 # ---------------------------------------------------------------------------
 # Provisioning
 # ---------------------------------------------------------------------------
+
+# Block until <container> reports an IPv4 on eth0 — any address, or the
+# specific <expected-ip> when given (e.g. right after pinning a static lease,
+# where only that exact address means the new lease actually took hold).
+_wait_for_ipv4() {
+    local container="$1" expected="${2:-}"
+    if [[ -n "$expected" ]]; then
+        until incus list "$container" --format csv -c 4 | grep -q "$expected"; do
+            sleep 1
+        done
+    else
+        until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
+            sleep 2
+        done
+    fi
+}
 
 _provision_backend() {
     local container="$1" ip="$2"
@@ -274,16 +277,12 @@ _provision_backend() {
         source="$data_dir" path=/var/lib/postgresql shift=true
 
     echo "==> Waiting for IPv4 on $container..."
-    until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
-        sleep 2
-    done
+    _wait_for_ipv4 "$container"
 
     echo "==> Pinning $container eth0 → $ip (static lease → stable proxy target)..."
     incus config device override "$container" eth0 ipv4.address="$ip"
     incus restart "$container"
-    until incus list "$container" --format csv -c 4 | grep -q "$ip"; do
-        sleep 1
-    done
+    _wait_for_ipv4 "$container" "$ip"
 
     echo "==> Installing PostgreSQL 17 on $container..."
     incus exec --verbose "$container" -- bash <<'SETUP'
@@ -359,9 +358,7 @@ _provision_proxy() {
     incus launch --verbose "$IMAGE" "$PROXY" </dev/null
 
     echo "==> Waiting for IPv4 on $PROXY..."
-    until incus list "$PROXY" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
-        sleep 2
-    done
+    _wait_for_ipv4 "$PROXY"
 }
 
 # ---------------------------------------------------------------------------
@@ -370,24 +367,6 @@ _provision_proxy() {
 
 cmd_up() {
     _require_data_store
-
-    if incus info pg-dev > /dev/null 2>&1; then
-        cat <<MSG
-NOTE: a legacy 'pg-dev' container exists alongside this setup. It won't
-conflict — the current system uses pg-dev-a, pg-dev-b, pg-proxy — but it
-will sit there using disk/memory until you delete it:
-
-    incus delete pg-dev --force
-
-Continuing in 1s...
-MSG
-        sleep 1
-    fi
-
-    if incus info pg-bouncer > /dev/null 2>&1; then
-        echo "==> Legacy pg-bouncer container found — deleting it..."
-        incus delete pg-bouncer --force
-    fi
 
     for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
         if incus info "$c" > /dev/null 2>&1; then
@@ -414,29 +393,40 @@ MSG
     cmd_endpoint
 }
 
+# Best-effort teardown: an unmounted data store or a container that refuses
+# to delete must not stop the rest of the cleanup from proceeding. Deleting
+# containers is tried for all three regardless of individual failures; the
+# XFS data trees are only removed once every container is confirmed gone AND
+# the store is actually mounted (removing them while unmounted would just
+# hollow out the mountpoint directory, not the XFS-backed data).
 cmd_down() {
-    _require_data_store
-    # pg-bouncer is listed for cleanup when upgrading from the old layout.
-    for c in "$PROXY" pg-bouncer "$BACKEND_A" "$BACKEND_B"; do
-        if incus info "$c" >/dev/null 2>&1; then
-            incus delete "$c" --force
-        fi
-    done
+    local c slot path failed=0
     for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
         if incus info "$c" >/dev/null 2>&1; then
-            echo "ERROR: $c still exists; refusing to remove its backing data." >&2
-            exit 1
+            if ! incus delete "$c" --force; then
+                echo "WARNING: failed to delete $c; continuing with the rest." >&2
+                failed=1
+            fi
         fi
     done
-    for slot in a b; do
-        local path="$DATA_ROOT/$slot"
-        [[ "$path" == "$DATA_ROOT/"[ab] ]] || {
-            echo "ERROR: refusing to remove unexpected data path '$path'" >&2
-            exit 1
-        }
-        rm -rf -- "$path"
-    done
+
+    if (( failed != 0 )); then
+        echo "ERROR: one or more containers could not be deleted; refusing to remove their backing data." >&2
+    elif mountpoint -q "$DATA_ROOT"; then
+        for slot in a b; do
+            path="$DATA_ROOT/$slot"
+            [[ "$path" == "$DATA_ROOT/"[ab] ]] || {
+                echo "ERROR: refusing to remove unexpected data path '$path'" >&2
+                exit 1
+            }
+            rm -rf -- "$path"
+        done
+    else
+        echo "WARNING: $DATA_ROOT is not mounted; the XFS data trees were left alone." >&2
+    fi
+
     rm -f "$STATE_FILE"
+    (( failed == 0 )) || return 1
 }
 
 # Box-table renderer for cmd_status. Reads rows on stdin; columns are separated
@@ -491,13 +481,16 @@ _status_row() {
     local c="$1" role="$2" proxy_ip="$3"
     local RS=$'\036' US=$'\037'
     local state endpoint ips snaps port json
-    state=$(_state "$c"); [[ -z "$state" ]] && state="-"
+    json=$(incus list "$c" --format json 2>/dev/null)
+    # Single incus call for both state and IPs (was a separate `_state` call
+    # plus this same `incus list --format json`).
+    state=$(printf '%s' "$json" | jq -r '.[0].status // empty | ascii_upcase' 2>/dev/null)
+    [[ -z "$state" ]] && state="-"
     case "$role" in
         active)  port="$ACTIVE_PORT" ;;
         staging) port="$STAGING_PORT" ;;
     esac
     endpoint="${proxy_ip:-?}:${port}"
-    json=$(incus list "$c" --format json 2>/dev/null)
     ips=$(printf '%s' "$json" \
         | jq -r '.[0].state.network // {} | to_entries[] | select(.key != "lo") | .value.addresses[]? | select(.scope == "global") | .address' 2>/dev/null \
         | paste -sd "$RS" -)
@@ -527,6 +520,9 @@ cmd_status() {
         echo "pg-proxy:    $pstate  ($proxy_ip → :$ACTIVE_PORT active, :$STAGING_PORT staging)"
     else
         echo "pg-proxy:    $pstate"
+    fi
+    if ! _data_store_mounted; then
+        echo "data store:  NOT MOUNTED — run 'make machine'"
     fi
     echo
     {
@@ -572,10 +568,21 @@ cmd_promote() {
 
     echo "==> Promoting: active $from → $to"
 
-    if [[ "$(_state "$PROXY")" != RUNNING \
-        || "$(_state "${BACKEND_PREFIX}-${from}")" != RUNNING \
-        || "$(_state "${BACKEND_PREFIX}-${to}")" != RUNNING ]]; then
-        echo "ERROR: proxy and both backends must be RUNNING before promotion." >&2
+    local proxy_state from_state to_state problems=() line
+    proxy_state=$(_state "$PROXY")
+    from_state=$(_state "${BACKEND_PREFIX}-${from}")
+    to_state=$(_state "${BACKEND_PREFIX}-${to}")
+    [[ "$proxy_state" == RUNNING ]] \
+        || problems+=("$PROXY is ${proxy_state:-ABSENT} — run 'make start'")
+    [[ "$from_state" == RUNNING ]] \
+        || problems+=("${BACKEND_PREFIX}-${from} (active) is ${from_state:-ABSENT} — run 'make start'")
+    [[ "$to_state" == RUNNING ]] \
+        || problems+=("${BACKEND_PREFIX}-${to} (staging) is ${to_state:-ABSENT} — run 'make pg.staging.start'")
+    if (( ${#problems[@]} > 0 )); then
+        echo "ERROR: promotion requires proxy and both backends RUNNING:" >&2
+        for line in "${problems[@]}"; do
+            echo "  - $line" >&2
+        done
         exit 1
     fi
 
@@ -633,36 +640,31 @@ _pg_wait_ready() {
     done
 }
 
-_stop_verified() {
-    local container="$1" state
+# Stop <container> and verify it actually lands in STOPPED, refusing to
+# proceed otherwise (callers are about to touch its data). Plain `incus stop`
+# by default; pass --force for `incus stop --force` when an unclean stop is
+# preferable to hanging.
+_stop_checked() {
+    local container="$1" force="${2:-}" state
     state=$(_state "$container")
     if [[ -z "$state" ]]; then
         echo "ERROR: container '$container' does not exist." >&2
         return 1
     fi
     if [[ "$state" != STOPPED ]]; then
-        incus stop "$container" --force || return
+        if [[ "$force" == --force ]]; then
+            incus stop "$container" --force || return
+        else
+            incus stop "$container" || return
+        fi
     fi
     state=$(_state "$container")
     if [[ "$state" != STOPPED ]]; then
-        echo "ERROR: $container is $state, not STOPPED; refusing to touch its data." >&2
-        return 1
-    fi
-}
-
-_stop_graceful_verified() {
-    local container="$1" state
-    state=$(_state "$container")
-    if [[ -z "$state" ]]; then
-        echo "ERROR: container '$container' does not exist." >&2
-        return 1
-    fi
-    if [[ "$state" != STOPPED ]]; then
-        incus stop "$container" || return
-    fi
-    state=$(_state "$container")
-    if [[ "$state" != STOPPED ]]; then
-        echo "ERROR: $container is $state, not STOPPED." >&2
+        if [[ "$force" == --force ]]; then
+            echo "ERROR: $container is $state, not STOPPED; refusing to touch its data." >&2
+        else
+            echo "ERROR: $container is $state, not STOPPED." >&2
+        fi
         return 1
     fi
 }
@@ -762,7 +764,7 @@ _snapshot() {
 
     mkdir -p "$current" "$snapshots"
     if [[ -e "$target" && "$force" != "--force" ]]; then
-        echo "ERROR: snapshot '$name' already exists on $container (pass force=1 to replace it)." >&2
+        echo "ERROR: snapshot '$name' already exists on $container (pass --force to the script, or force=1 via make, to replace it)." >&2
         exit 1
     fi
     [[ -e "$target" ]] && target_existed=1
@@ -830,7 +832,7 @@ _snapshot() {
 }
 
 _restore() {
-    local container="$1" name="$2"
+    local container="$1" name="$2" force="${3:-}"
     local current snapshots target after reply new old failed prune snap
     local result=0 cleanup_result=0 container_was_running=0 restore_committed=0
     _require_data_store
@@ -859,7 +861,7 @@ _restore() {
         if (( restore_committed == 0 )); then
             if [[ -d "$old" ]]; then
                 if [[ "$(_state "$container")" != STOPPED ]]; then
-                    _stop_verified "$container" || cleanup_status=$?
+                    _stop_checked "$container" --force || cleanup_status=$?
                 fi
                 if [[ "$(_state "$container")" == STOPPED ]]; then
                     if [[ -e "$current" ]]; then
@@ -938,9 +940,23 @@ _restore() {
     if [[ -n "$after" ]]; then
         echo "==> Snapshots on $container that will be deleted:"
         echo "$after" | sed 's/^/     /'
-        printf 'Continue? [Y/n] ' >&2
-        read -r reply
-        [[ "${reply:-Y}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+        if [[ "$force" == --force ]]; then
+            :
+        elif [[ -t 0 ]]; then
+            printf 'Continue? [Y/n] ' >&2
+            read -r reply
+            [[ "${reply:-Y}" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+        else
+            # The outer `container machine run --interactive` (non-TTY) transport
+            # delivers EOF on stdin immediately, so a `read` here would just fail
+            # instead of ever letting the user answer. Refuse instead of guessing.
+            echo "ERROR: this confirmation cannot be answered through the non-TTY machine transport." >&2
+            echo "       Re-run with force to skip the prompt and proceed, e.g.:" >&2
+            echo "         make pg.restore name=$name force=1          (active slot)" >&2
+            echo "         make pg.staging.restore name=$name force=1  (staging slot)" >&2
+            echo "       (or pass --force directly to the script)." >&2
+            exit 1
+        fi
     fi
 
     [[ "$(_state "$container")" == RUNNING ]] && container_was_running=1
@@ -972,7 +988,7 @@ _restore() {
             return 1
         fi
     done
-    if _stop_graceful_verified "$container"; then
+    if _stop_checked "$container"; then
         result=0
     else
         result=$?
@@ -1072,7 +1088,7 @@ _restore() {
 }
 
 _restore_last() {
-    local container="$1"
+    local container="$1" force="${2:-}"
     local name
     name=$(_snapshot_records "$container" | tail -n1 | cut -f2-)
     if [[ -z "$name" ]]; then
@@ -1080,7 +1096,7 @@ _restore_last() {
         exit 1
     fi
     echo "==> Restoring $container to most recent snapshot: $name"
-    _restore "$container" "$name"
+    _restore "$container" "$name" "$force"
 }
 
 # active slot
@@ -1089,16 +1105,20 @@ cmd_snapshot() {
     _snapshot "$(_c_active)" "$name" "${1:-}"
 }
 cmd_restore() {
-    local name="${1:?Usage: restore <name>}"
-    _restore "$(_c_active)" "$name"
+    local name="${1:?Usage: restore <name> [--force]}"; shift || true
+    _restore "$(_c_active)" "$name" "${1:-}"
 }
-cmd_restore_last() { _restore_last "$(_c_active)"; }
+cmd_restore_last() { _restore_last "$(_c_active)" "${1:-}"; }
 
 # List snapshots for a container, or note it isn't provisioned yet. Keeps
 # `make status` (which calls this) from failing on a fresh host before pg.up.
 _snapshot_list() {
     if incus info "$1" >/dev/null 2>&1; then
         local records epoch name created
+        if ! _data_store_mounted; then
+            echo "(data store not mounted — run 'make machine')"
+            return
+        fi
         records=$(_snapshot_records "$1")
         if [[ -z "$records" ]]; then
             echo "(no snapshots)"
@@ -1142,10 +1162,10 @@ cmd_staging_snapshot() {
     _snapshot "$(_c_staging)" "$name" "${1:-}"
 }
 cmd_staging_restore() {
-    local name="${1:?Usage: staging.restore <name>}"
-    _restore "$(_c_staging)" "$name"
+    local name="${1:?Usage: staging.restore <name> [--force]}"; shift || true
+    _restore "$(_c_staging)" "$name" "${1:-}"
 }
-cmd_staging_restore_last() { _restore_last "$(_c_staging)"; }
+cmd_staging_restore_last() { _restore_last "$(_c_staging)" "${1:-}"; }
 cmd_staging_reset()        { _restore "$(_c_staging)" initial; }
 cmd_staging_stop()         { incus stop "$(_c_staging)"; }
 cmd_staging_start()        { incus start "$(_c_staging)"; }
@@ -1203,14 +1223,10 @@ cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/p
 # the proxy forwards from current state. Idempotent; run on every `make
 # start` so the forwards survive an Apple machine reboot.
 #
-# Also the one-time migration path from the old pgbouncer layout: if pg-proxy
-# doesn't exist yet but a legacy pg-bouncer container does, replace it with a
-# bare pg-proxy. The client-facing Apple machine endpoint does not change.
+# Also recreates pg-proxy if it's missing but both backends exist (e.g. it
+# was deleted by hand); the client-facing Apple machine endpoint does not
+# change.
 cmd_refresh() {
-    if ! incus info "$PROXY" >/dev/null 2>&1 && incus info pg-bouncer >/dev/null 2>&1; then
-        echo "==> Migrating: replacing legacy pg-bouncer with a bare pg-proxy..."
-        incus delete pg-bouncer --force
-    fi
     if ! incus info "$PROXY" >/dev/null 2>&1 \
         && incus info "$BACKEND_A" >/dev/null 2>&1 \
         && incus info "$BACKEND_B" >/dev/null 2>&1; then
@@ -1278,7 +1294,7 @@ cmd_export() {
     echo "==> Stopping pg-dev containers for a consistent full export..."
     for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
         if [[ "$(_state "$c")" != STOPPED ]]; then
-            if _stop_graceful_verified "$c"; then
+            if _stop_checked "$c"; then
                 :
             else
                 result=$?
@@ -1383,9 +1399,20 @@ cmd_import_last() {
     local was_a=0 was_b=0 was_proxy=0
     local had_setup=0 existing_count=0
     local import_mutation_started=0
+    local legacy
     file=$(ls -t "$REPO_ROOT/var/pg-dev-all-"*.tar.gz 2>/dev/null | head -1 || true)
     if [[ -z "$file" ]]; then
-        echo "No full Apple-machine export found in var/."
+        legacy=$(ls -t "$REPO_ROOT/var/pg-dev-a-"*.tar.gz "$REPO_ROOT/var/pg-dev-b-"*.tar.gz \
+            2>/dev/null | head -1 || true)
+        if [[ -n "$legacy" ]]; then
+            echo "No full Apple-machine export found in var/, but pre-port Colima-era" >&2
+            echo "per-container exports exist (e.g. $legacy)." >&2
+            echo "This version only imports the combined 'pg-dev-all-*.tar.gz' produced by" >&2
+            echo "'$0 export'; it cannot import those legacy files. Import them manually with" >&2
+            echo "'incus import <file>' if you still need that data." >&2
+        else
+            echo "No full Apple-machine export found in var/."
+        fi
         exit 1
     fi
     echo "==> Importing from $file..."
@@ -1593,7 +1620,7 @@ cmd_import_last() {
     import_mutation_started=1
     if (( had_setup == 1 )); then
         for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
-            if _stop_graceful_verified "$c"; then :; else result=$?; break; fi
+            if _stop_checked "$c"; then :; else result=$?; break; fi
         done
     fi
     if (( result != 0 )); then
@@ -1715,16 +1742,16 @@ Active slot (whatever is currently active):
   shell                           bash into active backend
   logs                            tail postgres logs on active backend
   snapshot <name> [--force]       create an XFS reflink snapshot on active backend
-  restore <name>                  restore active backend to a snapshot
-  restore-last                    restore active backend to its most recent snapshot
+  restore <name> [--force]        restore active backend to a snapshot
+  restore-last [--force]          restore active backend to its most recent snapshot
 
 Staging slot (the other one):
   staging.psql [args]
   staging.shell
   staging.logs
   staging.snapshot <name> [--force]
-  staging.restore <name>
-  staging.restore-last
+  staging.restore <name> [--force]
+  staging.restore-last [--force]
   staging.reset                   shortcut: restore staging to 'initial'
   staging.stop                    stop staging backend
   staging.start                   start staging backend
