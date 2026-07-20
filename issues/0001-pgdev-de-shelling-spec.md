@@ -411,10 +411,31 @@ Only place `container` is invoked: `MachineCreate/Run/Set/Stop/Delete`,
 - `pgdevd`: `serve` (HTTP), `bootstrap` (systemd `ExecStartPre` → `store.Bootstrap`
   + `reconcile` daemon topology, ports `apple-machine-init`), runs
   `task.Recover` on start.
-- Deploy loop: `pgdev agent deploy` cross-compiles `pgdevd` (`GOOS=linux
-  GOARCH=arm64`) into `var/`, then one `systemctl restart pgdevd` exec; verify
-  via `GET /v1/version`. Production: `pgdevd` + unit baked into
-  `Dockerfile.machine`.
+**Hot-deploy into the RUNNING machine (hard requirement — no image rebuild per
+dev cycle).** `pgdev agent deploy`:
+1. Cross-compile on the Mac: `GOOS=linux GOARCH=arm64 go build ./cmd/pgdevd` →
+   `var/pgdevd.new`. No Go toolchain in the machine; this is why the image stays
+   minimal.
+2. **Deliver via the home-mount** (repo `var/` is visible in-machine at the same
+   path) — no `container cp`, no image layer.
+3. **Atomic install to a machine-local run path:** `mv var/pgdevd.new
+   /usr/local/bin/pgdevd` (rename, never write-in-place → avoids `ETXTBSY` on the
+   live binary; the running process keeps its old inode until restart). Run from
+   the machine-local copy, *not* the home-mount, so the unit survives a boot
+   where the home-mount isn't up yet — the mount is the delivery channel, not the
+   run location.
+4. **Restart:** one fire-and-forget `systemctl restart pgdevd` (a one-shot
+   control exec Apple's transport handles fine; routed over SSH once §5.8 is up).
+5. **Confirm:** poll `GET /v1/version` until the embedded git-sha matches, with a
+   timeout — `deploy` fails loudly on a stale daemon instead of silently running
+   old code.
+
+Image rebuild (`Dockerfile.machine` / `container machine create`) is reserved for
+**base changes only** (systemd/incus/xfs tooling, the unit file) or shipping a
+blessed release (bake `pgdevd` + unit into the image). The inner dev loop never
+touches `container machine create/recreate`. *(Pure-dev shortcut: point
+`ExecStart` at the home-mount path to skip step 3 — faster loop, but the daemon
+won't start after a reboot without the mount; keep the copy by default.)*
 
 ---
 
