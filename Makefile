@@ -218,7 +218,7 @@ pg.staging.restore-last: machine.exists
 
 .PHONY: pg.staging.reset
 pg.staging.reset: machine.exists
-	$(PG_DEV) staging.reset
+	@$(call PG_DEV_AUTO,staging.reset $(if $(force),--force,))
 
 .PHONY: pg.staging.stop
 pg.staging.stop: machine.exists

@@ -1166,7 +1166,7 @@ cmd_staging_restore() {
     _restore "$(_c_staging)" "$name" "${1:-}"
 }
 cmd_staging_restore_last() { _restore_last "$(_c_staging)" "${1:-}"; }
-cmd_staging_reset()        { _restore "$(_c_staging)" initial; }
+cmd_staging_reset()        { _restore "$(_c_staging)" initial "${1:-}"; }
 cmd_staging_stop()         { incus stop "$(_c_staging)"; }
 cmd_staging_start()        { incus start "$(_c_staging)"; }
 
