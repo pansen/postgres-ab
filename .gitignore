@@ -2,3 +2,5 @@
 .env
 /var/active-slot
 /var/*.tar.gz
+/var/machine-ip
+/var/*-forward.log

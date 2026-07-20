@@ -59,7 +59,7 @@ trap '_handle_exit 129' HUP
 trap '_handle_exit 130' INT
 trap '_handle_exit 143' TERM
 
-# Client-facing ports. Both are pooler-free *direct* lines — incus `proxy`
+# Machine-side proxy ports. Both are pooler-free *direct* lines — incus `proxy`
 # devices on pg-proxy that relay a raw TCP connection straight to the
 # backend's Postgres, no pgbouncer in the path. They follow promote (we
 # re-point each device's `connect` when active flips) and carry no session
@@ -68,6 +68,13 @@ trap '_handle_exit 143' TERM
 # ObjectInUse, and a bulk `pg_restore` isn't funneled through a pooler.
 ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"            # direct proxy → active backend
 STAGING_PORT="${PG_STAGING_PORT:-5433}"          # direct proxy → staging backend
+
+# Host-side client ports. macOS clients reach these through the loopback
+# forwarder (scripts/host-endpoint), which relays them to ACTIVE_PORT /
+# STAGING_PORT on the machine. Deliberately offset from 5432/5433 so a local
+# PostgreSQL on the default port isn't shadowed on 127.0.0.1.
+CLIENT_ACTIVE_PORT="${PG_CLIENT_ACTIVE_PORT:-5442}"
+CLIENT_STAGING_PORT="${PG_CLIENT_STAGING_PORT:-5443}"
 
 # The two proxy devices on pg-proxy (active + staging).
 MAIN_DEVICE=main
@@ -139,6 +146,13 @@ _proxy_ip() {
     ip -4 -o addr show dev eth0 2>/dev/null \
         | awk '{ split($4, a, "/"); print a[1]; exit }' || true
 }
+
+# The host macOS clients actually connect to. The machine IP from _proxy_ip
+# drifts and can't be pinned, so a socat forwarder on the Mac (scripts/
+# host-endpoint, `make endpoint.install`) listens on loopback and relays to
+# whatever the machine IP currently is. That makes 127.0.0.1 a permanent
+# endpoint. Set PG_CLIENT_HOST to address the machine IP directly instead.
+_client_host() { echo "${PG_CLIENT_HOST:-127.0.0.1}"; }
 
 # RUNNING / STOPPED / FROZEN / … — empty if the container doesn't exist.
 _state() {
@@ -473,12 +487,12 @@ _render_table() {
 }
 
 # One cmd_status row: NAME, STATE, client-facing ENDPOINT, snapshot count, and
-# the container's own bridge IPs. ENDPOINT is the published proxy-ip:port — the
+# the container's own bridge IPs. ENDPOINT is the stable client host:port — the
 # *role* mapping (constant across promote), so it shows even when the backend
 # is stopped. The backend's own IP isn't repeated here (it's in the IPs column
 # and, being on incusbr0, isn't reachable from macOS anyway).
 _status_row() {
-    local c="$1" role="$2" proxy_ip="$3"
+    local c="$1" role="$2" client_host="$3"
     local RS=$'\036' US=$'\037'
     local state endpoint ips snaps port json
     json=$(incus list "$c" --format json 2>/dev/null)
@@ -487,10 +501,10 @@ _status_row() {
     state=$(printf '%s' "$json" | jq -r '.[0].status // empty | ascii_upcase' 2>/dev/null)
     [[ -z "$state" ]] && state="-"
     case "$role" in
-        active)  port="$ACTIVE_PORT" ;;
-        staging) port="$STAGING_PORT" ;;
+        active)  port="$CLIENT_ACTIVE_PORT" ;;
+        staging) port="$CLIENT_STAGING_PORT" ;;
     esac
-    endpoint="${proxy_ip:-?}:${port}"
+    endpoint="${client_host:-?}:${port}"
     ips=$(printf '%s' "$json" \
         | jq -r '.[0].state.network // {} | to_entries[] | select(.key != "lo") | .value.addresses[]? | select(.scope == "global") | .address' 2>/dev/null \
         | paste -sd "$RS" -)
@@ -505,19 +519,21 @@ _status_row() {
 # after promote / staging start-stop), so it is the single place that answers
 # "what's running, where do I connect, and what can I roll back to".
 cmd_status() {
-    local a s ca cs proxy_ip pstate
+    local a s ca cs proxy_ip client_host pstate
     a=$(_active); s=$(_staging)
     ca="${BACKEND_PREFIX}-${a}"; cs="${BACKEND_PREFIX}-${s}"
     proxy_ip=$(_proxy_ip)
+    client_host=$(_client_host)
     pstate=$(_state "$PROXY"); [[ -z "$pstate" ]] && pstate="ABSENT"
 
     incus version 2>/dev/null
     echo
     echo "active slot: $a   (active = $ca, staging = $cs)"
     # pg-proxy owns every client-facing proxy device below, but bind=host puts
-    # the listeners on the Apple machine address shown here.
+    # the listeners on the Apple machine address shown here. Clients reach them
+    # via the stable $client_host endpoint (see the ENDPOINT column).
     if [[ "$pstate" == "RUNNING" ]]; then
-        echo "pg-proxy:    $pstate  ($proxy_ip → :$ACTIVE_PORT active, :$STAGING_PORT staging)"
+        echo "pg-proxy:    $pstate  (machine $proxy_ip → :$ACTIVE_PORT active, :$STAGING_PORT staging)"
     else
         echo "pg-proxy:    $pstate"
     fi
@@ -527,8 +543,8 @@ cmd_status() {
     echo
     {
         printf 'NAME\037STATE\037ENDPOINT\037SNAPSHOTS\037IPs\n'
-        _status_row "$ca" active  "$proxy_ip"
-        _status_row "$cs" staging "$proxy_ip"
+        _status_row "$ca" active  "$client_host"
+        _status_row "$cs" staging "$client_host"
     } | _render_table
     echo
     cmd_snapshots --with-psql
@@ -545,20 +561,27 @@ cmd_endpoint() {
         echo "ERROR: $PROXY is not running — 'make start' (then 'make pg.up' if it was never provisioned)." >&2
         exit 1
     fi
-    local ip
-    ip=$(_proxy_ip)
+    local host machine_ip
+    host=$(_client_host)
+    machine_ip=$(_proxy_ip)
     cat <<EOF
-active   host=$ip port=$ACTIVE_PORT dbname=$PG_DB   (current data)
-staging  host=$ip port=$STAGING_PORT dbname=$PG_DB   (import target / opposite of active)
+active   host=$host port=$CLIENT_ACTIVE_PORT dbname=$PG_DB   (current data)
+staging  host=$host port=$CLIENT_STAGING_PORT dbname=$PG_DB   (import target / opposite of active)
 
-.pgpass line (one line, covers both ports):
-    $ip:*:*:$PG_USER:$PG_PASSWORD
+.pgpass lines:
+$host:$CLIENT_ACTIVE_PORT:*:$PG_USER:$PG_PASSWORD
+$host:$CLIENT_STAGING_PORT:*:$PG_USER:$PG_PASSWORD
 EOF
 
     echo
     echo "psql commands:"
-    _print_psql_command "  active:  " "$ip" "$ACTIVE_PORT"
-    _print_psql_command "  staging: " "$ip" "$STAGING_PORT"
+    _print_psql_command "  active:  " "$host" "$CLIENT_ACTIVE_PORT"
+    _print_psql_command "  staging: " "$host" "$CLIENT_STAGING_PORT"
+    if [[ "$host" == 127.0.0.1 ]]; then
+        echo
+        echo "note: 127.0.0.1 needs the host forwarder ('make endpoint.install'); it"
+        echo "      relays to the machine IP ${machine_ip:-?}, which may drift on reboot."
+    fi
 }
 
 cmd_promote() {
@@ -597,8 +620,8 @@ cmd_promote() {
 
     # Flip the pointer, then re-point both forwards. Re-pointing a proxy
     # device's `connect` restarts its forkproxy, so any open TCP connection is
-    # dropped — clients reconnect (to the new active on :$ACTIVE_PORT, or the
-    # new staging on :$STAGING_PORT). The endpoints themselves never change.
+    # dropped — clients reconnect (to the new active on :$CLIENT_ACTIVE_PORT, or
+    # the new staging on :$CLIENT_STAGING_PORT). The endpoints never change.
     pointer_flipped=1
     _set_active "$to"
     if _set_forwards; then
@@ -1136,21 +1159,21 @@ _snapshot_list() {
 
 # Unified listing for both slots.
 cmd_snapshots() {
-    local with_psql="${1:-}" a s proxy_ip
+    local with_psql="${1:-}" a s client_host
     a=$(_active); s=$(_staging)
     if [[ "$with_psql" == --with-psql ]]; then
-        proxy_ip=$(_proxy_ip)
+        client_host=$(_client_host)
     fi
     echo "─── active  (${BACKEND_PREFIX}-${a}) ───"
     if [[ "$with_psql" == --with-psql ]]; then
-        _print_psql_command "$ " "$proxy_ip" "$ACTIVE_PORT"
+        _print_psql_command "$ " "$client_host" "$CLIENT_ACTIVE_PORT"
         echo
     fi
     _snapshot_list "${BACKEND_PREFIX}-${a}"
     echo
     echo "─── staging (${BACKEND_PREFIX}-${s}) ───"
     if [[ "$with_psql" == --with-psql ]]; then
-        _print_psql_command "$ " "$proxy_ip" "$STAGING_PORT"
+        _print_psql_command "$ " "$client_host" "$CLIENT_STAGING_PORT"
         echo
     fi
     _snapshot_list "${BACKEND_PREFIX}-${s}"
@@ -1197,14 +1220,18 @@ _ip_or_state() {
 # is the client-facing fact; the backend column shows its container IP when
 # running, or its state (STOPPED, …) when not.
 cmd_ip() {
-    local a s info_a info_s proxy_ip endpoint_a endpoint_s pstate
+    local a s info_a info_s machine_ip client_host endpoint_a endpoint_s pstate
     a=$(_active); s=$(_staging)
     info_a=$(_ip_or_state "${BACKEND_PREFIX}-${a}")
     info_s=$(_ip_or_state "${BACKEND_PREFIX}-${s}")
-    proxy_ip=$(_proxy_ip)
-    if [[ -n "$proxy_ip" ]]; then
-        endpoint_a="${proxy_ip}:${ACTIVE_PORT}"
-        endpoint_s="${proxy_ip}:${STAGING_PORT}"
+    machine_ip=$(_proxy_ip)
+    client_host=$(_client_host)
+    echo "machine IP:      ${machine_ip:-?}   (drifts across reboots; forwarder target)"
+    echo "client endpoint: ${client_host}   (stable; via 'make endpoint.install')"
+    echo
+    if [[ -n "$machine_ip" ]]; then
+        endpoint_a="${client_host}:${CLIENT_ACTIVE_PORT}"
+        endpoint_s="${client_host}:${CLIENT_STAGING_PORT}"
     else
         pstate=$(_state "$PROXY")
         endpoint_a="$PROXY ${pstate:-none}"

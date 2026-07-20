@@ -12,6 +12,7 @@ MACHINE_MEMORY ?= 12G
 PG_DATA_DISK_SIZE ?= 140G
 
 PG_DEV_SCRIPT := ./scripts/pg-dev-local
+HOST_ENDPOINT := ./scripts/host-endpoint
 MACHINE_RUN_ARGS := --name $(MACHINE_NAME) --root --interactive \
 	--workdir "$(CURDIR)" \
 	--env HOST_UID=$(shell id -u) \
@@ -38,6 +39,10 @@ endef
 deps:
 	@command -v container >/dev/null || { \
 		echo "Apple's container CLI is required: https://github.com/apple/container/releases" >&2; \
+		exit 1; \
+	}
+	@command -v socat >/dev/null || { \
+		echo "socat is required for the stable 127.0.0.1 client endpoint: brew install socat" >&2; \
 		exit 1; \
 	}
 	@version="$$(container --version | awk '{ print $$4 }')"; \
@@ -109,6 +114,7 @@ machine.status: system.start
 .PHONY: start
 start: machine
 	$(PG_DEV) refresh
+	@$(HOST_ENDPOINT) refresh
 	$(MAKE) status
 
 .PHONY: status/incus
@@ -122,6 +128,27 @@ status/incus: machine.exists
 .PHONY: status
 status: machine.exists
 	@$(PG_DEV) status
+
+# ----- stable macOS client endpoint --------------------------------------
+# The Apple machine's IP drifts and cannot be pinned, so a host-side socat
+# forwarder publishes a permanent 127.0.0.1:5432/:5433 endpoint and relays it
+# to the machine's current IP. `start` re-points it automatically; install once.
+
+.PHONY: endpoint.install
+endpoint.install: machine.exists
+	@$(HOST_ENDPOINT) install
+
+.PHONY: endpoint.refresh
+endpoint.refresh:
+	@$(HOST_ENDPOINT) refresh
+
+.PHONY: endpoint.uninstall
+endpoint.uninstall:
+	@$(HOST_ENDPOINT) uninstall
+
+.PHONY: endpoint.status
+endpoint.status:
+	@$(HOST_ENDPOINT) status
 
 .PHONY: stop
 stop:
@@ -255,5 +282,5 @@ recreate: delete start
 
 .PHONY: check
 check:
-	bash -n scripts/apple-machine-init scripts/pg-dev-local
+	bash -n scripts/apple-machine-init scripts/pg-dev-local scripts/host-endpoint
 	@$(MAKE) --no-print-directory -n deps >/dev/null

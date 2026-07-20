@@ -6,8 +6,9 @@ runs Incus inside one persistent Apple container machine and provides:
 
 - two long-lived PostgreSQL 17 backends (`pg-dev-a`, `pg-dev-b`) with
   independent, copy-on-write snapshot timelines;
-- stable role ports on the Apple machine: `:5432` is active and `:5433` is
-  staging, so a new dump can load without interrupting the current dataset;
+- a stable client endpoint on `127.0.0.1`, with fixed role ports: `:5442` is
+  active and `:5443` is staging, so a new dump can load without interrupting the
+  current dataset;
 - `make pg.promote` to switch the roles without copying data.
 
 This requires Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or
@@ -19,7 +20,11 @@ newer. Install the signed package from the
 ```text
 macOS client
     │
-    │ <apple-machine-ip>:5432 / :5433
+    │ 127.0.0.1:5442 / :5443          (stable, never changes)
+    ▼
+socat forwarder (host LaunchAgent)
+    │
+    │ <machine-ip>:5432 / :5433       (re-resolved on every `make start`)
     ▼
 ┌──────────────── Apple container machine ────────────────┐
 │ Incus host                                               │
@@ -49,19 +54,30 @@ active-slot pointer, and exports live outside the machine.
 
 The nested `incusbr0` subnet is not routed to macOS. The two Incus proxy
 devices therefore use `bind=host`: they listen on the Apple machine's own IP
-and connect to pinned `.11`/`.12` addresses on the nested bridge. `make
-pg.status` discovers and prints the current machine IP; do not use a backend's
-10.x Incus address from macOS.
+and connect to pinned `.11`/`.12` addresses on the nested bridge. Do not use a
+backend's 10.x Incus address from macOS.
 
-The client endpoint address is the machine's IP on macOS's internal
-virtualization bridge (`bridge100`, host side `192.168.64.1/24`) — a
-host-only NAT network whose leases come from macOS's built-in DHCP server
-(`bootpd`), not from your LAN's DHCP. The endpoint is therefore reachable
-only from this Mac, and the lease is **not pinned**: it can change after a
-macOS reboot or machine recreation. Re-check with `make pg.status` after
-reboots, and update any saved `.pgpass` entries or connection strings
-accordingly. `PG_MACHINE_IP` in `.env` overrides only what is printed by the
-script; it does not pin the actual IP.
+The machine's IP on macOS's internal virtualization bridge is a lease from
+macOS's built-in DHCP server (`bootpd`) and is **not pinnable**: it — and even
+its whole `/24` — can change after a macOS reboot or machine recreation. Apple's
+`container machine` CLI exposes no way to fix it (no `--network`, `--publish`, or
+static-IP option), and the machine registers no resolvable DNS name. So rather
+than chase the address, the client endpoint is decoupled from it: a per-user
+`launchd` LaunchAgent runs `socat` listeners on `127.0.0.1:5442` / `:5443` and
+relays them to the machine's current IP (on its `5432` / `5433`). The client
+ports are deliberately offset from `5432`/`5433` so a local PostgreSQL on the
+default port isn't shadowed. Clients always connect to **`127.0.0.1:5442`**
+(active) / **`:5443`** (staging) — a permanent endpoint, identical on every Mac.
+
+This is hands-off: **`make start` installs the forwarder on first run and
+re-points it at the current machine IP on every run** (the machine is down until
+`make start` anyway, so that is the only moment the IP can have changed). It
+needs `socat` (`brew install socat`, enforced by `make deps`). `make
+endpoint.status` shows the forwarder's state; `make endpoint.uninstall` removes
+it (set `PG_ENDPOINT_AUTOINSTALL=0` to stop `make start` re-installing it).
+
+`PG_CLIENT_HOST` overrides the printed client host if you prefer to address the
+machine IP directly instead of using the forwarder.
 
 There is no connection pooler. Each port is a per-connection TCP passthrough,
 so `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory
@@ -121,29 +137,33 @@ make pg.status
 The first `make start` builds an Ubuntu 26.04 machine image containing systemd,
 Incus, jq, and XFS tools. Later starts reuse the named persistent machine.
 `make pg.up` installs PostgreSQL 17 in two nested Ubuntu 24.04 containers and
-can take several minutes.
+can take several minutes. `make start` also installs and re-points the host
+forwarder that gives you the stable `127.0.0.1` endpoint (see
+[Networking](#networking)) — no separate step needed.
 
 Status prints endpoints similar to:
 
 ```text
-active   host=192.168.64.2 port=5432 dbname=<PG_DB>
-staging  host=192.168.64.2 port=5433 dbname=<PG_DB>
+active   host=127.0.0.1 port=5442 dbname=<PG_DB>
+staging  host=127.0.0.1 port=5443 dbname=<PG_DB>
 
-.pgpass line:
-    192.168.64.2:*:*:<PG_USER>:<PG_PASSWORD>
+.pgpass lines:
+127.0.0.1:5442:*:<PG_USER>:<PG_PASSWORD>
+127.0.0.1:5443:*:<PG_USER>:<PG_PASSWORD>
 
 psql commands:
-  active:  psql --host=192.168.64.2 --port=5432 --username=<PG_USER> --dbname=<PG_DB>
-  staging: psql --host=192.168.64.2 --port=5433 --username=<PG_USER> --dbname=<PG_DB>
+  active:  psql --host=127.0.0.1 --port=5442 --username=<PG_USER> --dbname=<PG_DB>
+  staging: psql --host=127.0.0.1 --port=5443 --username=<PG_USER> --dbname=<PG_DB>
 ```
 
-Put the printed line in `~/.pgpass`. If the Apple machine receives a different
-IP later, rerun `make pg.status` and update the host field. `PG_MACHINE_IP` can
-override only the address printed by the script when a routed alias is used.
+Put the printed lines in `~/.pgpass`. The `127.0.0.1` host is permanent — it does
+not change across reboots or machine recreation, so saved connection strings keep
+working. Set `PG_CLIENT_HOST` to address the machine IP directly instead of the
+forwarder.
 
 ## Day-to-day workflow
 
-Port 5432 always means the active/current dataset. Port 5433 always means the
+Port 5442 always means the active/current dataset. Port 5443 always means the
 opposite staging dataset.
 
 ```shell
@@ -159,12 +179,12 @@ Load a fresh dump without blocking the active database:
 # 1. Reset staging to its clean initial checkpoint.
 make pg.staging.reset
 
-# 2. Import through the staging port printed by `make pg.status`.
-pg_restore --host=<machine-ip> --port=5433 --dbname="$PG_DB" \
+# 2. Import through the staging port on the stable endpoint.
+pg_restore --host=127.0.0.1 --port=5443 --dbname="$PG_DB" \
   --jobs=4 your-dump.pgdump
 
 # 3. Verify and checkpoint staging.
-psql -h <machine-ip> -p 5433 -d "$PG_DB" -c '\dt'
+psql -h 127.0.0.1 -p 5443 -d "$PG_DB" -c '\dt'
 make pg.staging.snapshot name="$(date +%Y-%m-%dT%H-%M-%S)_dump_import"
 
 # 4. Swap roles. Open connections reconnect; host and ports stay the same.
@@ -173,7 +193,7 @@ make pg.promote
 
 `make pg.promote` requires the proxy and **both backends to be running**. If
 the staging backend is stopped, start it first with `make pg.staging.start`.
-If the new data is bad, `make pg.promote` again immediately points `:5432`
+If the new data is bad, `make pg.promote` again immediately points `:5442`
 back to the previous backend and its untouched timeline.
 
 ## Snapshot and restore commands
@@ -277,9 +297,13 @@ See `.env.example`. The main settings are:
 
 - `MACHINE_NAME`, `MACHINE_CPUS`, `MACHINE_MEMORY` — persistent Apple machine;
 - `PG_DATA_DISK_SIZE` — first-creation XFS logical size;
-- `PG_ACTIVE_PORT`, `PG_STAGING_PORT` — client-facing role ports;
+- `PG_ACTIVE_PORT`, `PG_STAGING_PORT` — machine-side proxy ports (`5432`/`5433`);
+- `PG_CLIENT_ACTIVE_PORT`, `PG_CLIENT_STAGING_PORT` — host loopback ports the
+  forwarder listens on (`5442`/`5443`);
 - `PG_BACKEND_A_IP`, `PG_BACKEND_B_IP` — optional nested bridge pins;
-- `PG_MACHINE_IP` — optional printed client-address override.
+- `PG_CLIENT_HOST` — client host printed for connections (default `127.0.0.1`,
+  the forwarder endpoint);
+- `PG_MACHINE_IP` — optional override of the discovered machine IP.
 
 ## Why a Makefile if there is a script?
 
