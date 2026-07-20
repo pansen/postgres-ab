@@ -411,8 +411,11 @@ cmd_up() {
 # to delete must not stop the rest of the cleanup from proceeding. Deleting
 # containers is tried for all three regardless of individual failures; the
 # XFS data trees are only removed once every container is confirmed gone AND
-# the store is actually mounted (removing them while unmounted would just
-# hollow out the mountpoint directory, not the XFS-backed data).
+# the store is mounted from the expected XFS image (_data_store_mounted, not a
+# bare mountpoint check — removing them while unmounted, or while some other
+# filesystem is mounted at $DATA_ROOT, could hollow out the wrong data). The
+# active-slot pointer is likewise kept if any container survived, so a failed
+# teardown doesn't silently lose which slot was active.
 cmd_down() {
     local c slot path failed=0
     for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
@@ -425,8 +428,11 @@ cmd_down() {
     done
 
     if (( failed != 0 )); then
-        echo "ERROR: one or more containers could not be deleted; refusing to remove their backing data." >&2
-    elif mountpoint -q "$DATA_ROOT"; then
+        echo "ERROR: one or more containers could not be deleted; refusing to remove their backing data and leaving the active-slot pointer in place." >&2
+        return 1
+    fi
+
+    if _data_store_mounted; then
         for slot in a b; do
             path="$DATA_ROOT/$slot"
             [[ "$path" == "$DATA_ROOT/"[ab] ]] || {
@@ -436,11 +442,10 @@ cmd_down() {
             rm -rf -- "$path"
         done
     else
-        echo "WARNING: $DATA_ROOT is not mounted; the XFS data trees were left alone." >&2
+        echo "WARNING: $DATA_ROOT is not mounted from the XFS data store; the data trees were left alone." >&2
     fi
 
     rm -f "$STATE_FILE"
-    (( failed == 0 )) || return 1
 }
 
 # Box-table renderer for cmd_status. Reads rows on stdin; columns are separated

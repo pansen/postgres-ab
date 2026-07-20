@@ -131,8 +131,9 @@ status: machine.exists
 
 # ----- stable macOS client endpoint --------------------------------------
 # The Apple machine's IP drifts and cannot be pinned, so a host-side socat
-# forwarder publishes a permanent 127.0.0.1:5432/:5433 endpoint and relays it
-# to the machine's current IP. `start` re-points it automatically; install once.
+# forwarder publishes a permanent 127.0.0.1:5442/:5443 endpoint and relays it
+# to the machine's current IP (on its :5432/:5433). `start` installs and
+# re-points it automatically.
 
 .PHONY: endpoint.install
 endpoint.install: machine.exists
