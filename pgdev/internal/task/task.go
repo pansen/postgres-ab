@@ -29,6 +29,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"pansen.me/pgdev/internal/logx"
 )
 
 // Step is one reversible unit of work.
@@ -56,6 +58,8 @@ type Task struct {
 	// Commit is the number of completed Steps at which the task becomes durable.
 	// completed >= Commit  → roll forward the rest; completed < Commit → roll back.
 	Commit int
+	// Log receives progress lines (nil = silent).
+	Log logx.Func
 }
 
 func (t Task) validate() error {
@@ -106,6 +110,7 @@ func Recover(ctx context.Context, j Journal, reg Registry) error {
 			continue
 		}
 		t.ID, t.Kind, t.Args, t.Commit = rec.ID, rec.Kind, rec.Args, rec.Commit
+		logx.Or(t.Log)("recovering interrupted %s (%d/%d steps done)", rec.ID, rec.Completed, len(t.Steps))
 		if _, err := resolve(ctx, j, t, rec.Completed); err != nil {
 			errs = append(errs, fmt.Errorf("recover %s: %w", rec.ID, err))
 		}
@@ -116,7 +121,9 @@ func Recover(ctx context.Context, j Journal, reg Registry) error {
 // forward runs Step.Do from index `from`, recording progress after each success.
 // It returns the number of fully-completed steps and the first error (if any).
 func forward(ctx context.Context, j Journal, t Task, from int) (int, error) {
+	log := logx.Or(t.Log)
 	for i := from; i < len(t.Steps); i++ {
+		log("[%s] %d/%d %s", t.Kind, i+1, len(t.Steps), t.Steps[i].Name)
 		if err := t.Steps[i].Do(ctx); err != nil {
 			return i, fmt.Errorf("step %d (%s): %w", i, t.Steps[i].Name, err)
 		}
@@ -156,15 +163,18 @@ func resolve(ctx context.Context, j Journal, t Task, completed int) (applied boo
 // (the step that failed or was interrupted) is included because its Do may have
 // left partial effects; its Undo is written to converge regardless.
 func rollback(ctx context.Context, t Task, completed int) error {
+	log := logx.Or(t.Log)
 	var errs []error
 	start := completed
 	if start > len(t.Steps)-1 {
 		start = len(t.Steps) - 1
 	}
+	log("[%s] rolling back", t.Kind)
 	for i := start; i >= 0; i-- {
 		if t.Steps[i].Undo == nil {
 			continue
 		}
+		log("[%s] undo %s", t.Kind, t.Steps[i].Name)
 		if err := t.Steps[i].Undo(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("undo step %d (%s): %w", i, t.Steps[i].Name, err))
 		}
@@ -173,8 +183,10 @@ func rollback(ctx context.Context, t Task, completed int) error {
 }
 
 func ensures(ctx context.Context, t Task) error {
+	log := logx.Or(t.Log)
 	var errs []error
 	for _, e := range t.Ensures {
+		log("[%s] ensure %s", t.Kind, e.Name)
 		if err := e.Run(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("ensure %s: %w", e.Name, err))
 		}

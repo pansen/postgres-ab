@@ -18,6 +18,7 @@ import (
 
 	"pansen.me/pgdev/internal/backend"
 	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/logx"
 	"pansen.me/pgdev/internal/store"
 	"pansen.me/pgdev/internal/task"
 )
@@ -26,6 +27,7 @@ type Ops struct {
 	Store   *store.Store
 	Backend backend.Backend
 	Cfg     config.Config
+	Log     logx.Func // progress logging (nil = silent); stamped onto built tasks
 }
 
 func New(st *store.Store, be backend.Backend, cfg config.Config) *Ops {
@@ -127,6 +129,7 @@ func (o *Ops) buildSnapshot(slot, name string, replaced bool) task.Task {
 		Steps:   steps,
 		Commit:  commit,
 		Ensures: []task.Ensure{{Name: "postgres-running", Run: func(ctx context.Context) error { return o.Backend.EnsurePGRunning(ctx, c) }}},
+		Log:     o.Log,
 	}
 }
 
@@ -252,6 +255,7 @@ func (o *Ops) buildRestore(slot, name string, wasRunning bool, after []string) t
 		Steps:   steps,
 		Commit:  commit,
 		Ensures: ensures,
+		Log:     o.Log,
 	}
 }
 

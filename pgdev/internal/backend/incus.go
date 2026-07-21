@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/logx"
 )
 
 // Incus drives backends by shelling out to the `incus` CLI over the machine's
@@ -21,10 +22,13 @@ type Incus struct {
 	Unit       string        // PostgreSQL systemd unit
 	ReadyTries int           // pg_isready attempts
 	ReadyEvery time.Duration // delay between attempts
+	Log        logx.Func     // progress logging (nil = silent)
 
 	// runFn overrides the `incus` invocation in tests (nil = shell out for real).
 	runFn func(ctx context.Context, args ...string) error
 }
+
+func (i *Incus) log(format string, args ...any) { logx.Or(i.Log)(format, args...) }
 
 // NewIncus returns an Incus backend with defaults matching the shell.
 func NewIncus(cfg config.Config) *Incus {
@@ -114,6 +118,7 @@ func (i *Incus) StartContainerAndWait(ctx context.Context, c string) error {
 		return err
 	}
 	if !running {
+		i.log("starting container %s...", c)
 		if err := i.run(ctx, "start", c); err != nil {
 			return err
 		}

@@ -19,6 +19,7 @@ import (
 
 	"pansen.me/pgdev/internal/backend"
 	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/logx"
 	"pansen.me/pgdev/internal/ops"
 	"pansen.me/pgdev/internal/store"
 	"pansen.me/pgdev/internal/task"
@@ -72,7 +73,10 @@ func env(ctx context.Context) (*ops.Ops, task.Journal, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	o := ops.New(st, backend.NewIncus(cfg), cfg)
+	be := backend.NewIncus(cfg)
+	be.Log = logx.Stderr
+	o := ops.New(st, be, cfg)
+	o.Log = logx.Stderr
 	if err := task.Recover(ctx, j, o.Registry()); err != nil {
 		return nil, nil, fmt.Errorf("recovering interrupted operation: %w", err)
 	}
@@ -91,7 +95,10 @@ func cmdStart(ctx context.Context, args []string) error {
 		return err
 	}
 	cfg := config.FromEnv()
-	o := ops.New(store.NewOSStore(cfg.DataRoot), backend.NewIncus(cfg), cfg)
+	be := backend.NewIncus(cfg)
+	be.Log = logx.Stderr
+	o := ops.New(store.NewOSStore(cfg.DataRoot), be, cfg)
+	o.Log = logx.Stderr
 	c := o.Cfg.Container(*slot)
 	if err := o.Backend.StartContainerAndWait(ctx, c); err != nil {
 		return err
