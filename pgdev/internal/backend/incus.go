@@ -163,22 +163,16 @@ func (i *Incus) StartContainerAndWait(ctx context.Context, c string) error {
 			return err
 		}
 	}
-	err = i.EnsurePGRunning(ctx, c)
-	if err == nil {
-		return nil
-	}
-	// Some container boots come up with the pgdata bind-mount not yet accessible,
-	// so PostgreSQL can never start on that boot; a full container restart
-	// reliably clears it (observed on this setup). Retry the whole bring-up once.
-	i.log("PostgreSQL did not come up on %s (%v); restarting the container once and retrying...", c, err)
-	if rerr := i.run(ctx, "restart", c); rerr != nil {
-		return errors.Join(err, rerr)
-	}
-	if werr := i.waitSystemd(ctx, c); werr != nil {
-		return werr
-	}
+	// With the boot-ordering drop-in (RequiresMountsFor=/var/lib/postgresql, baked
+	// into the golden image, §Slice 3), PostgreSQL waits for its data mount and
+	// auto-starts once it appears — so bring-up is just a readiness wait, no
+	// container-restart nudge.
 	return i.EnsurePGRunning(ctx, c)
 }
+
+// WaitSystemd blocks until the container's system manager is reachable, so
+// provisioning's systemctl calls don't race the bus coming up after a boot.
+func (i *Incus) WaitSystemd(ctx context.Context, c string) error { return i.waitSystemd(ctx, c) }
 
 // waitSystemd blocks until the container's system manager is reachable (any
 // settled state), so subsequent systemctl calls don't race the bus coming up.

@@ -74,9 +74,11 @@ system.start: deps
 machine.image: system.start
 	container build --tag $(MACHINE_IMAGE) --file Dockerfile.machine .
 
-# Create the persistent Linux machine once, then bootstrap its Incus daemon and
-# XFS reflink store on every run. `machine set` is intentionally harmless while
-# running; changed resources take effect after the next stop/start.
+# Create the persistent Linux machine once and boot it. The XFS reflink store and
+# the Incus daemon topology are no longer bootstrapped here (scripts/apple-machine-
+# init is retired): `pgdevd bootstrap` runs them as the daemon unit's ExecStartPre,
+# installed by `pgdev agent deploy` (the `deploy` target). `machine set` is
+# harmless while running; changed resources take effect after the next stop/start.
 .PHONY: machine
 machine: system.start
 	@if ! container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
@@ -92,10 +94,16 @@ machine: system.start
 	container machine set --name $(MACHINE_NAME) \
 		cpus=$(MACHINE_CPUS) memory=$(MACHINE_MEMORY) home-mount=rw
 	# Apple 1.1 cannot attach an interactive exec while a machine is making its
-	# first transition from stopped to running. Boot it non-interactively, then
-	# let the guest bootstrap wait for systemd's bus below.
+	# first transition from stopped to running. Boot it non-interactively; the
+	# daemon's ExecStartPre bootstrap (via `make deploy`) does the rest.
 	container machine run --name $(MACHINE_NAME) --root -- true
-	$(MACHINE_RUN) ./scripts/apple-machine-init
+
+# Build + install the in-machine daemon and confirm the version handshake. The
+# daemon's ExecStartPre runs `pgdevd bootstrap` (XFS store + Incus topology), so
+# this is also what stands up a freshly created machine.
+.PHONY: deploy
+deploy: machine pgdevd
+	$(PGDEV) agent deploy
 
 # Cheap guard for targets that exec into an already-running machine: fail fast
 # with a clear message instead of a raw Apple CLI 'notFound' error when the
@@ -126,8 +134,7 @@ machine.status: system.start
 	container machine inspect $(MACHINE_NAME)
 
 .PHONY: start
-start: machine pgdevd
-	$(PGDEV) agent deploy
+start: deploy
 	$(PGDEV) refresh
 	@$(HOST_ENDPOINT) refresh
 	$(MAKE) status
@@ -179,12 +186,12 @@ system.stop: stop
 # ----- lifecycle ----------------------------------------------------------
 
 .PHONY: pg.up
-pg.up: machine pgdevd
-	$(PG_DEV) up
+pg.up: deploy
+	$(PGDEV) up
 
 .PHONY: pg.down
-pg.down: machine.exists
-	$(PG_DEV) down
+pg.down: deploy
+	$(PGDEV) down
 
 .PHONY: pg.status
 pg.status: machine.exists pgdevd
@@ -297,6 +304,6 @@ recreate: delete start
 
 .PHONY: check
 check:
-	bash -n scripts/apple-machine-init scripts/pg-dev-local scripts/host-endpoint
+	bash -n scripts/pg-dev-local scripts/host-endpoint
 	@$(MAKE) --no-print-directory -n deps >/dev/null
 	$(MAKE) -C $(PGDEV_DIR) vet test build

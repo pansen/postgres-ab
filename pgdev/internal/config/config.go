@@ -54,6 +54,10 @@ type Config struct {
 
 	DataRoot     string // /var/lib/pg-dev-local
 	DataDiskSize string // 140G
+	DataImage    string // /var/lib/pg-dev-local.xfs (loop-backed store)
+
+	BaseImage   string // images:ubuntu/24.04/cloud — provisioning base
+	GoldenImage string // pg-dev-base — published PG-installed image (Slice 3)
 
 	// Agent transport (pgdev ↔ pgdevd).
 	AgentPort      int    // 5440 — HTTP/JSON on the machine's eth0
@@ -99,6 +103,9 @@ func Load() Config {
 		BackendBIP:        get("PG_BACKEND_B_IP", ""),
 		DataRoot:          get("PG_DATA_ROOT", DefaultDataRoot),
 		DataDiskSize:      get("PG_DATA_DISK_SIZE", "140G"),
+		DataImage:         get("PG_DATA_IMAGE", DefaultDataRoot+".xfs"),
+		BaseImage:         get("PG_BASE_IMAGE", "images:ubuntu/24.04/cloud"),
+		GoldenImage:       get("PG_GOLDEN_IMAGE", "pg-dev-base"),
 		AgentPort:         atoi(get("PG_AGENT_PORT", "5440")),
 		MachineIP:         get("PG_MACHINE_IP", ""),
 		RepoRoot:          repo,

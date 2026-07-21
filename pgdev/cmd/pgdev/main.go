@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -61,6 +62,8 @@ func rootCmd() *cobra.Command {
 	}
 
 	root.AddCommand(
+		a.upCmd(),
+		a.downCmd(),
 		a.statusCmd(),
 		a.promoteCmd(),
 		a.refreshCmd(),
@@ -117,4 +120,16 @@ func (a *app) slot(role string) string {
 		return a.active.Staging()
 	}
 	return a.active.Get()
+}
+
+// longClient is like client but with a generous timeout for multi-minute
+// mutations (up/down provisioning holds the HTTP request open while the daemon
+// installs PostgreSQL and creates clusters).
+func (a *app) longClient(ctx context.Context) (*agentapi.Client, error) {
+	cl, err := a.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cl.HTTP.Timeout = 30 * time.Minute
+	return cl, nil
 }

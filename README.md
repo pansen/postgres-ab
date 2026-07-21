@@ -60,17 +60,21 @@ serves an HTTP/JSON API on the machine's `eth0` (port `5440`, bearer token in
 pgdev (macOS) ── HTTP/JSON ──▶ pgdevd (machine) ──▶ Incus socket + XFS store
 ```
 
-`pgdev status`/`promote`/`refresh`/`snapshots`/`ip`/`snapshot`/`restore` are all
-API calls — after boot there are **zero `container machine run` execs on the
-control path**. `promote` collapses to "flip the active-slot pointer, then
-reconcile the proxy `connect=` targets"; the daemon owns the single-mutation
-lock, the write-ahead journal, and crash recovery on start. Both binaries are
+`pgdev up`/`down`/`status`/`promote`/`refresh`/`snapshots`/`ip`/`snapshot`/
+`restore` are all API calls — after boot there are **zero `container machine run`
+execs on the control path**. `promote` collapses to "flip the active-slot
+pointer, then reconcile the proxy `connect=` targets"; `up` provisions both
+backends from a golden `pg-dev-base` image (PostgreSQL installed once, then
+`incus publish`ed — minutes → seconds) and creates each slot's cluster on its
+XFS slot; the daemon owns the single-mutation lock, the write-ahead journal, and
+crash recovery on start. Machine setup (the XFS store + Incus topology) is
+`pgdevd bootstrap`, run as the daemon unit's `ExecStartPre`. Both binaries are
 built by `make pgdevd` (they share one git-stamped version); `pgdev agent
 deploy` — run automatically by `make start` — cross-compiles nothing new, it
 delivers the prebuilt daemon over the home mount, installs it atomically to a
 machine-local path, restarts the unit, and confirms the `GET /v1/version`
 handshake so a stale daemon fails loudly. Interactive work (`psql`, `shell`,
-`logs`) and provisioning still run through `scripts/pg-dev-local` for now
+`logs`) and full export/import still run through `scripts/pg-dev-local` for now
 (later slices).
 
 ### Networking
@@ -115,8 +119,9 @@ DM-thin stack needed by Incus's optimized snapshot backends. Incus therefore
 falls back to `dir`, whose snapshots are full directory copies—not practical
 for repeated multi-gigabyte PostgreSQL checkpoints.
 
-`scripts/apple-machine-init` instead creates a sparse XFS loop filesystem
-(140 GiB by default) inside the machine root disk. Apple's 1.1 boot examples
+`pgdevd bootstrap` (run as the daemon unit's `ExecStartPre`) instead creates a
+sparse XFS loop filesystem (140 GiB by default) inside the machine root disk,
+mounts it, and configures the Incus storage/network/profile. Apple's 1.1 boot examples
 show a 512 GiB root device, but that size is not a documented compatibility
 guarantee. PostgreSQL data for each slot is mounted from the XFS filesystem,
 and snapshot commands use reflink copies. Creating a checkpoint is fast and

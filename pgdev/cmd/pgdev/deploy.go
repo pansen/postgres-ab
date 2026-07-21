@@ -25,9 +25,11 @@ Wants=incus.service
 [Service]
 Type=simple
 EnvironmentFile=-%s
+ExecStartPre=/usr/local/bin/pgdevd bootstrap
 ExecStart=/usr/local/bin/pgdevd serve
 Restart=on-failure
 RestartSec=2
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

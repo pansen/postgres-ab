@@ -75,6 +75,18 @@ func (c *Client) Reconcile(ctx context.Context) (ReconcileResponse, error) {
 	return out, err
 }
 
+func (c *Client) Up(ctx context.Context) (StatusResponse, error) {
+	var out StatusResponse
+	err := c.do(ctx, http.MethodPost, "/v1/up", struct{}{}, &out)
+	return out, err
+}
+
+func (c *Client) Down(ctx context.Context) (OpResponse, error) {
+	var out OpResponse
+	err := c.do(ctx, http.MethodPost, "/v1/down", struct{}{}, &out)
+	return out, err
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader
 	if body != nil {

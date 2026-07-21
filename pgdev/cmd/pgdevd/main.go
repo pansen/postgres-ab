@@ -49,6 +49,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return cmdServe(ctx, args[1:])
+	case "bootstrap":
+		return cmdBootstrap(ctx, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, args[1:])
 	case "restore":
@@ -65,6 +67,18 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+// cmdBootstrap ensures the XFS store, Incus topology and boot-ordering drop-ins
+// are in place (ports scripts/apple-machine-init). It runs as the systemd unit's
+// ExecStartPre and is safe to run standalone.
+func cmdBootstrap(ctx context.Context, _ []string) error {
+	cfg := config.Load()
+	svc, err := daemon.New(cfg, version, logx.Stderr)
+	if err != nil {
+		return err
+	}
+	return svc.Bootstrap(ctx)
 }
 
 // cmdServe runs the resident HTTP daemon: recover any interrupted mutation,
@@ -284,6 +298,7 @@ pgdevd — in-machine agent (resident daemon + one-shot task engine)
 
 Usage:
   pgdevd serve        [--addr :5440]         resident HTTP/JSON control daemon
+  pgdevd bootstrap                            XFS store + Incus topology (ExecStartPre)
   pgdevd snapshot     --slot <a|b> --name <name> [--force]
   pgdevd restore      --slot <a|b> --name <name> [--force]
   pgdevd restore-last --slot <a|b> [--force]

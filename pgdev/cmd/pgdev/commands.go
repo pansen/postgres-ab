@@ -15,6 +15,56 @@ import (
 	"pansen.me/pgdev/internal/agentapi"
 )
 
+// ----- lifecycle (up / down) -----------------------------------------------
+
+func (a *app) upCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "up",
+		Short: "Provision pg-dev-a, pg-dev-b and pg-proxy from an empty Incus host",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			if err := a.cfg.RequireCreds(); err != nil {
+				return err
+			}
+			cl, err := a.longClient(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Println("==> Provisioning (the first run builds the golden PostgreSQL image; this can take a few minutes)...")
+			st, err := cl.Up(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Println("==> pg-dev ready.")
+			fmt.Println()
+			a.renderStatus(ctx, st)
+			return nil
+		},
+	}
+}
+
+func (a *app) downCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "down",
+		Short: "Delete the containers and both XFS data trees",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			cl, err := a.longClient(ctx)
+			if err != nil {
+				return err
+			}
+			res, err := cl.Down(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Println(res.Message)
+			return nil
+		},
+	}
+}
+
 // ----- status --------------------------------------------------------------
 
 func (a *app) statusCmd() *cobra.Command {

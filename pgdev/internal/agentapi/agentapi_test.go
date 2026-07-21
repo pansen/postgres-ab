@@ -45,6 +45,12 @@ func (f *fakeService) Restore(context.Context, RestoreRequest) (OpResponse, erro
 func (f *fakeService) Reconcile(context.Context) (ReconcileResponse, error) {
 	return ReconcileResponse{ProxyRunning: true, Actions: []string{"main → x"}}, nil
 }
+func (f *fakeService) Up(context.Context) (StatusResponse, error) {
+	return StatusResponse{Active: "a"}, nil
+}
+func (f *fakeService) Down(context.Context) (OpResponse, error) {
+	return OpResponse{Message: "down"}, nil
+}
 
 func newTest(t *testing.T, token string) (*Client, *fakeService, func()) {
 	t.Helper()

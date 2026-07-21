@@ -19,6 +19,8 @@ type Service interface {
 	Snapshot(ctx context.Context, req SnapshotRequest) (OpResponse, error)
 	Restore(ctx context.Context, req RestoreRequest) (OpResponse, error)
 	Reconcile(ctx context.Context) (ReconcileResponse, error)
+	Up(ctx context.Context) (StatusResponse, error)
+	Down(ctx context.Context) (OpResponse, error)
 }
 
 // Server adapts a Service to the HTTP/JSON contract with bearer-token auth.
@@ -40,6 +42,8 @@ func NewServer(svc Service, token string) http.Handler {
 	mux.HandleFunc("POST /v1/snapshot", s.auth(s.snapshot))
 	mux.HandleFunc("POST /v1/restore", s.auth(s.restore))
 	mux.HandleFunc("POST /v1/reconcile", s.auth(s.reconcile))
+	mux.HandleFunc("POST /v1/up", s.auth(s.up))
+	mux.HandleFunc("POST /v1/down", s.auth(s.down))
 	return mux
 }
 
@@ -120,6 +124,24 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
 	res, err := s.svc.Reconcile(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) up(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.Up(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) down(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.Down(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
