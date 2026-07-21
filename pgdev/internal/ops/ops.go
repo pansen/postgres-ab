@@ -186,7 +186,15 @@ func (o *Ops) buildRestore(slot, name string, wasRunning bool, after []string) t
 	steps := []task.Step{
 		{
 			Name: "stage-reflink-clone", // build the candidate while current still serves
-			Do:   func(ctx context.Context) error { return o.Store.StageClone(ctx, target, newDir) },
+			Do: func(ctx context.Context) error {
+				if err := o.Store.StageClone(ctx, target, newDir); err != nil {
+					return err
+				}
+				// Make the restored top-level dir as traversable as the live one
+				// it will replace, so PostgreSQL can access its data directory
+				// even if this snapshot was captured with a wrong top-level mode.
+				return store.MatchTopMode(current, newDir)
+			},
 			Undo: func(ctx context.Context) error { return store.RemoveAll(newDir) },
 		},
 		{

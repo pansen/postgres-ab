@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
 	"pansen.me/pgdev/internal/config"
 	"pansen.me/pgdev/internal/logx"
 )
+
+var ipv4re = regexp.MustCompile(`\d+\.\d+\.\d+\.\d+`)
 
 // Incus drives backends by shelling out to the `incus` CLI over the machine's
 // local Incus socket. Slice 1 keeps the shell transport (it matches the current
@@ -70,16 +73,46 @@ func (i *Incus) EnsurePGRunning(ctx context.Context, c string) error {
 	if !running {
 		return fmt.Errorf("container %s is not running; cannot ensure PostgreSQL", c)
 	}
-	active, err := i.PGActive(ctx, c)
-	if err != nil {
-		return err
-	}
-	if !active {
-		if err := i.run(ctx, "exec", c, "--", "systemctl", "start", i.Unit); err != nil {
-			return err
+	// PostgreSQL auto-starts on container boot, so the primary job is to WAIT for
+	// readiness rather than to start it (an explicit start would race the boot
+	// unit). Nudge only when the unit is genuinely down, tolerating a transient
+	// start failure (e.g. the pgdata bind-mount not yet accessible) and retrying.
+	i.log("waiting for PostgreSQL on %s to accept connections...", c)
+	var last, logged string
+	for attempt := 0; attempt < i.ReadyTries; attempt++ {
+		if i.pgReady(ctx, c) {
+			if attempt > 0 {
+				i.log("PostgreSQL on %s is ready.", c)
+			}
+			return nil
+		}
+		last = i.pgUnitState(ctx, c)
+		switch last {
+		case "failed":
+			if last != logged {
+				i.log("PostgreSQL unit on %s is failed; resetting and retrying its start...", c)
+			}
+			_ = i.run(ctx, "exec", c, "--", "systemctl", "reset-failed", i.Unit)
+			_ = i.run(ctx, "exec", c, "--", "systemctl", "start", i.Unit)
+		case "inactive":
+			if last != logged {
+				i.log("PostgreSQL unit on %s is inactive; starting it...", c)
+			}
+			_ = i.run(ctx, "exec", c, "--", "systemctl", "start", i.Unit)
+			// active/activating/deactivating: PG is coming up on its own — just wait.
+		default:
+			if attempt > 0 && attempt%5 == 0 {
+				i.log("still waiting for PostgreSQL on %s (unit: %s, %ds elapsed)...", c, last, attempt)
+			}
+		}
+		logged = last
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(i.ReadyEvery):
 		}
 	}
-	return i.waitReady(ctx, c)
+	return fmt.Errorf("PostgreSQL on %s not ready after %d attempts (unit state: %s)", c, i.ReadyTries, last)
 }
 
 func (i *Incus) StopContainer(ctx context.Context, c string) error {
@@ -122,11 +155,50 @@ func (i *Incus) StartContainerAndWait(ctx context.Context, c string) error {
 		if err := i.run(ctx, "start", c); err != nil {
 			return err
 		}
+		// After a fresh boot the container's systemd bus is not up for a moment;
+		// issuing systemctl too early fails with "Failed to connect to bus".
+		if err := i.waitSystemd(ctx, c); err != nil {
+			return err
+		}
 	}
-	// A container boot does not necessarily start PostgreSQL (its systemd unit is
-	// not reliably enabled), so bring PG up explicitly and wait for readiness
-	// instead of assuming the boot did it.
+	err = i.EnsurePGRunning(ctx, c)
+	if err == nil {
+		return nil
+	}
+	// Some container boots come up with the pgdata bind-mount not yet accessible,
+	// so PostgreSQL can never start on that boot; a full container restart
+	// reliably clears it (observed on this setup). Retry the whole bring-up once.
+	i.log("PostgreSQL did not come up on %s (%v); restarting the container once and retrying...", c, err)
+	if rerr := i.run(ctx, "restart", c); rerr != nil {
+		return errors.Join(err, rerr)
+	}
+	if werr := i.waitSystemd(ctx, c); werr != nil {
+		return werr
+	}
 	return i.EnsurePGRunning(ctx, c)
+}
+
+// waitSystemd blocks until the container's system manager is reachable (any
+// settled state), so subsequent systemctl calls don't race the bus coming up.
+func (i *Incus) waitSystemd(ctx context.Context, c string) error {
+	for attempt := 0; attempt < i.ReadyTries; attempt++ {
+		if attempt == 3 {
+			i.log("waiting for systemd in %s to become reachable...", c)
+		}
+		// is-system-running exits non-zero for "degraded" etc. but still prints a
+		// state word; only a bus-connect failure prints none. Parse the text.
+		out, _ := exec.CommandContext(ctx, "incus", "exec", c, "--", "systemctl", "is-system-running").CombinedOutput()
+		switch strings.TrimSpace(string(out)) {
+		case "running", "degraded", "starting", "maintenance":
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(i.ReadyEvery):
+		}
+	}
+	return fmt.Errorf("systemd in %s did not become reachable", c)
 }
 
 func (i *Incus) RepairIP(ctx context.Context, c string) error {
@@ -137,7 +209,58 @@ func (i *Incus) RepairIP(ctx context.Context, c string) error {
 	if ip == "" {
 		return nil // no pin configured/derivable; leave networking as-is
 	}
-	return i.run(ctx, "config", "device", "override", c, "eth0", "ipv4.address="+ip)
+
+	// Pin the address only if it's missing or wrong. `override` creates the
+	// instance-local device over the profile-inherited NIC; once it's already
+	// local (e.g. pinned at provisioning), `override` fails and `set` is the
+	// right verb. Idempotent: a correct pin touches nothing.
+	have := ""
+	if out, e := i.output(ctx, "config", "device", "get", c, "eth0", "ipv4.address"); e == nil {
+		have = strings.TrimSpace(out)
+	}
+	if have != ip {
+		i.log("pinning %s eth0 -> %s (was %q)...", c, ip, have)
+		if err := i.run(ctx, "config", "device", "override", c, "eth0", "ipv4.address="+ip); err != nil {
+			if err := i.run(ctx, "config", "device", "set", c, "eth0", "ipv4.address="+ip); err != nil {
+				return err
+			}
+		}
+	}
+
+	// A running backend on the wrong address needs a restart to take the new
+	// static lease; a stopped one picks it up on next start (the restore path).
+	running, err := i.ContainerRunning(ctx, c)
+	if err != nil {
+		return err
+	}
+	if running {
+		if actual, _ := i.containerIP(ctx, c); actual != ip {
+			i.log("restarting %s to apply %s...", c, ip)
+			if err := i.run(ctx, "restart", c); err != nil {
+				return err
+			}
+			for attempt := 0; attempt < i.ReadyTries; attempt++ {
+				if a, _ := i.containerIP(ctx, c); a == ip {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(i.ReadyEvery):
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// containerIP returns the container's first IPv4 address, or "" if none.
+func (i *Incus) containerIP(ctx context.Context, c string) (string, error) {
+	out, err := i.output(ctx, "list", c, "--format", "csv", "-c", "4")
+	if err != nil {
+		return "", err
+	}
+	return ipv4re.FindString(out), nil
 }
 
 // backendIP resolves a container's pinned nested-bridge address: an explicit
@@ -180,18 +303,15 @@ func (i *Incus) state(ctx context.Context, c string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-func (i *Incus) waitReady(ctx context.Context, c string) error {
-	for attempt := 0; attempt < i.ReadyTries; attempt++ {
-		if err := i.run(ctx, "exec", c, "--", "pg_isready", "-q"); err == nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(i.ReadyEvery):
-		}
-	}
-	return fmt.Errorf("PostgreSQL on %s not ready after %d attempts", c, i.ReadyTries)
+func (i *Incus) pgReady(ctx context.Context, c string) bool {
+	return i.run(ctx, "exec", c, "--", "pg_isready", "-q") == nil
+}
+
+// pgUnitState returns the PostgreSQL unit's activation-state word (active,
+// inactive, failed, activating, …), or "" if the bus can't be reached.
+func (i *Incus) pgUnitState(ctx context.Context, c string) string {
+	out, _ := exec.CommandContext(ctx, "incus", "exec", c, "--", "systemctl", "is-active", i.Unit).CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 func (i *Incus) run(ctx context.Context, args ...string) error {

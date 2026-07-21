@@ -56,6 +56,13 @@ func TestXFSReflinkClone(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The top-level data dir is bind-mounted at /var/lib/postgresql, so its mode
+	// must survive cloning (a non-traversable top level makes PG fail to start).
+	// Use a distinctive mode and assert the clone reproduces it exactly.
+	if err := os.Chmod(st.Current("a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	// Write a few MiB so a full copy would be observably distinct from a reflink.
 	payload := bytes.Repeat([]byte("pgdev-reflink-probe\n"), 200_000)
 	if err := os.WriteFile(filepath.Join(st.Current("a"), "data"), payload, 0o600); err != nil {
@@ -74,6 +81,13 @@ func TestXFSReflinkClone(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("cloned data differs from source")
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("cloned top-level mode = %o, want 0755 (perms not preserved)", fi.Mode().Perm())
 	}
 }
 

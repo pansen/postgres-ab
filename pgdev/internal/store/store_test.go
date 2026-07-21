@@ -36,6 +36,29 @@ func TestMoveIdempotent(t *testing.T) {
 	}
 }
 
+func TestMatchTopMode(t *testing.T) {
+	dir := t.TempDir()
+	ref, dst := filepath.Join(dir, "ref"), filepath.Join(dir, "dst")
+	mustMkdir(t, ref)
+	mustMkdir(t, dst)
+	if err := os.Chmod(ref, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := MatchTopMode(ref, dst); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("dst mode = %o, want 0755", fi.Mode().Perm())
+	}
+}
+
 func TestValidateName(t *testing.T) {
 	ok := []string{"initial", "2026-07-20T10-00-00_dump", "a.b_c-d", "X"}
 	bad := []string{"", ".hidden", "-leading", "has space", "a/b", "a$b"}

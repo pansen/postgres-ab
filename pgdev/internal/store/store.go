@@ -171,6 +171,18 @@ func Move(src, dst string) error {
 // RemoveAll deletes a path, idempotently.
 func RemoveAll(path string) error { return os.RemoveAll(path) }
 
+// MatchTopMode sets dst's top-level permission bits to match ref's. Restore uses
+// it so a cloned snapshot's data dir is as traversable as the live dir it
+// replaces — defending against snapshots captured with a wrong top-level mode by
+// earlier buggy versions (the live dir is known-good: PostgreSQL runs on it).
+func MatchTopMode(ref, dst string) error {
+	fi, err := os.Stat(ref)
+	if err != nil {
+		return err
+	}
+	return os.Chmod(dst, fi.Mode().Perm())
+}
+
 // StageClone makes a fresh reflink copy of srcDir at dstDir, removing any stale
 // dstDir first so a re-run (roll-forward after a crash) is idempotent.
 func (s *Store) StageClone(ctx context.Context, srcDir, dstDir string) error {
@@ -182,13 +194,17 @@ func (s *Store) StageClone(ctx context.Context, srcDir, dstDir string) error {
 
 // reflinkClone is the production Cloner: a same-filesystem XFS CoW copy.
 func reflinkClone(ctx context.Context, srcDir, dstDir string) error {
-	// Trailing "/." copies directory *contents* into an existing dst, matching
-	// the shell (cp -a --reflink=always --sparse=auto "$current/." "$tmp/").
-	if err := os.MkdirAll(dstDir, 0o700); err != nil {
+	// Copy the directory ITSELF (dst must not exist — StageClone removed it) so
+	// cp -a reproduces the source's exact ownership and permissions on the new
+	// top-level dir. This matters because the slot's data dir is bind-mounted at
+	// /var/lib/postgresql: a top level that isn't traversable by the postgres
+	// user makes PostgreSQL fail with "data directory is not accessible".
+	// (Pre-creating dst and copying contents into it would stamp it with our
+	// mode, not the source's — the bug that broke restores.)
+	if err := os.MkdirAll(filepath.Dir(dstDir), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "cp", "-a", "--reflink=always", "--sparse=auto",
-		filepath.Join(srcDir, "."), dstDir+string(os.PathSeparator))
+	cmd := exec.CommandContext(ctx, "cp", "-a", "--reflink=always", "--sparse=auto", srcDir, dstDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reflink clone %s -> %s: %w: %s", srcDir, dstDir, err, out)
 	}
