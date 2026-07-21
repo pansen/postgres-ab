@@ -5,43 +5,20 @@ set -Eeuo pipefail
 # pg-dev-local — the residual shell shim for the snapshottable-PostgreSQL setup.
 #
 # Almost everything now lives in the Go tooling under ./pgdev (see issues/0001):
-# provisioning, status, promote, refresh, snapshots, snapshot/restore, endpoint
-# and the machine bootstrap are the `pgdev` host CLI talking to the in-machine
-# `pgdevd` daemon. What remains here is the handful of interactive / per-slot
-# passthroughs that still ride `incus exec` — shell, logs (active + staging)
-# and staging start/stop — which retire when this script is deleted (Slice 5).
+# provisioning, status, promote, refresh, snapshots, snapshot/restore, endpoint,
+# staging start/stop and the machine bootstrap are the `pgdev` host CLI talking to
+# the in-machine `pgdevd` daemon. What remains here is the interactive per-slot
+# passthroughs that still ride `incus exec` — shell and logs (active + staging) —
+# which retire when this script is deleted (Slice 5), once they move to their real
+# transport (SSH/ssh2incus, §5.8).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
 
 BACKEND_PREFIX=pg-dev
-BACKEND_A="${BACKEND_PREFIX}-a"
-BACKEND_B="${BACKEND_PREFIX}-b"
 STATE_DIR="$REPO_ROOT/var"
 STATE_FILE="$STATE_DIR/active-slot"
-DATA_ROOT=/var/lib/pg-dev-local
-MUTATION_LOCK=/run/lock/pg-dev-local.lock
-SIGNAL_CLEANUP=
-
-# State-changing commands install a short-lived cleanup callback while they
-# own stopped containers, temporary data trees, or an unmounted filesystem.
-# Bash resolves locals dynamically, so the callback can safely use the state
-# tracked by the command that installed it.
-_handle_exit() {
-    local status="$1"
-    trap - ERR HUP INT TERM
-    set +eu
-    if [[ -n "$SIGNAL_CLEANUP" ]] && declare -F "$SIGNAL_CLEANUP" >/dev/null; then
-        "$SIGNAL_CLEANUP"
-    fi
-    exit "$status"
-}
-
-trap '_handle_exit $?' ERR
-trap '_handle_exit 129' HUP
-trap '_handle_exit 130' INT
-trap '_handle_exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -52,48 +29,10 @@ _staging()   { [[ "$(_active)" == a ]] && echo b || echo a; }
 _c_active()  { echo "${BACKEND_PREFIX}-$(_active)"; }
 _c_staging() { echo "${BACKEND_PREFIX}-$(_staging)"; }
 
-_slot_for_container() {
-    case "$1" in
-        "$BACKEND_A") echo a ;;
-        "$BACKEND_B") echo b ;;
-        *) echo "ERROR: unknown backend container '$1'" >&2; exit 1 ;;
-    esac
-}
-
-_acquire_mutation_lock() {
-    mkdir -p "$(dirname "$MUTATION_LOCK")"
-    exec 9>"$MUTATION_LOCK"
-    flock 9
-}
-
 # ---------------------------------------------------------------------------
-# Per-slot commands
+# Per-slot commands (read-only interactive access; no state mutation)
 # ---------------------------------------------------------------------------
 
-# In-machine pgdev binary shim. staging.start delegates to it to bring a backend
-# fully up (container + PostgreSQL, waiting for readiness); the crash-safe
-# snapshot/restore engine it also exposes now runs via the `pgdev` host CLI.
-PGDEVD_BIN="${PGDEVD_BIN:-$REPO_ROOT/pgdev/bin/pgdevd}"
-
-_pgdevd() {
-    if [[ ! -x "$PGDEVD_BIN" ]]; then
-        echo "ERROR: pgdevd binary not found at $PGDEVD_BIN." >&2
-        echo "       Build it on the host with: make -C pgdev build" >&2
-        exit 1
-    fi
-    PG_DATA_ROOT="$DATA_ROOT" \
-    PG_BACKEND_PREFIX="$BACKEND_PREFIX" \
-    PG_BACKEND_A_IP="${PG_BACKEND_A_IP:-}" \
-    PG_BACKEND_B_IP="${PG_BACKEND_B_IP:-}" \
-        "$PGDEVD_BIN" "$@"
-}
-
-cmd_staging_stop()         { incus stop "$(_c_staging)"; }
-# Start the staging container AND its PostgreSQL (a container boot does not
-# reliably auto-start the unit); the binary waits for readiness.
-cmd_staging_start()        { _pgdevd start --slot "$(_slot_for_container "$(_c_staging)")"; }
-
-# Shell / logs, per slot.
 cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
 cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
 
@@ -108,10 +47,10 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <command> [args]
 
-NOTE: lifecycle (up/down), status, promote, refresh, ip, endpoint, snapshots and
-the snapshot/restore commands moved to the host 'pgdev' CLI (which talks HTTP to
-the in-machine pgdevd daemon). This script now covers only interactive access and
-staging lifecycle — the rest retires together with the script in a later slice
+NOTE: lifecycle (up/down), status, promote, refresh, ip, endpoint, snapshots, the
+snapshot/restore commands and staging start/stop moved to the host 'pgdev' CLI
+(which talks HTTP to the in-machine pgdevd daemon). This script now covers only
+interactive access — the rest retires together with the script in a later slice
 (see issues/0001).
 
 Active slot (whatever is currently active):
@@ -121,16 +60,8 @@ Active slot (whatever is currently active):
 Staging slot (the other one):
   staging.shell
   staging.logs
-  staging.stop                    stop staging backend
-  staging.start                   start staging backend
 EOF
 }
-
-case "${1:-}" in
-    staging.stop|staging.start)
-        _acquire_mutation_lock
-        ;;
-esac
 
 case "${1:-}" in
     shell)          shift; cmd_shell "$@" ;;
@@ -138,8 +69,6 @@ case "${1:-}" in
 
     staging.shell)        shift; cmd_staging_shell "$@" ;;
     staging.logs)         shift; cmd_staging_logs "$@" ;;
-    staging.stop)         shift; cmd_staging_stop "$@" ;;
-    staging.start)        shift; cmd_staging_start "$@" ;;
 
     ""|-h|--help)   usage ;;
     *)              usage; exit 1 ;;

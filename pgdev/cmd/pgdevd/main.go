@@ -3,8 +3,9 @@
 // Since Slice 2 its primary mode is `serve`: a resident HTTP/JSON daemon (the
 // systemd unit runs it) that owns the journaled task engine, the single-mutation
 // mutex, blueprint reconciliation, and boot-time recovery. The Slice 1 one-shot
-// subcommands (snapshot/restore/start) remain for the strangler transition and
-// for `staging.start`, running each mutation through the same task engine.
+// snapshot/restore subcommands remain for the strangler transition, running each
+// mutation through the same task engine. Staging start/stop is now a daemon API
+// (StartStaging/StopStaging), so the old `start --slot` one-shot is gone.
 package main
 
 import (
@@ -57,8 +58,6 @@ func run(args []string) error {
 		return cmdRestore(ctx, args[1:], false)
 	case "restore-last":
 		return cmdRestore(ctx, args[1:], true)
-	case "start":
-		return cmdStart(ctx, args[1:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 		return nil
@@ -144,30 +143,6 @@ func env(ctx context.Context) (*ops.Ops, task.Journal, error) {
 		return nil, nil, fmt.Errorf("recovering interrupted operation: %w", err)
 	}
 	return o, j, nil
-}
-
-// cmdStart brings a backend fully up: container running AND PostgreSQL ready.
-// It needs neither the journal nor the data store, so it skips env().
-func cmdStart(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	slot := fs.String("slot", "", "backend slot (a|b)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if err := requireSlot(*slot); err != nil {
-		return err
-	}
-	cfg := config.Load()
-	be := backend.NewIncus(cfg)
-	be.Log = logx.Stderr
-	o := ops.New(store.NewOSStore(cfg.DataRoot), be, cfg)
-	o.Log = logx.Stderr
-	c := o.Cfg.Container(*slot)
-	if err := o.Backend.StartContainerAndWait(ctx, c); err != nil {
-		return err
-	}
-	fmt.Printf("Started %s (PostgreSQL ready).\n", c)
-	return nil
 }
 
 func cmdSnapshot(ctx context.Context, args []string) error {
@@ -302,7 +277,6 @@ Usage:
   pgdevd snapshot     --slot <a|b> --name <name> [--force]
   pgdevd restore      --slot <a|b> --name <name> [--force]
   pgdevd restore-last --slot <a|b> [--force]
-  pgdevd start        --slot <a|b>
   pgdevd version
 `))
 	return nil

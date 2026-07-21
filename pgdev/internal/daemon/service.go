@@ -218,6 +218,33 @@ func (s *Service) promotable(ctx context.Context, from, to string) error {
 	return nil
 }
 
+// ----- staging lifecycle ---------------------------------------------------
+
+// StartStaging brings the staging (non-active) backend fully up — container
+// running AND PostgreSQL ready. It ports the shell's `staging.start` (which
+// shelled `pgdevd start --slot`); the single-mutation lock replaces its flock.
+func (s *Service) StartStaging(ctx context.Context) (agentapi.OpResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.Cfg.Container(other(s.Active.Get()))
+	if err := s.Incus.StartContainerAndWait(ctx, c); err != nil {
+		return agentapi.OpResponse{}, err
+	}
+	return agentapi.OpResponse{Message: fmt.Sprintf("started %s (PostgreSQL ready)", c)}, nil
+}
+
+// StopStaging stops the staging (non-active) backend. Ports the shell's
+// `staging.stop`; StopContainer refuses if the container won't reach STOPPED.
+func (s *Service) StopStaging(ctx context.Context) (agentapi.OpResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.Cfg.Container(other(s.Active.Get()))
+	if err := s.Incus.StopContainer(ctx, c); err != nil {
+		return agentapi.OpResponse{}, err
+	}
+	return agentapi.OpResponse{Message: fmt.Sprintf("stopped %s", c)}, nil
+}
+
 // ----- snapshot / restore --------------------------------------------------
 
 func (s *Service) Snapshot(ctx context.Context, req agentapi.SnapshotRequest) (agentapi.OpResponse, error) {

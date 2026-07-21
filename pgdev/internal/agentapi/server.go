@@ -21,6 +21,8 @@ type Service interface {
 	Reconcile(ctx context.Context) (ReconcileResponse, error)
 	Up(ctx context.Context) (StatusResponse, error)
 	Down(ctx context.Context) (OpResponse, error)
+	StartStaging(ctx context.Context) (OpResponse, error)
+	StopStaging(ctx context.Context) (OpResponse, error)
 }
 
 // Server adapts a Service to the HTTP/JSON contract with bearer-token auth.
@@ -44,6 +46,8 @@ func NewServer(svc Service, token string) http.Handler {
 	mux.HandleFunc("POST /v1/reconcile", s.auth(s.reconcile))
 	mux.HandleFunc("POST /v1/up", s.auth(s.up))
 	mux.HandleFunc("POST /v1/down", s.auth(s.down))
+	mux.HandleFunc("POST /v1/staging/start", s.auth(s.stagingStart))
+	mux.HandleFunc("POST /v1/staging/stop", s.auth(s.stagingStop))
 	return mux
 }
 
@@ -142,6 +146,24 @@ func (s *Server) up(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) down(w http.ResponseWriter, r *http.Request) {
 	res, err := s.svc.Down(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) stagingStart(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.StartStaging(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) stagingStop(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.StopStaging(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return

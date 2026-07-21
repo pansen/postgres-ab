@@ -310,13 +310,13 @@ pg.staging.reset: disk.check machine.exists pgdevd
 	$(PGDEV) staging reset $(if $(force),--force,)
 
 .PHONY: pg.staging.stop
-pg.staging.stop: machine.exists
-	$(PG_DEV) staging.stop
+pg.staging.stop: machine.exists pgdevd
+	$(PGDEV) staging stop
 	$(MAKE) status
 
 .PHONY: pg.staging.start
 pg.staging.start: machine.exists pgdevd
-	$(PG_DEV) staging.start
+	$(PGDEV) staging start
 	$(PGDEV) refresh
 	$(MAKE) status
 

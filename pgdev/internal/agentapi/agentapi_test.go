@@ -51,6 +51,12 @@ func (f *fakeService) Up(context.Context) (StatusResponse, error) {
 func (f *fakeService) Down(context.Context) (OpResponse, error) {
 	return OpResponse{Message: "down"}, nil
 }
+func (f *fakeService) StartStaging(context.Context) (OpResponse, error) {
+	return OpResponse{Message: "started pg-dev-b (PostgreSQL ready)"}, nil
+}
+func (f *fakeService) StopStaging(context.Context) (OpResponse, error) {
+	return OpResponse{Message: "stopped pg-dev-b"}, nil
+}
 
 func newTest(t *testing.T, token string) (*Client, *fakeService, func()) {
 	t.Helper()
@@ -96,6 +102,19 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if !fake.lastSnap.set || fake.lastSnap.req.Slot != "b" || !fake.lastSnap.req.Force {
 		t.Fatalf("server saw %+v", fake.lastSnap)
+	}
+}
+
+func TestStagingLifecycleRoundTrip(t *testing.T) {
+	cl, _, done := newTest(t, "secret")
+	defer done()
+	res, err := cl.StartStaging(context.Background())
+	if err != nil || res.Message == "" {
+		t.Fatalf("start staging: res=%+v err=%v", res, err)
+	}
+	res, err = cl.StopStaging(context.Background())
+	if err != nil || res.Message == "" {
+		t.Fatalf("stop staging: res=%+v err=%v", res, err)
 	}
 }
 

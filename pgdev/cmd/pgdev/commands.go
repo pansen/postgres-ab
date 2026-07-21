@@ -410,8 +410,55 @@ func (a *app) stagingCmd() *cobra.Command {
 		a.restoreCmd("staging"),
 		a.restoreLastCmd("staging"),
 		reset,
+		a.stagingStartCmd(),
+		a.stagingStopCmd(),
 	)
 	return c
+}
+
+// stagingStartCmd brings the staging backend fully up (container + PostgreSQL,
+// waiting for readiness). Uses the long-timeout client — bring-up waits on
+// systemd and PostgreSQL, which can outlast the default HTTP deadline.
+func (a *app) stagingStartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "start",
+		Short: "Start the staging backend (container + PostgreSQL, waits for readiness)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			cl, err := a.longClient(ctx)
+			if err != nil {
+				return err
+			}
+			res, err := cl.StartStaging(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Println(res.Message)
+			return nil
+		},
+	}
+}
+
+func (a *app) stagingStopCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop",
+		Short: "Stop the staging backend",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			cl, err := a.client(ctx)
+			if err != nil {
+				return err
+			}
+			res, err := cl.StopStaging(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Println(res.Message)
+			return nil
+		},
+	}
 }
 
 // ----- shared render helpers -----------------------------------------------

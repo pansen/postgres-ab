@@ -87,6 +87,18 @@ func (c *Client) Down(ctx context.Context) (OpResponse, error) {
 	return out, err
 }
 
+func (c *Client) StartStaging(ctx context.Context) (OpResponse, error) {
+	var out OpResponse
+	err := c.do(ctx, http.MethodPost, "/v1/staging/start", struct{}{}, &out)
+	return out, err
+}
+
+func (c *Client) StopStaging(ctx context.Context) (OpResponse, error) {
+	var out OpResponse
+	err := c.do(ctx, http.MethodPost, "/v1/staging/stop", struct{}{}, &out)
+	return out, err
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
 	var rdr io.Reader
 	if body != nil {
