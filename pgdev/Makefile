@@ -8,23 +8,36 @@
 BIN        := pgdevd
 BIN_DIR    := bin
 OUT        := $(BIN_DIR)/$(BIN)
+HOST_OUT   := $(BIN_DIR)/pgdev
 PKG        := ./...
 # The machine is Apple silicon; build for it by default. Override for other hosts.
 GOOS       ?= linux
 GOARCH     ?= arm64
-# Stamp the binary so `pgdevd version` / GET /v1/version can confirm a deploy.
+# Stamp both binaries from the same git state so the deploy version handshake
+# (host pgdev ↔ in-machine pgdevd via GET /v1/version) matches.
 VERSION    ?= $(shell git -C .. describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS    := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 
-## build: cross-compile the in-machine binary to bin/pgdevd (linux/arm64)
+## build: build both binaries — the in-machine daemon and the host CLI
 .PHONY: build
-build:
+build: daemon host
+
+## daemon: cross-compile the in-machine binary to bin/pgdevd (linux/arm64)
+.PHONY: daemon
+daemon:
 	@mkdir -p $(BIN_DIR)
-	GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
+	@GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0 \
 		go build -trimpath -ldflags '$(LDFLAGS)' -o $(OUT) ./cmd/pgdevd
 	@echo "built $(OUT) ($(GOOS)/$(GOARCH), $(VERSION))"
+
+## host: build the host (macOS) CLI to bin/pgdev
+.PHONY: host
+host:
+	@mkdir -p $(BIN_DIR)
+	@go build -trimpath -ldflags '$(LDFLAGS)' -o $(HOST_OUT) ./cmd/pgdev
+	@echo "built $(HOST_OUT) (host, $(VERSION))"
 
 ## build-host: build for the host OS/arch (handy for local smoke runs)
 .PHONY: build-host

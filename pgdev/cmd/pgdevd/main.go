@@ -1,10 +1,10 @@
 // Command pgdevd is the in-machine agent for the snapshottable-PostgreSQL setup.
 //
-// In Slice 1 it is a one-shot CLI, invoked by scripts/pg-dev-local for the
-// snapshot/restore command family: it runs each mutation through the journaled
-// task engine (internal/task), auto-healing any interrupted prior run first.
-// Later slices grow a `serve` subcommand (the resident HTTP daemon) on the same
-// binary; the cobra command surface and the typed Incus client land with them.
+// Since Slice 2 its primary mode is `serve`: a resident HTTP/JSON daemon (the
+// systemd unit runs it) that owns the journaled task engine, the single-mutation
+// mutex, blueprint reconciliation, and boot-time recovery. The Slice 1 one-shot
+// subcommands (snapshot/restore/start) remain for the strangler transition and
+// for `staging.start`, running each mutation through the same task engine.
 package main
 
 import (
@@ -12,13 +12,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
+	"pansen.me/pgdev/internal/agentapi"
 	"pansen.me/pgdev/internal/backend"
 	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/daemon"
 	"pansen.me/pgdev/internal/logx"
 	"pansen.me/pgdev/internal/ops"
 	"pansen.me/pgdev/internal/store"
@@ -43,6 +47,8 @@ func run(args []string) error {
 	defer stop()
 
 	switch args[0] {
+	case "serve":
+		return cmdServe(ctx, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, args[1:])
 	case "restore":
@@ -61,10 +67,53 @@ func run(args []string) error {
 	}
 }
 
+// cmdServe runs the resident HTTP daemon: recover any interrupted mutation,
+// then serve the agentapi on the machine's eth0 until signalled. This is the
+// control path — the systemd unit runs `pgdevd serve`.
+func cmdServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := fs.String("addr", "", "listen address (default :<PG_AGENT_PORT>)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg := config.Load()
+	svc, err := daemon.New(cfg, version, logx.Stderr)
+	if err != nil {
+		return err
+	}
+	if err := svc.RecoverPending(ctx); err != nil {
+		return fmt.Errorf("recovering interrupted operation on start: %w", err)
+	}
+	token, err := agentapi.ReadToken(cfg.AgentTokenPath)
+	if err != nil {
+		return fmt.Errorf("reading agent token: %w", err)
+	}
+	if token == "" {
+		logx.Stderr("WARNING: no agent token at %s yet; API rejects all requests until 'pgdev agent deploy' writes one", cfg.AgentTokenPath)
+	}
+
+	listen := *addr
+	if listen == "" {
+		listen = fmt.Sprintf(":%d", cfg.AgentPort)
+	}
+	srv := &http.Server{Addr: listen, Handler: agentapi.NewServer(svc, token), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	logx.Stderr("pgdevd %s serving on %s", version, listen)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
 // env wires up the shared dependencies and runs recovery for any interrupted
 // prior mutation before returning.
 func env(ctx context.Context) (*ops.Ops, task.Journal, error) {
-	cfg := config.FromEnv()
+	cfg := config.Load()
 	st := store.NewOSStore(cfg.DataRoot)
 	if err := st.RequireMounted(); err != nil {
 		return nil, nil, err
@@ -94,7 +143,7 @@ func cmdStart(ctx context.Context, args []string) error {
 	if err := requireSlot(*slot); err != nil {
 		return err
 	}
-	cfg := config.FromEnv()
+	cfg := config.Load()
 	be := backend.NewIncus(cfg)
 	be.Log = logx.Stderr
 	o := ops.New(store.NewOSStore(cfg.DataRoot), be, cfg)
@@ -231,9 +280,10 @@ func requireSlot(slot string) error {
 
 func usage() error {
 	fmt.Fprintln(os.Stderr, strings.TrimSpace(`
-pgdevd — in-machine agent (Slice 1: snapshot/restore engine)
+pgdevd — in-machine agent (resident daemon + one-shot task engine)
 
 Usage:
+  pgdevd serve        [--addr :5440]         resident HTTP/JSON control daemon
   pgdevd snapshot     --slot <a|b> --name <name> [--force]
   pgdevd restore      --slot <a|b> --name <name> [--force]
   pgdevd restore-last --slot <a|b> [--force]

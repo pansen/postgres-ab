@@ -1,6 +1,7 @@
 /.zed
 .env
-/var/active-slot
-/var/*.tar.gz
-/var/machine-ip
-/var/*-forward.log
+
+# Everything under var/ is machine-local runtime or generated state — nothing
+# there is source: the agent-token SECRET, the active-slot/machine-ip pointers,
+# the deploy-generated pgdevd.env / pgdevd.service, exports (*.tar.gz), and logs.
+/var/

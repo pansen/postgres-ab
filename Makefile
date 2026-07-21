@@ -14,6 +14,10 @@ PG_DATA_DISK_SIZE ?= 140G
 PG_DEV_SCRIPT := ./scripts/pg-dev-local
 HOST_ENDPOINT := ./scripts/host-endpoint
 PGDEV_DIR := pgdev
+# Host CLI (macOS). Since Slice 2 the stateful control path — status / promote /
+# refresh / snapshots / ip / snapshot / restore — runs through this binary over
+# the resident pgdevd HTTP API, not `container machine run` execs into the shell.
+PGDEV := $(PGDEV_DIR)/bin/pgdev
 MACHINE_RUN_ARGS := --name $(MACHINE_NAME) --root --interactive \
 	--workdir "$(CURDIR)" \
 	--env HOST_UID=$(shell id -u) \
@@ -100,11 +104,11 @@ machine: system.start
 machine.exists:
 	@container machine inspect $(MACHINE_NAME) >/dev/null 2>&1 || { echo "Machine '$(MACHINE_NAME)' does not exist — run 'make start' first." >&2; exit 1; }
 
-# Cross-compile the in-machine Go agent (the snapshot/restore engine, see
-# issues/0001) on the host. The binary lands on the home-mount at pgdev/bin and
-# is exec'd by scripts/pg-dev-local inside the machine. It is a prerequisite of
-# every target that snapshots or restores, so the shell shim and the binary
-# never drift.
+# Build both Go binaries on the host, stamped from the same git state: the
+# in-machine daemon (pgdev/bin/pgdevd, linux/arm64, delivered via the home-mount
+# and installed by `pgdev agent deploy`) and the host CLI (pgdev/bin/pgdev,
+# macOS). A prerequisite of every control-path and snapshot target so the shell
+# shims, the daemon and the CLI never drift.
 .PHONY: pgdevd
 pgdevd:
 	@$(MAKE) -C $(PGDEV_DIR) build
@@ -122,8 +126,9 @@ machine.status: system.start
 	container machine inspect $(MACHINE_NAME)
 
 .PHONY: start
-start: machine
-	$(PG_DEV) refresh
+start: machine pgdevd
+	$(PGDEV) agent deploy
+	$(PGDEV) refresh
 	@$(HOST_ENDPOINT) refresh
 	$(MAKE) status
 
@@ -134,10 +139,10 @@ status/incus: machine.exists
 	$(MACHINE_RUN) incus info --resources
 
 # The one status command: pointer + proxy roles, per-backend state/endpoints,
-# snapshot counts and snapshot timelines.
+# snapshot counts and snapshot timelines. Served by pgdevd over the HTTP API.
 .PHONY: status
-status: machine.exists
-	@$(PG_DEV) status
+status: machine.exists pgdevd
+	@$(PGDEV) status
 
 # ----- stable macOS client endpoint --------------------------------------
 # The Apple machine's IP drifts and cannot be pinned, so a host-side socat
@@ -182,17 +187,17 @@ pg.down: machine.exists
 	$(PG_DEV) down
 
 .PHONY: pg.status
-pg.status: machine.exists
-	$(PG_DEV) status
-	@$(PG_DEV) endpoint
+pg.status: machine.exists pgdevd
+	$(PGDEV) status
+	@$(PGDEV) endpoint
 
 .PHONY: pg.promote
-pg.promote: machine.exists
-	$(PG_DEV) promote
+pg.promote: machine.exists pgdevd
+	$(PGDEV) promote
 
 .PHONY: pg.refresh
-pg.refresh: machine.exists
-	$(PG_DEV) refresh
+pg.refresh: machine.exists pgdevd
+	$(PGDEV) refresh
 
 # ----- active backend -----------------------------------------------------
 
@@ -205,8 +210,8 @@ pg.shell: machine.exists
 	@$(call PG_DEV_AUTO,shell)
 
 .PHONY: pg.ip
-pg.ip: machine.exists
-	@$(PG_DEV) ip
+pg.ip: machine.exists pgdevd
+	@$(PGDEV) ip
 
 .PHONY: pg.logs
 pg.logs: machine.exists
@@ -214,19 +219,19 @@ pg.logs: machine.exists
 
 .PHONY: pg.snapshot
 pg.snapshot: machine.exists pgdevd
-	$(PG_DEV) snapshot $(name) $(if $(force),--force,)
+	$(PGDEV) snapshot $(name) $(if $(force),--force,)
 
 .PHONY: pg.restore
 pg.restore: machine.exists pgdevd
-	@$(call PG_DEV_AUTO,restore $(name) $(if $(force),--force,))
+	$(PGDEV) restore $(name) $(if $(force),--force,)
 
 .PHONY: pg.restore-last
 pg.restore-last: machine.exists pgdevd
-	@$(call PG_DEV_AUTO,restore-last $(if $(force),--force,))
+	$(PGDEV) restore-last $(if $(force),--force,)
 
 .PHONY: pg.snapshots
-pg.snapshots: machine.exists
-	$(PG_DEV) snapshots
+pg.snapshots: machine.exists pgdevd
+	$(PGDEV) snapshots
 
 # ----- staging backend ----------------------------------------------------
 
@@ -244,19 +249,19 @@ pg.staging.logs: machine.exists
 
 .PHONY: pg.staging.snapshot
 pg.staging.snapshot: machine.exists pgdevd
-	$(PG_DEV) staging.snapshot $(name) $(if $(force),--force,)
+	$(PGDEV) staging snapshot $(name) $(if $(force),--force,)
 
 .PHONY: pg.staging.restore
 pg.staging.restore: machine.exists pgdevd
-	@$(call PG_DEV_AUTO,staging.restore $(name) $(if $(force),--force,))
+	$(PGDEV) staging restore $(name) $(if $(force),--force,)
 
 .PHONY: pg.staging.restore-last
 pg.staging.restore-last: machine.exists pgdevd
-	@$(call PG_DEV_AUTO,staging.restore-last $(if $(force),--force,))
+	$(PGDEV) staging restore-last $(if $(force),--force,)
 
 .PHONY: pg.staging.reset
 pg.staging.reset: machine.exists pgdevd
-	@$(call PG_DEV_AUTO,staging.reset $(if $(force),--force,))
+	$(PGDEV) staging reset $(if $(force),--force,)
 
 .PHONY: pg.staging.stop
 pg.staging.stop: machine.exists
@@ -294,4 +299,4 @@ recreate: delete start
 check:
 	bash -n scripts/apple-machine-init scripts/pg-dev-local scripts/host-endpoint
 	@$(MAKE) --no-print-directory -n deps >/dev/null
-	$(MAKE) -C $(PGDEV_DIR) vet test
+	$(MAKE) -C $(PGDEV_DIR) vet test build

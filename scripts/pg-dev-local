@@ -448,113 +448,6 @@ cmd_down() {
     rm -f "$STATE_FILE"
 }
 
-# Box-table renderer for cmd_status. Reads rows on stdin; columns are separated
-# by US (\037) and multi-line cells split on RS (\036). The first row is the
-# header (centered); data cells are left-aligned. Mirrors incus's own table
-# look (a border after every row) so the two outputs sit together naturally.
-_render_table() {
-    awk -v FSU=$'\037' -v SUB=$'\036' '
-    function rep(ch, n,   s) { s = ""; while (n-- > 0) s = s ch; return s }
-    function bord(   c, s) { s = "+"; for (c = 1; c <= ncol; c++) s = s rep("-", w[c] + 2) "+"; return s }
-    function ctr(str, width,   t, l) { t = width - length(str); l = int(t / 2); return rep(" ", l) str rep(" ", t - l) }
-    function prow(r,   i, c, val, line) {
-        for (i = 1; i <= ht[r]; i++) {
-            line = "|"
-            for (c = 1; c <= ncol; c++) {
-                val = (i <= ln[r, c]) ? cell[r, c, i] : ""
-                if (r == 1) line = line " " ctr(val, w[c]) " |"
-                else        line = line " " val rep(" ", w[c] - length(val)) " |"
-            }
-            print line
-        }
-    }
-    BEGIN { FS = FSU }
-    {
-        nr++
-        if (NF > ncol) ncol = NF
-        for (c = 1; c <= NF; c++) {
-            m = split($c, L, SUB)
-            if (m > ht[nr]) ht[nr] = m
-            ln[nr, c] = m
-            for (i = 1; i <= m; i++) {
-                cell[nr, c, i] = L[i]
-                if (length(L[i]) > w[c]) w[c] = length(L[i])
-            }
-        }
-        if (ht[nr] < 1) ht[nr] = 1
-        rows = nr
-    }
-    END {
-        print bord(); prow(1); print bord()
-        for (r = 2; r <= rows; r++) { prow(r); print bord() }
-    }
-    '
-}
-
-# One cmd_status row: NAME, STATE, client-facing ENDPOINT, snapshot count, and
-# the container's own bridge IPs. ENDPOINT is the stable client host:port — the
-# *role* mapping (constant across promote), so it shows even when the backend
-# is stopped. The backend's own IP isn't repeated here (it's in the IPs column
-# and, being on incusbr0, isn't reachable from macOS anyway).
-_status_row() {
-    local c="$1" role="$2" client_host="$3"
-    local RS=$'\036' US=$'\037'
-    local state endpoint ips snaps port json
-    json=$(incus list "$c" --format json 2>/dev/null)
-    # Single incus call for both state and IPs (was a separate `_state` call
-    # plus this same `incus list --format json`).
-    state=$(printf '%s' "$json" | jq -r '.[0].status // empty | ascii_upcase' 2>/dev/null)
-    [[ -z "$state" ]] && state="-"
-    case "$role" in
-        active)  port="$CLIENT_ACTIVE_PORT" ;;
-        staging) port="$CLIENT_STAGING_PORT" ;;
-    esac
-    endpoint="${client_host:-?}:${port}"
-    ips=$(printf '%s' "$json" \
-        | jq -r '.[0].state.network // {} | to_entries[] | select(.key != "lo") | .value.addresses[]? | select(.scope == "global") | .address' 2>/dev/null \
-        | paste -sd "$RS" -)
-    [[ -z "$ips" ]] && ips="-"
-    snaps=$(_snapshot_count "$c")
-    printf '%s%s%s%s%s%s%s%s%s\n' \
-        "$c" "$US" "$state" "$US" "$endpoint" "$US" "$snaps" "$US" "$ips"
-}
-
-# The one status view: incus client/server versions, slot + proxy roles, a
-# per-backend table, then the snapshot timelines. Called by `make status` (and
-# after promote / staging start-stop), so it is the single place that answers
-# "what's running, where do I connect, and what can I roll back to".
-cmd_status() {
-    local a s ca cs proxy_ip client_host pstate
-    a=$(_active); s=$(_staging)
-    ca="${BACKEND_PREFIX}-${a}"; cs="${BACKEND_PREFIX}-${s}"
-    proxy_ip=$(_proxy_ip)
-    client_host=$(_client_host)
-    pstate=$(_state "$PROXY"); [[ -z "$pstate" ]] && pstate="ABSENT"
-
-    incus version 2>/dev/null
-    echo
-    echo "active slot: $a   (active = $ca, staging = $cs)"
-    # pg-proxy owns every client-facing proxy device below, but bind=host puts
-    # the listeners on the Apple machine address shown here. Clients reach them
-    # via the stable $client_host endpoint (see the ENDPOINT column).
-    if [[ "$pstate" == "RUNNING" ]]; then
-        echo "pg-proxy:    $pstate  (machine $proxy_ip → :$ACTIVE_PORT active, :$STAGING_PORT staging)"
-    else
-        echo "pg-proxy:    $pstate"
-    fi
-    if ! _data_store_mounted; then
-        echo "data store:  NOT MOUNTED — run 'make machine'"
-    fi
-    echo
-    {
-        printf 'NAME\037STATE\037ENDPOINT\037SNAPSHOTS\037IPs\n'
-        _status_row "$ca" active  "$client_host"
-        _status_row "$cs" staging "$client_host"
-    } | _render_table
-    echo
-    cmd_snapshots --with-psql
-}
-
 _print_psql_command() {
     local label="$1" ip="$2" port="$3"
     printf '%spsql --host=%q --port=%q --username=%q --dbname=%q\n' \
@@ -587,67 +480,6 @@ EOF
         echo "note: 127.0.0.1 needs the host forwarder ('make endpoint.install'); it"
         echo "      relays to the machine IP ${machine_ip:-?}, which may drift on reboot."
     fi
-}
-
-cmd_promote() {
-    local from to result=0 pointer_flipped=0
-    from=$(_active)
-    to=$(_staging)
-
-    echo "==> Promoting: active $from → $to"
-
-    local proxy_state from_state to_state problems=() line
-    proxy_state=$(_state "$PROXY")
-    from_state=$(_state "${BACKEND_PREFIX}-${from}")
-    to_state=$(_state "${BACKEND_PREFIX}-${to}")
-    [[ "$proxy_state" == RUNNING ]] \
-        || problems+=("$PROXY is ${proxy_state:-ABSENT} — run 'make start'")
-    [[ "$from_state" == RUNNING ]] \
-        || problems+=("${BACKEND_PREFIX}-${from} (active) is ${from_state:-ABSENT} — run 'make start'")
-    [[ "$to_state" == RUNNING ]] \
-        || problems+=("${BACKEND_PREFIX}-${to} (staging) is ${to_state:-ABSENT} — run 'make pg.staging.start'")
-    if (( ${#problems[@]} > 0 )); then
-        echo "ERROR: promotion requires proxy and both backends RUNNING:" >&2
-        for line in "${problems[@]}"; do
-            echo "  - $line" >&2
-        done
-        exit 1
-    fi
-
-    _promote_signal_cleanup() {
-        set +e
-        if (( pointer_flipped == 1 )); then
-            _set_active "$from"
-            _set_forwards
-        fi
-    }
-    SIGNAL_CLEANUP=_promote_signal_cleanup
-
-    # Flip the pointer, then re-point both forwards. Re-pointing a proxy
-    # device's `connect` restarts its forkproxy, so any open TCP connection is
-    # dropped — clients reconnect (to the new active on :$CLIENT_ACTIVE_PORT, or
-    # the new staging on :$CLIENT_STAGING_PORT). The endpoints never change.
-    pointer_flipped=1
-    _set_active "$to"
-    if _set_forwards; then
-        result=0
-    else
-        result=$?
-        echo "ERROR: proxy update failed; restoring active slot $from..." >&2
-        _set_active "$from"
-        pointer_flipped=0
-        _set_forwards || echo "ERROR: proxy rollback also failed; run 'make pg.refresh'." >&2
-        SIGNAL_CLEANUP=
-        unset -f _promote_signal_cleanup
-        return "$result"
-    fi
-    pointer_flipped=0
-    SIGNAL_CLEANUP=
-    unset -f _promote_signal_cleanup
-
-    echo "==> Promoted. Active: ${BACKEND_PREFIX}-${to}   Staging: ${BACKEND_PREFIX}-${from}"
-    echo
-    cmd_status
 }
 
 # ---------------------------------------------------------------------------
@@ -694,45 +526,6 @@ _stop_checked() {
             echo "ERROR: $container is $state, not STOPPED." >&2
         fi
         return 1
-    fi
-}
-
-_validate_snapshot_name() {
-    local name="$1"
-    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-        echo "ERROR: snapshot names may contain only letters, digits, '.', '_' and '-'" >&2
-        exit 1
-    fi
-}
-
-# Creation-ordered records as: epoch<TAB>name. Snapshot directory mtimes are
-# touched only after a successful copy, so they are reliable ordering metadata.
-_snapshot_records() {
-    local container="$1" snapshots
-    snapshots=$(_data_snapshots "$container")
-    [[ -d "$snapshots" ]] || return 0
-    find "$snapshots" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@\t%f\n' | sort -n
-}
-
-_snapshot_count() {
-    local container="$1" count
-    count=$(_snapshot_records "$container" | wc -l | tr -d ' ')
-    echo "${count:-0}"
-}
-
-_slot_recovery_artifact() {
-    local container="$1" current snapshots artifact
-    current=$(_data_current "$container")
-    snapshots=$(_data_snapshots "$container")
-    artifact=$(find "$(dirname "$current")" -maxdepth 1 -type d \
-        -name 'current.restore-*' -print -quit 2>/dev/null || true)
-    if [[ -z "$artifact" ]]; then
-        artifact=$(find "$snapshots" -maxdepth 1 -type d \
-            \( -name '.*.tmp.*' -o -name '.*.replaced.*' -o -name '.restore-prune.*' \) \
-            -print -quit 2>/dev/null || true)
-    fi
-    if [[ -n "$artifact" ]]; then
-        echo "$artifact"
     fi
 }
 
@@ -784,81 +577,12 @@ _restore_last() {
     _pgdevd "${args[@]}"
 }
 
-
-# active slot
-cmd_snapshot() {
-    local name="${1:?Usage: snapshot <name> [--force]}"; shift || true
-    _snapshot "$(_c_active)" "$name" "${1:-}"
-}
-cmd_restore() {
-    local name="${1:?Usage: restore <name> [--force]}"; shift || true
-    _restore "$(_c_active)" "$name" "${1:-}"
-}
-cmd_restore_last() { _restore_last "$(_c_active)" "${1:-}"; }
-
-# List snapshots for a container, or note it isn't provisioned yet. Keeps
-# `make status` (which calls this) from failing on a fresh host before pg.up.
-_snapshot_list() {
-    if incus info "$1" >/dev/null 2>&1; then
-        local records epoch name created
-        if ! _data_store_mounted; then
-            echo "(data store not mounted — run 'make machine')"
-            return
-        fi
-        records=$(_snapshot_records "$1")
-        if [[ -z "$records" ]]; then
-            echo "(no snapshots)"
-            return
-        fi
-        printf '%-36s %s\n' NAME CREATED_AT
-        while IFS=$'\t' read -r epoch name; do
-            created=$(date --date="@${epoch}" '+%Y-%m-%d %H:%M:%S %z')
-            printf '%-36s %s\n' "$name" "$created"
-        done <<< "$records"
-    else
-        echo "(not provisioned — run 'make pg.up')"
-    fi
-}
-
-# Unified listing for both slots.
-cmd_snapshots() {
-    local with_psql="${1:-}" a s client_host
-    a=$(_active); s=$(_staging)
-    if [[ "$with_psql" == --with-psql ]]; then
-        client_host=$(_client_host)
-    fi
-    echo "─── active  (${BACKEND_PREFIX}-${a}) ───"
-    if [[ "$with_psql" == --with-psql ]]; then
-        _print_psql_command "$ " "$client_host" "$CLIENT_ACTIVE_PORT"
-        echo
-    fi
-    _snapshot_list "${BACKEND_PREFIX}-${a}"
-    echo
-    echo "─── staging (${BACKEND_PREFIX}-${s}) ───"
-    if [[ "$with_psql" == --with-psql ]]; then
-        _print_psql_command "$ " "$client_host" "$CLIENT_STAGING_PORT"
-        echo
-    fi
-    _snapshot_list "${BACKEND_PREFIX}-${s}"
-}
-
-# staging slot
-cmd_staging_snapshot() {
-    local name="${1:?Usage: staging.snapshot <name> [--force]}"; shift || true
-    _snapshot "$(_c_staging)" "$name" "${1:-}"
-}
-cmd_staging_restore() {
-    local name="${1:?Usage: staging.restore <name> [--force]}"; shift || true
-    _restore "$(_c_staging)" "$name" "${1:-}"
-}
-cmd_staging_restore_last() { _restore_last "$(_c_staging)" "${1:-}"; }
-cmd_staging_reset()        { _restore "$(_c_staging)" initial "${1:-}"; }
 cmd_staging_stop()         { incus stop "$(_c_staging)"; }
 # Start the staging container AND its PostgreSQL (a container boot does not
 # reliably auto-start the unit); the binary waits for readiness.
 cmd_staging_start()        { _pgdevd start --slot "$(_slot_for_container "$(_c_staging)")"; }
 
-# Shell / psql / ip / logs, per slot.
+# Shell / psql / logs, per slot.
 _psql() {
     local container="$1"; shift
     incus exec "$container" -- env PGPASSWORD="$PG_PASSWORD" \
@@ -870,67 +594,8 @@ cmd_staging_psql() { _psql "$(_c_staging)" "$@"; }
 cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
 cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
 
-# IPv4 when running; otherwise the lifecycle state (STOPPED, FROZEN, …).
-_ip_or_state() {
-    local container="$1" ip
-    ip=$(_container_ip "$container")
-    if [[ -n "$ip" ]]; then
-        echo "$ip"
-    else
-        echo "$(_state "$container")"
-    fi
-}
-
-# Unified port + backend view for both slots. The proxy endpoint (proxy-ip:port)
-# is the client-facing fact; the backend column shows its container IP when
-# running, or its state (STOPPED, …) when not.
-cmd_ip() {
-    local a s info_a info_s machine_ip client_host endpoint_a endpoint_s pstate
-    a=$(_active); s=$(_staging)
-    info_a=$(_ip_or_state "${BACKEND_PREFIX}-${a}")
-    info_s=$(_ip_or_state "${BACKEND_PREFIX}-${s}")
-    machine_ip=$(_proxy_ip)
-    client_host=$(_client_host)
-    echo "machine IP:      ${machine_ip:-?}   (drifts across reboots; forwarder target)"
-    echo "client endpoint: ${client_host}   (stable; via 'make endpoint.install')"
-    echo
-    if [[ -n "$machine_ip" ]]; then
-        endpoint_a="${client_host}:${CLIENT_ACTIVE_PORT}"
-        endpoint_s="${client_host}:${CLIENT_STAGING_PORT}"
-    else
-        pstate=$(_state "$PROXY")
-        endpoint_a="$PROXY ${pstate:-none}"
-        endpoint_s="$endpoint_a"
-    fi
-    printf '%-8s  %-22s  →  %-10s (%s)\n' \
-        active  "$endpoint_a" "${BACKEND_PREFIX}-${a}" "$info_a"
-    printf '%-8s  %-22s  →  %-10s (%s)\n' \
-        staging "$endpoint_s" "${BACKEND_PREFIX}-${s}" "$info_s"
-}
-
 cmd_logs()         { incus exec "$(_c_active)"  -- tail -f /var/log/postgresql/postgresql-17-main.log; }
 cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/postgresql-17-main.log; }
-
-# Re-pin the backends' static IPs (self-heal a drifted lease), then re-point
-# the proxy forwards from current state. Idempotent; run on every `make
-# start` so the forwards survive an Apple machine reboot.
-#
-# Also recreates pg-proxy if it's missing but both backends exist (e.g. it
-# was deleted by hand); the client-facing Apple machine endpoint does not
-# change.
-cmd_refresh() {
-    if ! incus info "$PROXY" >/dev/null 2>&1 \
-        && incus info "$BACKEND_A" >/dev/null 2>&1 \
-        && incus info "$BACKEND_B" >/dev/null 2>&1; then
-        echo "==> Recreating missing $PROXY..."
-        _provision_proxy
-    fi
-
-    _repair_backend_ip "$BACKEND_A" "$(_pick_backend_a_ip)"
-    _repair_backend_ip "$BACKEND_B" "$(_pick_backend_b_ip)"
-    _set_forwards
-    echo "Refreshed forwards (:$ACTIVE_PORT → active, :$STAGING_PORT → staging)."
-}
 
 # ---------------------------------------------------------------------------
 # Full export / import (both slots + proxy + raw reflink-preserving XFS image)
@@ -1417,34 +1082,26 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <command> [args]
 
+NOTE: status, promote, refresh, ip, snapshots and the snapshot/restore commands
+moved to the host 'pgdev' CLI (which talks HTTP to the in-machine pgdevd daemon).
+This script now covers only provisioning, interactive access, staging lifecycle
+and full export/import — the rest retires together with the script in a later
+slice (see issues/0001).
+
 Lifecycle:
   up                              provision pg-dev-a, pg-dev-b, pg-proxy
   down                            delete containers and both XFS data trees
-  status                          show pointer + container states
   endpoint                        print endpoints, .pgpass, and psql commands
-  promote                         flip active↔staging (re-point both forwards)
-  refresh                         re-pin backend IPs + re-assert proxy forwards
-
-Both slots (rendered side by side):
-  ip                              proxy endpoint → backend, for both slots
-  snapshots                       snapshot lists for active and staging
 
 Active slot (whatever is currently active):
   psql [args]                     psql via incus exec into active backend
   shell                           bash into active backend
   logs                            tail postgres logs on active backend
-  snapshot <name> [--force]       create an XFS reflink snapshot on active backend
-  restore <name> [--force]        restore active backend to a snapshot
-  restore-last [--force]          restore active backend to its most recent snapshot
 
 Staging slot (the other one):
   staging.psql [args]
   staging.shell
   staging.logs
-  staging.snapshot <name> [--force]
-  staging.restore <name> [--force]
-  staging.restore-last [--force]
-  staging.reset                   shortcut: restore staging to 'initial'
   staging.stop                    stop staging backend
   staging.start                   start staging backend
 
@@ -1455,9 +1112,7 @@ EOF
 }
 
 case "${1:-}" in
-    up|down|promote|refresh|snapshot|restore|restore-last|\
-    staging.snapshot|staging.restore|staging.restore-last|staging.reset|\
-    staging.stop|staging.start|export|import-last)
+    up|down|staging.stop|staging.start|export|import-last)
         _acquire_mutation_lock
         ;;
 esac
@@ -1465,27 +1120,15 @@ esac
 case "${1:-}" in
     up)             shift; cmd_up "$@" ;;
     down)           shift; cmd_down "$@" ;;
-    status)         shift; cmd_status "$@" ;;
     endpoint)       shift; cmd_endpoint "$@" ;;
-    promote)        shift; cmd_promote "$@" ;;
-    refresh)        shift; cmd_refresh "$@" ;;
 
     psql)           shift; cmd_psql "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
-    ip)             shift; cmd_ip "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
-    snapshot)       shift; cmd_snapshot "$@" ;;
-    restore)        shift; cmd_restore "$@" ;;
-    restore-last)   shift; cmd_restore_last "$@" ;;
-    snapshots)      shift; cmd_snapshots "$@" ;;
 
     staging.psql)         shift; cmd_staging_psql "$@" ;;
     staging.shell)        shift; cmd_staging_shell "$@" ;;
     staging.logs)         shift; cmd_staging_logs "$@" ;;
-    staging.snapshot)     shift; cmd_staging_snapshot "$@" ;;
-    staging.restore)      shift; cmd_staging_restore "$@" ;;
-    staging.restore-last) shift; cmd_staging_restore_last "$@" ;;
-    staging.reset)        shift; cmd_staging_reset "$@" ;;
     staging.stop)         shift; cmd_staging_stop "$@" ;;
     staging.start)        shift; cmd_staging_start "$@" ;;
 

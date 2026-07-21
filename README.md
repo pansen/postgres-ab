@@ -44,11 +44,34 @@ socat forwarder (host LaunchAgent)
 └─────────────────────────────────────────────────────────┘
 ```
 
-The Apple machine is the persistent outer Linux environment. The Makefile
-runs `scripts/pg-dev-local` as root inside it, where the Incus socket and the
-database storage are available. The repository remains on macOS and is visible
-at the same `/Users/...` path through the machine's home mount, so `.env`, the
-active-slot pointer, and exports live outside the machine.
+The Apple machine is the persistent outer Linux environment. The repository
+remains on macOS and is visible at the same `/Users/...` path through the
+machine's home mount, so `.env`, the active-slot pointer, and exports live
+outside the machine.
+
+### Control plane (`pgdev` ↔ `pgdevd`)
+
+The stateful control path no longer injects shell over Apple's `container exec`.
+A resident daemon, **`pgdevd`**, runs inside the machine under systemd and
+serves an HTTP/JSON API on the machine's `eth0` (port `5440`, bearer token in
+`var/agent-token`). The host CLI, **`pgdev`**, talks to it:
+
+```text
+pgdev (macOS) ── HTTP/JSON ──▶ pgdevd (machine) ──▶ Incus socket + XFS store
+```
+
+`pgdev status`/`promote`/`refresh`/`snapshots`/`ip`/`snapshot`/`restore` are all
+API calls — after boot there are **zero `container machine run` execs on the
+control path**. `promote` collapses to "flip the active-slot pointer, then
+reconcile the proxy `connect=` targets"; the daemon owns the single-mutation
+lock, the write-ahead journal, and crash recovery on start. Both binaries are
+built by `make pgdevd` (they share one git-stamped version); `pgdev agent
+deploy` — run automatically by `make start` — cross-compiles nothing new, it
+delivers the prebuilt daemon over the home mount, installs it atomically to a
+machine-local path, restarts the unit, and confirms the `GET /v1/version`
+handshake so a stale daemon fails loudly. Interactive work (`psql`, `shell`,
+`logs`) and provisioning still run through `scripts/pg-dev-local` for now
+(later slices).
 
 ### Networking
 

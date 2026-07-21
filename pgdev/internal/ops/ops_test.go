@@ -25,7 +25,7 @@ import (
 // test.
 
 func testConfig() config.Config {
-	return config.Config{BackendPrefix: "pg-dev", BackendIP: map[string]string{}}
+	return config.Config{BackendPrefix: "pg-dev", DataRoot: "/var/lib/pg-dev-local"}
 }
 
 func TestSnapshotConverges(t *testing.T) {
