@@ -13,6 +13,7 @@ PG_DATA_DISK_SIZE ?= 140G
 
 PG_DEV_SCRIPT := ./scripts/pg-dev-local
 HOST_ENDPOINT := ./scripts/host-endpoint
+PGDEV_DIR := pgdev
 MACHINE_RUN_ARGS := --name $(MACHINE_NAME) --root --interactive \
 	--workdir "$(CURDIR)" \
 	--env HOST_UID=$(shell id -u) \
@@ -99,6 +100,15 @@ machine: system.start
 machine.exists:
 	@container machine inspect $(MACHINE_NAME) >/dev/null 2>&1 || { echo "Machine '$(MACHINE_NAME)' does not exist — run 'make start' first." >&2; exit 1; }
 
+# Cross-compile the in-machine Go agent (the snapshot/restore engine, see
+# issues/0001) on the host. The binary lands on the home-mount at pgdev/bin and
+# is exec'd by scripts/pg-dev-local inside the machine. It is a prerequisite of
+# every target that snapshots or restores, so the shell shim and the binary
+# never drift.
+.PHONY: pgdevd
+pgdevd:
+	@$(MAKE) -C $(PGDEV_DIR) build
+
 .PHONY: machine.shell
 machine.shell: machine.exists
 	container machine run --name $(MACHINE_NAME) --interactive --tty
@@ -164,7 +174,7 @@ system.stop: stop
 # ----- lifecycle ----------------------------------------------------------
 
 .PHONY: pg.up
-pg.up: machine
+pg.up: machine pgdevd
 	$(PG_DEV) up
 
 .PHONY: pg.down
@@ -203,15 +213,15 @@ pg.logs: machine.exists
 	@$(call PG_DEV_AUTO,logs)
 
 .PHONY: pg.snapshot
-pg.snapshot: machine.exists
+pg.snapshot: machine.exists pgdevd
 	$(PG_DEV) snapshot $(name) $(if $(force),--force,)
 
 .PHONY: pg.restore
-pg.restore: machine.exists
+pg.restore: machine.exists pgdevd
 	@$(call PG_DEV_AUTO,restore $(name) $(if $(force),--force,))
 
 .PHONY: pg.restore-last
-pg.restore-last: machine.exists
+pg.restore-last: machine.exists pgdevd
 	@$(call PG_DEV_AUTO,restore-last $(if $(force),--force,))
 
 .PHONY: pg.snapshots
@@ -233,19 +243,19 @@ pg.staging.logs: machine.exists
 	@$(call PG_DEV_AUTO,staging.logs)
 
 .PHONY: pg.staging.snapshot
-pg.staging.snapshot: machine.exists
+pg.staging.snapshot: machine.exists pgdevd
 	$(PG_DEV) staging.snapshot $(name) $(if $(force),--force,)
 
 .PHONY: pg.staging.restore
-pg.staging.restore: machine.exists
+pg.staging.restore: machine.exists pgdevd
 	@$(call PG_DEV_AUTO,staging.restore $(name) $(if $(force),--force,))
 
 .PHONY: pg.staging.restore-last
-pg.staging.restore-last: machine.exists
+pg.staging.restore-last: machine.exists pgdevd
 	@$(call PG_DEV_AUTO,staging.restore-last $(if $(force),--force,))
 
 .PHONY: pg.staging.reset
-pg.staging.reset: machine.exists
+pg.staging.reset: machine.exists pgdevd
 	@$(call PG_DEV_AUTO,staging.reset $(if $(force),--force,))
 
 .PHONY: pg.staging.stop
@@ -254,9 +264,8 @@ pg.staging.stop: machine.exists
 	$(MAKE) status
 
 .PHONY: pg.staging.start
-pg.staging.start: machine.exists
+pg.staging.start: machine.exists pgdevd
 	$(PG_DEV) staging.start
-	sleep 1
 	$(PG_DEV) refresh
 	$(MAKE) status
 
@@ -285,3 +294,4 @@ recreate: delete start
 check:
 	bash -n scripts/apple-machine-init scripts/pg-dev-local scripts/host-endpoint
 	@$(MAKE) --no-print-directory -n deps >/dev/null
+	$(MAKE) -C $(PGDEV_DIR) vet test
