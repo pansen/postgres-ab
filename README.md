@@ -73,9 +73,9 @@ built by `make pgdevd` (they share one git-stamped version); `pgdev agent
 deploy` — run automatically by `make start` — cross-compiles nothing new, it
 delivers the prebuilt daemon over the home mount, installs it atomically to a
 machine-local path, restarts the unit, and confirms the `GET /v1/version`
-handshake so a stale daemon fails loudly. Interactive work (`psql`, `shell`,
-`logs`) and full export/import still run through `scripts/pg-dev-local` for now
-(later slices).
+handshake so a stale daemon fails loudly. Only the interactive/per-slot
+passthroughs (`psql`, `shell`, `logs`, `staging.{start,stop}`) still run through
+`scripts/pg-dev-local` for now; it is deleted in the last slice.
 
 ### Networking
 
@@ -267,32 +267,12 @@ make machine.shell.root   # root shell for diagnostics
 make pg.shell             # shell in the active PostgreSQL container
 ```
 
-## Export, deletion, and recovery
+## Deletion and recovery
 
-Snapshots disappear with the Apple machine. `make pg.export` writes a recovery
-tarball under the host repository's `var/` directory containing both Incus
-backends, the proxy, active-slot state, and the unmounted sparse XFS image.
-Archiving the filesystem image preserves its shared reflink extents instead of
-expanding each checkpoint into a full independent copy:
-
-```shell
-make pg.export
-
-# Restore over the current complete setup, or after rebuilding an empty
-# outer machine:
-make recreate
-make pg.import-last
-```
-
-`make pg.import-last` only reads the full-setup `pg-dev-all-*.tar.gz` archives
-produced by this version; per-container exports from the old Colima setup are
-not importable.
-
-Exports are intentionally much slower and larger than reflink checkpoints.
-Use them before deleting or recreating the outer machine. Import accepts an
-empty Incus host or a complete three-container setup and rolls back on a
-failed validation/startup; it refuses a partial setup. Keep enough free disk
-for the extracted sparse XFS image and the previous image during the swap.
+Snapshots and the XFS data trees disappear with the Apple machine. There is no
+built-in full-setup export/import; before a destructive step, dump anything you
+need over the client ports with ordinary `pg_dump` (e.g. `pg_dump -h 127.0.0.1
+-p 5442 …`) and restore it with `pg_restore` into the staging port afterward.
 
 ```shell
 make stop          # stop the persistent Apple machine; keep all data
@@ -302,11 +282,12 @@ make delete        # delete the outer machine and everything inside it
 make recreate      # delete, rebuild, and start a fresh outer machine
 ```
 
-`make delete`, `make recreate`, and `make pg.down` are destructive. Host-side
-exports under `var/` survive outer-machine deletion. If a leftover experimental
-machine from early testing exists (e.g. one created by hand named `pg`), it is
-unrelated to this setup and can be reclaimed with `container machine delete
-<name>`.
+`make delete`, `make recreate`, and `make pg.down` are destructive. Because the
+machine's root disk is a sparse image that never shrinks (see the disk-space
+trap below), `make recreate` is also the dependable way to reclaim macOS space —
+deleting the machine frees the whole image. If a leftover experimental machine
+from early testing exists (e.g. one created by hand named `pg`), it is unrelated
+to this setup and can be reclaimed with `container machine delete <name>`.
 
 ## Constraints & gotchas
 
@@ -326,15 +307,15 @@ Controls:
 - `make disk` — show macOS free space, the Apple container storage footprint,
   the guest root-disk usage, and the `.xfs` store's actual (physical) size.
 - `make disk.check` — a fail-fast pre-flight (macOS free space vs
-  `DISK_MIN_FREE_GB`, default 40 GiB) that gates `pg.up`, the staging
-  restore/reset commands, and `import-last`. Set `DISK_MIN_FREE_GB` to **at least
-  the size of the dump you're about to restore** (a restore can grow the image by
-  roughly the DB size). Note the client-side `pg_restore` itself runs outside
-  make, so this guards the step right before it, not the copy.
+  `DISK_MIN_FREE_GB`, default 40 GiB) that gates `pg.up` and the staging
+  restore/reset commands. Set `DISK_MIN_FREE_GB` to **at least the size of the
+  dump you're about to restore** (a restore can grow the image by roughly the DB
+  size). Note the client-side `pg_restore` itself runs outside make, so this
+  guards the step right before it, not the copy.
 - **Reclaim** a bloated VM disk with **`make recreate`** — deleting the machine
-  frees the entire sparse image on macOS; then rebuild and restore from a prior
-  `make pg.export`. This is the only dependable shrink today (`container system
-  prune` only touches the CLI's ~GB of image/build cache, not the root disk).
+  frees the entire sparse image on macOS; then rebuild (dump anything you need
+  first). This is the only dependable shrink today (`container system prune` only
+  touches the CLI's ~GB of image/build cache, not the root disk).
 - **Cap future growth** (strategic): relocate the bulky data onto a dedicated
   APFS volume with a quota (`diskutil apfs addVolume … -quota …`) mounted into
   the machine, so the payload can't consume the whole macOS volume. Not wired up

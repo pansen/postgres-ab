@@ -126,8 +126,8 @@ machine.exists:
 # `make disk` inspects real usage; `make disk.check` is the fail-fast guard on
 # write-heavy targets. There is no supported per-machine disk cap or compaction
 # in Apple container 1.1: the dependable reclaim is `make recreate` (delete the
-# machine → macOS frees the whole sparse image → rebuild; preserve data first
-# with `make pg.export` and restore it after with `make pg.import-last`).
+# machine → macOS frees the whole sparse image → rebuild). `recreate` wipes the
+# data trees, so dump anything you need first (e.g. pg_dump over :5442/:5443).
 
 .PHONY: disk
 disk:
@@ -327,16 +327,6 @@ pg.staging.start: machine.exists pgdevd
 	$(PG_DEV) staging.start
 	$(PGDEV) refresh
 	$(MAKE) status
-
-# ----- full export / import -----------------------------------------------
-
-.PHONY: pg.export
-pg.export: machine.exists
-	$(PG_DEV) export
-
-.PHONY: pg.import-last
-pg.import-last: disk.check machine.exists
-	$(PG_DEV) import-last
 
 # ----- destructive outer-machine lifecycle -------------------------------
 

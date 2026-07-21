@@ -507,10 +507,15 @@ in CI; XFS integration test runs on GH Actions Ubuntu (`losetup`+`mkfs.xfs`).
 `scripts/host-endpoint`. *Accept:* reboot-drift test — restart machine, forwarder
 self-heals to the new IP with no `make` step.
 
-**Slice 5 — Export/import.** Port move-aside rollback (`cmd_export`,
-`cmd_import_last`) as journaled tasks; delete `scripts/pg-dev-local`; Makefile →
-aliases/gone. *Accept:* `make pg.export` then `make recreate && make
-pg.import-last` round-trips with rollback on failure.
+**Slice 5 — Retire the script.** ~~Port export/import as journaled tasks~~ —
+**dropped**: `cmd_export`/`cmd_import_last` were never used and have been removed
+(2026-07-21), along with their helper cascade; there is no full-setup
+export/import (dump/restore over the client ports instead). What remains of
+`scripts/pg-dev-local` is the interactive/per-slot passthroughs (`psql`, `shell`,
+`logs`, `staging.{start,stop}`). Slice 5 = move those to their real transports
+(SSH/`ssh2incus` per §5.8 for interactive; `staging.start/stop` into the daemon),
+then delete the script and collapse the Makefile aliases. *Accept:* `psql`/`shell`/
+`logs`/staging lifecycle work with `scripts/pg-dev-local` gone.
 
 ---
 
