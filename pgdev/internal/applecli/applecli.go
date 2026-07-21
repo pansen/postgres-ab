@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var ipv4re = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`)
@@ -43,6 +44,34 @@ func (c *CLI) MachineIP(ctx context.Context) (string, error) {
 	}
 	// "2: eth0 inet 192.168.64.5/24 ..." → first IPv4.
 	return ipv4re.FindString(out), nil
+}
+
+var systemdStates = map[string]bool{"running": true, "degraded": true, "starting": true, "maintenance": true}
+
+// WaitReady blocks until the machine's systemd is up enough to run systemctl.
+// This clears two early-boot races at once: right after a freshly created
+// machine's first stopped→running transition Apple rejects execs with "Operation
+// not supported by device", and even once execs work the system bus isn't
+// listening yet (systemctl fails with "Failed to connect to system scope bus").
+// `systemctl is-system-running` prints a settled state word to stdout only once
+// the bus answers (even "degraded", which is this guest's steady state and exits
+// non-zero) — so a printed state word is the reliable readiness signal.
+func (c *CLI) WaitReady(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, _ := c.Run(ctx, "systemctl", "is-system-running") // ignore exit code; read stdout
+		if systemdStates[strings.TrimSpace(out)] {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("machine %s systemd not ready within %s (last: %q)", c.Machine, timeout, strings.TrimSpace(out))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // Run executes argv inside the machine as root and returns combined output. Used

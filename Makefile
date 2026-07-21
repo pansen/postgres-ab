@@ -11,6 +11,16 @@ MACHINE_MEMORY ?= 12G
 # data snapshots inside the machine's root disk.
 PG_DATA_DISK_SIZE ?= 140G
 
+# The machine's root disk (vdb) is a SPARSE image on macOS. It grows as data is
+# written inside the guest and — because Apple's container runtime does not
+# compact on discard/TRIM — effectively never shrinks. The XFS PostgreSQL store
+# lives on it, so a large restore can ratchet the Mac's free space to zero; the
+# next guest write then fails and the XFS store shuts down mid-write (EIO),
+# dropping PostgreSQL into recovery. `disk.check` refuses write-heavy targets
+# below this much free space on the macOS volume backing the VM. Set it to at
+# least the size of the dump you are about to restore. See `make disk`.
+DISK_MIN_FREE_GB ?= 40
+
 PG_DEV_SCRIPT := ./scripts/pg-dev-local
 HOST_ENDPOINT := ./scripts/host-endpoint
 PGDEV_DIR := pgdev
@@ -112,6 +122,43 @@ deploy: machine pgdevd
 machine.exists:
 	@container machine inspect $(MACHINE_NAME) >/dev/null 2>&1 || { echo "Machine '$(MACHINE_NAME)' does not exist — run 'make start' first." >&2; exit 1; }
 
+# ----- disk-space trap (the sparse VM disk grows and does not shrink) ------
+# `make disk` inspects real usage; `make disk.check` is the fail-fast guard on
+# write-heavy targets. There is no supported per-machine disk cap or compaction
+# in Apple container 1.1: the dependable reclaim is `make recreate` (delete the
+# machine → macOS frees the whole sparse image → rebuild; preserve data first
+# with `make pg.export` and restore it after with `make pg.import-last`).
+
+.PHONY: disk
+disk:
+	@echo "── macOS volume backing the Apple container VM ──"
+	@df -h "$(HOME)"
+	@echo
+	@echo "Apple container storage (physical allocation on macOS):"
+	@du -sh "$(HOME)/Library/Containers/com.apple.container" 2>/dev/null || echo "  (path not readable)"
+	@container system df 2>/dev/null || true
+	@echo
+	@echo "── guest machine root disk (vdb — sparse, grows only) ──"
+	@container machine run --name $(MACHINE_NAME) --root -- df -h / 2>/dev/null || echo "  (machine not running)"
+	@echo
+	@echo "XFS PostgreSQL store (.xfs actual blocks; logical size $(PG_DATA_DISK_SIZE)):"
+	@container machine run --name $(MACHINE_NAME) --root -- du -h /var/lib/pg-dev-local.xfs 2>/dev/null || true
+	@container machine run --name $(MACHINE_NAME) --root -- df -h /var/lib/pg-dev-local 2>/dev/null \
+		|| echo "  (XFS store unavailable — if it shut down after a full disk, remount with 'make start')"
+
+# Fast pre-flight for write-heavy targets: no guest calls, just macOS free space.
+.PHONY: disk.check
+disk.check:
+	@avail=$$(df -g "$(HOME)" | awk 'NR==2 {print $$4}'); \
+	if [ "$${avail:-0}" -lt "$(DISK_MIN_FREE_GB)" ]; then \
+		echo "ERROR: only $${avail} GiB free on the macOS volume backing the VM (need >= $(DISK_MIN_FREE_GB) GiB)." >&2; \
+		echo "       The VM root disk is a sparse image that only grows; a large restore can fill" >&2; \
+		echo "       macOS and shut the guest PostgreSQL store down mid-write. Free space on macOS," >&2; \
+		echo "       reclaim with 'make recreate', or lower DISK_MIN_FREE_GB. See 'make disk'." >&2; \
+		exit 1; \
+	fi; \
+	echo "==> macOS free space OK ($${avail} GiB >= $(DISK_MIN_FREE_GB) GiB)."
+
 # Build both Go binaries on the host, stamped from the same git state: the
 # in-machine daemon (pgdev/bin/pgdevd, linux/arm64, delivered via the home-mount
 # and installed by `pgdev agent deploy`) and the host CLI (pgdev/bin/pgdev,
@@ -186,7 +233,7 @@ system.stop: stop
 # ----- lifecycle ----------------------------------------------------------
 
 .PHONY: pg.up
-pg.up: deploy
+pg.up: disk.check deploy
 	$(PGDEV) up
 
 .PHONY: pg.down
@@ -259,15 +306,15 @@ pg.staging.snapshot: machine.exists pgdevd
 	$(PGDEV) staging snapshot $(name) $(if $(force),--force,)
 
 .PHONY: pg.staging.restore
-pg.staging.restore: machine.exists pgdevd
+pg.staging.restore: disk.check machine.exists pgdevd
 	$(PGDEV) staging restore $(name) $(if $(force),--force,)
 
 .PHONY: pg.staging.restore-last
-pg.staging.restore-last: machine.exists pgdevd
+pg.staging.restore-last: disk.check machine.exists pgdevd
 	$(PGDEV) staging restore-last $(if $(force),--force,)
 
 .PHONY: pg.staging.reset
-pg.staging.reset: machine.exists pgdevd
+pg.staging.reset: disk.check machine.exists pgdevd
 	$(PGDEV) staging reset $(if $(force),--force,)
 
 .PHONY: pg.staging.stop
@@ -288,16 +335,28 @@ pg.export: machine.exists
 	$(PG_DEV) export
 
 .PHONY: pg.import-last
-pg.import-last: machine.exists
+pg.import-last: disk.check machine.exists
 	$(PG_DEV) import-last
 
 # ----- destructive outer-machine lifecycle -------------------------------
 
+# Apple 1.1 frequently returns an XPC timeout when deleting a RUNNING machine
+# (especially one with wedged I/O), even though the delete actually completes and
+# the apiserver then drops out. So: stop first (the documented workaround), then
+# tolerate the delete error and judge success by whether the machine is actually
+# gone — not by the exit code.
 .PHONY: delete
 delete: system.start
 	@if container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
-		container machine delete $(MACHINE_NAME); \
+		echo "==> Stopping $(MACHINE_NAME) before delete..."; \
+		container machine stop $(MACHINE_NAME) 2>/dev/null || true; \
+		container machine delete $(MACHINE_NAME) || true; \
 	fi
+	@if container machine inspect $(MACHINE_NAME) >/dev/null 2>&1; then \
+		echo "ERROR: $(MACHINE_NAME) is still present after delete. The Apple apiserver may be wedged — retry, or reset it with 'make system.stop && make system.start'." >&2; \
+		exit 1; \
+	fi
+	@echo "==> $(MACHINE_NAME) deleted (macOS reclaims its sparse disk image)."
 
 .PHONY: recreate
 recreate: delete start

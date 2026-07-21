@@ -310,6 +310,36 @@ unrelated to this setup and can be reclaimed with `container machine delete
 
 ## Constraints & gotchas
 
+**Disk space — the sparse-VM-disk trap (important):** the Apple container
+machine's root disk (`vdb`) is a **sparse image on macOS that only grows**.
+Blocks written inside the guest (the XFS PostgreSQL store, `pg_restore` output,
+Incus image layers) are added to the macOS-side image and are **not returned to
+macOS when you delete them** — Apple's runtime does not compact the disk on
+discard/TRIM, and there is no supported per-machine size cap. So a large restore
+can silently ratchet your Mac's free space to zero. When the next guest write
+then fails, the loop-backed XFS store shuts down mid-write with an I/O error and
+PostgreSQL drops into recovery (you'll see `Input/output error` on data files and
+`XFS … Filesystem has been shut down`).
+
+Controls:
+
+- `make disk` — show macOS free space, the Apple container storage footprint,
+  the guest root-disk usage, and the `.xfs` store's actual (physical) size.
+- `make disk.check` — a fail-fast pre-flight (macOS free space vs
+  `DISK_MIN_FREE_GB`, default 40 GiB) that gates `pg.up`, the staging
+  restore/reset commands, and `import-last`. Set `DISK_MIN_FREE_GB` to **at least
+  the size of the dump you're about to restore** (a restore can grow the image by
+  roughly the DB size). Note the client-side `pg_restore` itself runs outside
+  make, so this guards the step right before it, not the copy.
+- **Reclaim** a bloated VM disk with **`make recreate`** — deleting the machine
+  frees the entire sparse image on macOS; then rebuild and restore from a prior
+  `make pg.export`. This is the only dependable shrink today (`container system
+  prune` only touches the CLI's ~GB of image/build cache, not the root disk).
+- **Cap future growth** (strategic): relocate the bulky data onto a dedicated
+  APFS volume with a quota (`diskutil apfs addVolume … -quota …`) mounted into
+  the machine, so the payload can't consume the whole macOS volume. Not wired up
+  here yet — see `issues/`.
+
 **Repository location:** The repository must live under your macOS home directory.
 The Apple container machine only mounts `$HOME` (home-mount), and every make
 target executes the repo's scripts inside the machine via that mount. A repo

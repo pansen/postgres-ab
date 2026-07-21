@@ -25,7 +25,11 @@ Wants=incus.service
 [Service]
 Type=simple
 EnvironmentFile=-%s
-ExecStartPre=/usr/local/bin/pgdevd bootstrap
+# Non-fatal (the '-'): bootstrap still creates/mounts the store and topology on
+# success, but if it can't (e.g. a full disk shut the XFS store down), the daemon
+# still starts so 'pgdev status' stays usable to diagnose, instead of the whole
+# unit failing and bricking 'make start'.
+ExecStartPre=-/usr/local/bin/pgdevd bootstrap
 ExecStart=/usr/local/bin/pgdevd serve
 Restart=on-failure
 RestartSec=2
@@ -98,6 +102,20 @@ func (a *app) deploy(ctx context.Context) error {
 	unitPath := filepath.Join(a.cfg.RepoRoot, "var", "pgdevd.service")
 	if err := os.WriteFile(unitPath, []byte(fmt.Sprintf(unitTemplate, envPath)), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", unitPath, err)
+	}
+
+	// A freshly created machine may still be finishing its first boot; wait until
+	// systemd is up before installing/enabling, or Apple rejects the exec
+	// ("Operation not supported by device") or systemctl can't reach the bus.
+	fmt.Println("==> Waiting for the machine to be ready...")
+	if err := a.apple.WaitReady(ctx, 120*time.Second); err != nil {
+		return err
+	}
+	// A (re)created machine gets a fresh DHCP lease, so the cached var/machine-ip
+	// can be stale. Refresh it from the live address before the handshake dials
+	// the daemon (this also re-points the endpoint forwarder at the new IP).
+	if ip, err := a.apple.MachineIP(ctx); err == nil && ip != "" {
+		a.writeMachineIPFile(ip)
 	}
 
 	fmt.Println("==> Installing pgdevd into the machine...")
