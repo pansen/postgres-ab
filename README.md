@@ -197,7 +197,7 @@ opposite staging dataset.
 ```shell
 make start
 make pg.status
-make pg.psql
+psql -h 127.0.0.1 -p 5442 -d "$PG_DB"
 make pg.logs
 ```
 

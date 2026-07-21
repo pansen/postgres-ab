@@ -8,17 +8,12 @@ set -Eeuo pipefail
 # provisioning, status, promote, refresh, snapshots, snapshot/restore, endpoint
 # and the machine bootstrap are the `pgdev` host CLI talking to the in-machine
 # `pgdevd` daemon. What remains here is the handful of interactive / per-slot
-# passthroughs that still ride `incus exec` — psql, shell, logs (active +
-# staging) and staging start/stop — which retire when this script is deleted
-# (Slice 5).
+# passthroughs that still ride `incus exec` — shell, logs (active + staging)
+# and staging start/stop — which retire when this script is deleted (Slice 5).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
-
-PG_USER="${PG_USER:?PG_USER must be set in .env}"
-PG_DB="${PG_DB:?PG_DB must be set in .env}"
-PG_PASSWORD="${PG_PASSWORD:?PG_PASSWORD must be set in .env}"
 
 BACKEND_PREFIX=pg-dev
 BACKEND_A="${BACKEND_PREFIX}-a"
@@ -98,15 +93,7 @@ cmd_staging_stop()         { incus stop "$(_c_staging)"; }
 # reliably auto-start the unit); the binary waits for readiness.
 cmd_staging_start()        { _pgdevd start --slot "$(_slot_for_container "$(_c_staging)")"; }
 
-# Shell / psql / logs, per slot.
-_psql() {
-    local container="$1"; shift
-    incus exec "$container" -- env PGPASSWORD="$PG_PASSWORD" \
-        psql -U "$PG_USER" "$PG_DB" "$@"
-}
-cmd_psql()         { _psql "$(_c_active)"  "$@"; }
-cmd_staging_psql() { _psql "$(_c_staging)" "$@"; }
-
+# Shell / logs, per slot.
 cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
 cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
 
@@ -128,12 +115,10 @@ staging lifecycle — the rest retires together with the script in a later slice
 (see issues/0001).
 
 Active slot (whatever is currently active):
-  psql [args]                     psql via incus exec into active backend
   shell                           bash into active backend
   logs                            tail postgres logs on active backend
 
 Staging slot (the other one):
-  staging.psql [args]
   staging.shell
   staging.logs
   staging.stop                    stop staging backend
@@ -148,11 +133,9 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-    psql)           shift; cmd_psql "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
 
-    staging.psql)         shift; cmd_staging_psql "$@" ;;
     staging.shell)        shift; cmd_staging_shell "$@" ;;
     staging.logs)         shift; cmd_staging_logs "$@" ;;
     staging.stop)         shift; cmd_staging_stop "$@" ;;

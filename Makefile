@@ -255,10 +255,6 @@ pg.refresh: machine.exists pgdevd
 
 # ----- active backend -----------------------------------------------------
 
-.PHONY: pg.psql
-pg.psql: machine.exists
-	@$(call PG_DEV_AUTO,psql)
-
 .PHONY: pg.shell
 pg.shell: machine.exists
 	@$(call PG_DEV_AUTO,shell)
@@ -288,10 +284,6 @@ pg.snapshots: machine.exists pgdevd
 	$(PGDEV) snapshots
 
 # ----- staging backend ----------------------------------------------------
-
-.PHONY: pg.staging.psql
-pg.staging.psql: machine.exists
-	@$(call PG_DEV_AUTO,staging.psql)
 
 .PHONY: pg.staging.shell
 pg.staging.shell: machine.exists
