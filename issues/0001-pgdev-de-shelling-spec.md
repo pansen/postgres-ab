@@ -485,6 +485,24 @@ in CI; XFS integration test runs on GH Actions Ubuntu (`losetup`+`mkfs.xfs`).
 `incus publish` (removes curl|gpg heredoc, minutes → seconds). *Accept:*
 `make pg.up`/`pg.down` from empty Incus host reproduce today's result.
 
+- **Action — boot-ordering hardening (make PG depend on its storage, both
+  levels).** Today the runtime code (Incus adapter) papers over storage-not-ready
+  races with wait/retry/restart loops. Fix it at the source in provisioning:
+  1. *Container level:* bake a drop-in on `postgresql@17-main`,
+     `RequiresMountsFor=/var/lib/postgresql`, so PostgreSQL waits for the Incus
+     idmapped disk-device mount to appear (systemd tracks it as a passive
+     `var-lib-postgresql.mount`; the packaged unit doesn't declare this). Closes
+     the "PG auto-starts before the data dir is mounted" boot race.
+  2. *Outer-machine level:* order `incus.service`
+     `After=/var/lib/pg-dev-local` (its XFS loop mount) so a bare machine reboot
+     can't start `incusd` before the backends' disk-device *sources* exist. The
+     bigger reboot-safety gap; today only `apple-machine-init` enforces this
+     order imperatively.
+  Once trusted, the adapter's `waitSystemd`/nudge/container-restart recovery in
+  `StartContainerAndWait` can be simplified to a plain readiness wait.
+  *Accept:* container reboot (`incus restart pg-dev-a`) brings PG up with no
+  adapter nudging; outer-machine reboot leaves a working setup without `make start`.
+
 **Slice 4 — Endpoint.** `internal/forward` + `pgdev endpoint`; delete
 `scripts/host-endpoint`. *Accept:* reboot-drift test — restart machine, forwarder
 self-heals to the new IP with no `make` step.
