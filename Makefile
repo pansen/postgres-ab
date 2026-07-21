@@ -325,7 +325,7 @@ pg.staging.stop: machine.exists
 .PHONY: pg.staging.start
 pg.staging.start: machine.exists pgdevd
 	$(PG_DEV) staging.start
-	$(PG_DEV) refresh
+	$(PGDEV) refresh
 	$(MAKE) status
 
 # ----- full export / import -----------------------------------------------

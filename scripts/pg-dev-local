@@ -134,26 +134,6 @@ _require_data_store() {
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-_proxy_ip() {
-    # The nested incusbr0 addresses are not routed to macOS. Proxy devices
-    # therefore bind on the Incus host, which is this Apple machine's eth0.
-    if [[ -n "${PG_MACHINE_IP:-}" ]]; then
-        echo "$PG_MACHINE_IP"
-        return
-    fi
-    # `|| true`: don't let a missing eth0 (e.g. no interface yet) trip the ERR
-    # trap — callers already fall back to "?" / state text on empty output.
-    ip -4 -o addr show dev eth0 2>/dev/null \
-        | awk '{ split($4, a, "/"); print a[1]; exit }' || true
-}
-
-# The host macOS clients actually connect to. The machine IP from _proxy_ip
-# drifts and can't be pinned, so a socat forwarder on the Mac (scripts/
-# host-endpoint, `make endpoint.install`) listens on loopback and relays to
-# whatever the machine IP currently is. That makes 127.0.0.1 a permanent
-# endpoint. Set PG_CLIENT_HOST to address the machine IP directly instead.
-_client_host() { echo "${PG_CLIENT_HOST:-127.0.0.1}"; }
-
 # RUNNING / STOPPED / FROZEN / … — empty if the container doesn't exist.
 _state() {
     incus list "$1" --format csv -c s 2>/dev/null | head -n1 || true
@@ -256,231 +236,9 @@ _set_forwards() {
 # Provisioning
 # ---------------------------------------------------------------------------
 
-# Block until <container> reports an IPv4 on eth0 — any address, or the
-# specific <expected-ip> when given (e.g. right after pinning a static lease,
-# where only that exact address means the new lease actually took hold).
-_wait_for_ipv4() {
-    local container="$1" expected="${2:-}"
-    if [[ -n "$expected" ]]; then
-        until incus list "$container" --format csv -c 4 | grep -q "$expected"; do
-            sleep 1
-        done
-    else
-        until incus list "$container" --format csv -c 4 | grep -qE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; do
-            sleep 2
-        done
-    fi
-}
-
-_provision_backend() {
-    local container="$1" ip="$2"
-    local data_dir
-    data_dir=$(_data_current "$container")
-
-    echo "==> Launching $container from $IMAGE..."
-    echo "    The first backend downloads and unpacks the Ubuntu image; later launches reuse it."
-    # `incus launch` accepts optional YAML configuration on stdin. The outer
-    # Apple `container machine run --interactive` keeps stdin open, so without
-    # this redirect Incus waits forever before it creates an operation.
-    incus launch --verbose "$IMAGE" "$container" </dev/null
-
-    echo "==> Attaching XFS-reflinked PostgreSQL data at $data_dir..."
-    mkdir -p "$data_dir"
-    incus exec "$container" -- mkdir -p /var/lib/postgresql
-    incus config device add "$container" pgdata disk \
-        source="$data_dir" path=/var/lib/postgresql shift=true
-
-    echo "==> Waiting for IPv4 on $container..."
-    _wait_for_ipv4 "$container"
-
-    echo "==> Pinning $container eth0 → $ip (static lease → stable proxy target)..."
-    incus config device override "$container" eth0 ipv4.address="$ip"
-    incus restart "$container"
-    _wait_for_ipv4 "$container" "$ip"
-
-    echo "==> Installing PostgreSQL 17 on $container..."
-    incus exec --verbose "$container" -- bash <<'SETUP'
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-apt-get update -q
-apt-get install -y curl gnupg lsb-release
-
-curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-    | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-    > /etc/apt/sources.list.d/pgdg.list
-apt-get update -q
-apt-get install -y --no-install-recommends postgresql-17
-
-mkdir -p /etc/postgresql/17/main/conf.d
-cat > /etc/postgresql/17/main/conf.d/99-dev.conf <<'PGCONF'
-listen_addresses = '*'
-dynamic_shared_memory_type = posix
-
-shared_buffers = 2GB
-effective_cache_size = 6GB
-work_mem = 32MB
-maintenance_work_mem = 1GB
-max_parallel_maintenance_workers = 4
-
-max_wal_size = 16GB
-checkpoint_timeout = 30min
-checkpoint_completion_target = 0.8
-wal_level = minimal
-max_wal_senders = 0
-
-fsync = off
-full_page_writes = off
-synchronous_commit = off
-autovacuum = off
-
-log_destination = stderr
-logging_collector = off
-log_min_duration_statement = 0
-log_checkpoints = on
-log_lock_waits = on
-deadlock_timeout = 100
-debug_pretty_print = on
-PGCONF
-
-cat > /etc/postgresql/17/main/pg_hba.conf <<'PGHBA'
-local   all   postgres                peer
-local   all   all                     md5
-host    all   all   0.0.0.0/0         scram-sha-256
-host    all   all   ::/0              scram-sha-256
-PGHBA
-
-systemctl restart postgresql@17-main
-SETUP
-
-    echo "==> Creating role '$PG_USER' and database '$PG_DB' on $container..."
-    incus exec --verbose "$container" -- su -c psql postgres <<SQL
-CREATE ROLE "$PG_USER" WITH LOGIN PASSWORD '$PG_PASSWORD' SUPERUSER;
-CREATE DATABASE "$PG_DB" OWNER "$PG_USER";
-SQL
-
-    echo "==> Snapshotting $container @ initial..."
-    _snapshot "$container" initial
-}
-
-# pg-proxy is a bare container: no packages, no config. It exists only to own
-# the two proxy devices (added by _set_forwards). With bind=host, both their
-# listeners and backend connections live in the Apple machine host namespace.
-_provision_proxy() {
-    echo "==> Launching $PROXY from the cached Ubuntu image (bare proxy container)..."
-    incus launch --verbose "$IMAGE" "$PROXY" </dev/null
-
-    echo "==> Waiting for IPv4 on $PROXY..."
-    _wait_for_ipv4 "$PROXY"
-}
-
 # ---------------------------------------------------------------------------
 # Lifecycle commands
 # ---------------------------------------------------------------------------
-
-cmd_up() {
-    _require_data_store
-
-    for c in "$BACKEND_A" "$BACKEND_B" "$PROXY"; do
-        if incus info "$c" > /dev/null 2>&1; then
-            echo "Container '$c' already exists — run '$0 down' first."
-            exit 1
-        fi
-    done
-
-    local backend_a_ip backend_b_ip
-    backend_a_ip=$(_pick_backend_a_ip)
-    backend_b_ip=$(_pick_backend_b_ip)
-    echo "==> Static backend IPs: $BACKEND_A=$backend_a_ip  $BACKEND_B=$backend_b_ip"
-
-    _provision_backend "$BACKEND_A" "$backend_a_ip"
-    _provision_backend "$BACKEND_B" "$backend_b_ip"
-    _provision_proxy
-
-    _set_active a
-    _set_forwards
-
-    echo
-    echo "==> pg-dev ready."
-    echo
-    cmd_endpoint
-}
-
-# Best-effort teardown: an unmounted data store or a container that refuses
-# to delete must not stop the rest of the cleanup from proceeding. Deleting
-# containers is tried for all three regardless of individual failures; the
-# XFS data trees are only removed once every container is confirmed gone AND
-# the store is mounted from the expected XFS image (_data_store_mounted, not a
-# bare mountpoint check — removing them while unmounted, or while some other
-# filesystem is mounted at $DATA_ROOT, could hollow out the wrong data). The
-# active-slot pointer is likewise kept if any container survived, so a failed
-# teardown doesn't silently lose which slot was active.
-cmd_down() {
-    local c slot path failed=0
-    for c in "$PROXY" "$BACKEND_A" "$BACKEND_B"; do
-        if incus info "$c" >/dev/null 2>&1; then
-            if ! incus delete "$c" --force; then
-                echo "WARNING: failed to delete $c; continuing with the rest." >&2
-                failed=1
-            fi
-        fi
-    done
-
-    if (( failed != 0 )); then
-        echo "ERROR: one or more containers could not be deleted; refusing to remove their backing data and leaving the active-slot pointer in place." >&2
-        return 1
-    fi
-
-    if _data_store_mounted; then
-        for slot in a b; do
-            path="$DATA_ROOT/$slot"
-            [[ "$path" == "$DATA_ROOT/"[ab] ]] || {
-                echo "ERROR: refusing to remove unexpected data path '$path'" >&2
-                exit 1
-            }
-            rm -rf -- "$path"
-        done
-    else
-        echo "WARNING: $DATA_ROOT is not mounted from the XFS data store; the data trees were left alone." >&2
-    fi
-
-    rm -f "$STATE_FILE"
-}
-
-_print_psql_command() {
-    local label="$1" ip="$2" port="$3"
-    printf '%spsql --host=%q --port=%q --username=%q --dbname=%q\n' \
-        "$label" "$ip" "$port" "$PG_USER" "$PG_DB"
-}
-
-cmd_endpoint() {
-    if [[ "$(_state "$PROXY")" != "RUNNING" ]]; then
-        echo "ERROR: $PROXY is not running — 'make start' (then 'make pg.up' if it was never provisioned)." >&2
-        exit 1
-    fi
-    local host machine_ip
-    host=$(_client_host)
-    machine_ip=$(_proxy_ip)
-    cat <<EOF
-active   host=$host port=$CLIENT_ACTIVE_PORT dbname=$PG_DB   (current data)
-staging  host=$host port=$CLIENT_STAGING_PORT dbname=$PG_DB   (import target / opposite of active)
-
-.pgpass lines:
-$host:$CLIENT_ACTIVE_PORT:*:$PG_USER:$PG_PASSWORD
-$host:$CLIENT_STAGING_PORT:*:$PG_USER:$PG_PASSWORD
-EOF
-
-    echo
-    echo "psql commands:"
-    _print_psql_command "  active:  " "$host" "$CLIENT_ACTIVE_PORT"
-    _print_psql_command "  staging: " "$host" "$CLIENT_STAGING_PORT"
-    if [[ "$host" == 127.0.0.1 ]]; then
-        echo
-        echo "note: 127.0.0.1 needs the host forwarder ('make endpoint.install'); it"
-        echo "      relays to the machine IP ${machine_ip:-?}, which may drift on reboot."
-    fi
-}
 
 # ---------------------------------------------------------------------------
 # Per-slot ops
@@ -551,30 +309,6 @@ _pgdevd() {
     PG_BACKEND_A_IP="${PG_BACKEND_A_IP:-}" \
     PG_BACKEND_B_IP="${PG_BACKEND_B_IP:-}" \
         "$PGDEVD_BIN" "$@"
-}
-
-_snapshot() {
-    local container="$1" name="$2" force="${3:-}"
-    local slot; slot=$(_slot_for_container "$container")
-    local args=(snapshot --slot "$slot" --name "$name")
-    [[ -n "$force" ]] && args+=("$force")
-    _pgdevd "${args[@]}"
-}
-
-_restore() {
-    local container="$1" name="$2" force="${3:-}"
-    local slot; slot=$(_slot_for_container "$container")
-    local args=(restore --slot "$slot" --name "$name")
-    [[ -n "$force" ]] && args+=("$force")
-    _pgdevd "${args[@]}"
-}
-
-_restore_last() {
-    local container="$1" force="${2:-}"
-    local slot; slot=$(_slot_for_container "$container")
-    local args=(restore-last --slot "$slot")
-    [[ -n "$force" ]] && args+=("$force")
-    _pgdevd "${args[@]}"
 }
 
 cmd_staging_stop()         { incus stop "$(_c_staging)"; }
@@ -1082,16 +816,11 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <command> [args]
 
-NOTE: status, promote, refresh, ip, snapshots and the snapshot/restore commands
-moved to the host 'pgdev' CLI (which talks HTTP to the in-machine pgdevd daemon).
-This script now covers only provisioning, interactive access, staging lifecycle
-and full export/import — the rest retires together with the script in a later
-slice (see issues/0001).
-
-Lifecycle:
-  up                              provision pg-dev-a, pg-dev-b, pg-proxy
-  down                            delete containers and both XFS data trees
-  endpoint                        print endpoints, .pgpass, and psql commands
+NOTE: lifecycle (up/down), status, promote, refresh, ip, endpoint, snapshots and
+the snapshot/restore commands moved to the host 'pgdev' CLI (which talks HTTP to
+the in-machine pgdevd daemon). This script now covers only interactive access,
+staging lifecycle and full export/import — the rest retires together with the
+script in a later slice (see issues/0001).
 
 Active slot (whatever is currently active):
   psql [args]                     psql via incus exec into active backend
@@ -1112,16 +841,12 @@ EOF
 }
 
 case "${1:-}" in
-    up|down|staging.stop|staging.start|export|import-last)
+    staging.stop|staging.start|export|import-last)
         _acquire_mutation_lock
         ;;
 esac
 
 case "${1:-}" in
-    up)             shift; cmd_up "$@" ;;
-    down)           shift; cmd_down "$@" ;;
-    endpoint)       shift; cmd_endpoint "$@" ;;
-
     psql)           shift; cmd_psql "$@" ;;
     shell)          shift; cmd_shell "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
