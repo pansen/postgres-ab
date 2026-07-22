@@ -50,6 +50,13 @@ macOS client ─ 127.0.0.1:5442 (active) / :5443 (staging)
        own XFS reflink store        own XFS reflink store
 ```
 
+> **Note:** the host forwarder (`internal/forward`) does not exist yet — it is
+> Slice 4 of `issues/0001` and is unbuilt. Today the client ports are served by
+> `make endpoint.install` (a loopback forwarder) and `promote` re-points the
+> *in-machine* Incus proxy devices (`internal/daemon` + `internal/reconcile`).
+> The diagram and the `promote` bullet below describe the proposed target state,
+> not the current code.
+
 - **Active pointer** (host-side, `var/active-machine`) decides which machine is
   active (behind `:5442`) and which is staging (`:5443`).
 - **`promote`** = flip the pointer and re-point the two host-forwarder targets.
@@ -83,10 +90,10 @@ macOS client ─ 127.0.0.1:5442 (active) / :5443 (staging)
   PostgreSQL can be baked into the **machine image** (`Dockerfile.machine`), so
   provisioning is "attach store + create cluster + role/db" — no
   `incus publish` / golden-container dance (Slice-3 §Golden becomes moot).
-- **Snapshots on the home-mount are reclaimable.** If exports (and optionally the
-  snapshot store) live on the home-mount (macOS APFS, persistent across a machine
-  nuke), they are ordinary files you can delete to free Mac space directly — no
-  sparse-file trap for that data.
+- **Snapshots on the home-mount are reclaimable.** If the snapshot store lives on
+  the home-mount (macOS APFS, persistent across a machine nuke), its files are
+  ordinary files you can delete to free Mac space directly — no sparse-file trap
+  for that data.
 
 ---
 
@@ -161,15 +168,16 @@ Incus proxy/networking machinery (much of Slices 2–4) **shrinks or disappears*
    staging recreated per import (simpler, but promote semantics differ)?
 2. **Do we keep in-machine reflink snapshots at all**, or is a slot just "current
    data + hard-reset"? (Keeping them preserves cheap intra-cycle rollback.)
-3. **Where do snapshots/exports live** so they survive a nuke — home-mount
+3. **Where does the snapshot store live** so it survives a nuke — home-mount
    (reclaimable APFS) or accept loss on hard-reset?
 4. **Per-machine resource sizing** that fits two machines on the target Mac.
 5. **Golden image**: keep per-machine, or bake PG into `Dockerfile.machine`.
 6. **Concurrency smoke test**: two machines up + interleaved lifecycle execs —
    does Apple 1.1 stay stable?
 7. **Sequencing vs Slices 4–5**: this partly supersedes them (no proxy →
-   forwarder tracks two IPs; export/import gains a "reclaim by recreate" path).
-   Adopt now and re-scope 4–5, or finish 4–5 on one machine first?
+   forwarder tracks two IPs; the `pg_restore`-into-staging loop gains a "reclaim
+   by recreate" path). Adopt now and re-scope 4–5, or finish 4–5 on one machine
+   first?
 
 ---
 
