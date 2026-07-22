@@ -1,11 +1,96 @@
 # Spec 0002 — Two Apple machines: make `reset` reclaim macOS disk
 
-Status: proposed (RFC — decide before building) · Owner: TBD · Relates to:
-`issues/0001-pgdev-de-shelling-spec.md`, memory `apple-vm-disk-trap`.
+Status: **adopted, scope refined** (2026-07-22) · Owner: andi · Branch:
+`chore/andi/separate_machines` · Relates to:
+`issues/0001-pgdev-de-shelling-spec.md`, memory `apple-vm-disk-trap`,
+`apple-container-cli-quirks`.
 
-This is a design proposal, not yet an implementation plan. It captures the idea,
-why it works, what it costs, and the open decisions — so we can decide whether to
-adopt it before writing slices.
+This started as a design proposal (§1–§8 below, kept for rationale). It is now
+**adopted with a deliberately minimal scope** — see **§0 Decisions & current
+state** for what a new session needs, then read §1–§4 for the "why".
+
+---
+
+## 0. Decisions & current state (read this first)
+
+### 0.1 Adopted scope — minimal, conservative, NOT a topology rewrite
+
+Everything that exists today stays as-is in behavior: **Incus per backend**, the
+reflink snapshot/restore engine (`store`/`ops`/`task`/`pg` packages), `promote`
+semantics, and the client contract (`127.0.0.1:5442` active / `:5443` staging)
+are all **unchanged**.
+
+- **The only structural change:** each backend moves from sharing one machine
+  (`vpg`, today: two backends `pg-dev-a`/`pg-dev-b` + a `pg-proxy` container in
+  one machine) to **owning its own Apple machine** — `vpg-a` hosts backend `a`,
+  `vpg-b` hosts backend `b`, each with its own Incus daemon + one PG backend on
+  its own XFS reflink store.
+- **The only new behavior:** `make pg.staging.rebuild` = delete + recreate **only
+  the staging machine** (reclaiming its grown sparse `vdb` on macOS), then
+  re-provision that one backend. **The active machine is never touched.** Today
+  the only way to reclaim the sparse disk is `make recreate`, which nukes *both*
+  databases and loses the A/B benefit; separation lets you reclaim staging alone
+  while active keeps running.
+- **Physical consequences of separation that DO force change:** the in-machine
+  `pg-proxy` fronting both backends can't span two VMs, so active/staging routing
+  moves to the **host forwarder** (`:5442`→active machine, `:5443`→staging
+  machine); `promote` becomes a **host pointer-flip + forwarder re-point**; each
+  machine exposes its one backend on its own `eth0`.
+
+### 0.2 Open decisions from §7 — resolved
+
+1. **Symmetric-alternating** (both machines swap roles on promote, both
+   periodically emptied). Not the asymmetric one-ephemeral-staging variant.
+2. **Keep in-machine reflink snapshots** — the Slice 1–3 engine is kept per
+   machine; soft reset (reflink) stays the day-to-day default, hard reset
+   (machine recreate) is the reclaim tier.
+3. Snapshot-store location (home-mount vs accept-loss-on-nuke): **still open**,
+   low priority — a hard reset intentionally discards staging snapshots.
+4. **Per-machine memory is configurable** (`MACHINE_MEMORY` today is `12G`; two
+   machines must each drop, e.g. 6–8G). The 2× RAM concern in §4 is **dismissed**
+   as a temporary loading-phase cost.
+5. Golden image (keep per-machine vs bake PG into `Dockerfile.machine`): **still
+   open**, decide during the daemon slice.
+6. **Concurrency smoke test: this was Slice 0 — PASSED 2026-07-22** (see §0.3).
+7. Sequencing: adopt now; the host forwarder (Slice 4 of 0001) is pulled in
+   because routing must move host-side.
+
+Build with best practices, tests alongside code, and cheaper subagents where
+feasible; a Fable subagent serves as architect/second-opinion.
+
+### 0.3 Implementation state & next step
+
+- **Slice 0 — concurrency smoke test (the gate before any refactor). ✅ PASSED
+  2026-07-22.** Proved the load-bearing assumption: deleting/recreating **one**
+  Apple machine must not disturb a **sibling** machine nor wedge the shared
+  apiserver (Apple 1.1's control plane is fragile — see
+  `apple-container-cli-quirks`). `scripts/two-machine-smoke.sh` ran ITERS=5:
+  `vpg-smoke-a` survived all 5 delete/recreate cycles of `vpg-smoke-b`, the
+  apiserver stayed responsive throughout, both throwaways were cleaned up, and the
+  real `vpg` (stopped) was left untouched. Free space returned to baseline (62
+  GiB). The script refuses to touch any non-`vpg-smoke-*` name, so it can never
+  delete a real `vpg`. Still **untracked** in git.
+
+  Recovery note: getting here first required a userspace reboot — the Apple
+  apiserver was wedged with an orphaned launchd Mach endpoint (`launchctl
+  bootstrap` → EIO); only a reboot clears it (storage survives). See memory
+  `apple-apiserver-wedged-recovery`. Also fixed a latent smoke-script bug: the
+  "vpg untouched" assertion hard-coded `*running*` but the real `vpg` is
+  `stopped`, so it now compares to the recorded baseline state instead.
+
+  **To re-run it:**
+  ```
+  make machine.image          # starts the apiserver + builds local/pg-incus-machine:26.04
+  ./scripts/two-machine-smoke.sh   # ITERS=5 by default; SMOKE_CPUS/SMOKE_MEMORY overridable
+  ```
+
+- **Slices 1+ (in progress):** the code changes sketched in §5 — `internal/config`
+  two machine names, shrink `blueprint`/`reconcile`, `applecli` machine lifecycle,
+  host forwarder tracking two drifting IPs, one-backend-per-`pgdevd`, and the
+  `cmd/pgdev` promote/rebuild wiring. A Fable architect is producing the detailed
+  slice-by-slice plan; the existing `vpg` machine + its data must keep working
+  during migration (`vpg-a`/`vpg-b` coexist with `vpg` during dev — do not purge
+  `vpg` prematurely).
 
 ---
 
@@ -162,6 +247,11 @@ Incus proxy/networking machinery (much of Slices 2–4) **shrinks or disappears*
 ---
 
 ## 7. Open decisions (resolve before slicing)
+
+> **Resolved 2026-07-22 — see §0.2.** Kept here as the original framing. Short
+> version: symmetric-alternating; keep reflink snapshots; per-machine memory
+> configurable; concurrency smoke test is Slice 0 (in progress). Items 3 (snapshot
+> store location) and 5 (golden image) remain open, both low-priority.
 
 1. **Symmetric-alternating vs asymmetric** roles: two machines that swap on
    promote (both periodically emptied) — or one long-lived active + one ephemeral
