@@ -99,7 +99,14 @@ func (o *Ops) buildSnapshot(slot, name string, replaced bool) task.Task {
 		},
 		{
 			Name: "stage-reflink-clone",
-			Do:   func(ctx context.Context) error { return o.Store.StageClone(ctx, current, staging) },
+			Do: func(ctx context.Context) error {
+				if err := o.Store.StageClone(ctx, current, staging); err != nil {
+					return err
+				}
+				// cp -a preserved the live data dir's mtime; stamp the snapshot with
+				// its real creation time so List/After/Last order by when it was taken.
+				return store.TouchNow(staging)
+			},
 			Undo: func(ctx context.Context) error { return store.RemoveAll(staging) },
 		},
 	}

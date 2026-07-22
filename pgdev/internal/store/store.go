@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"time"
 )
 
 // Store is rooted at the XFS mount (e.g. /var/lib/pg-dev-local).
@@ -70,14 +71,19 @@ func (s *Store) RequireMounted() error {
 
 // ----- snapshot metadata ---------------------------------------------------
 
-// Snapshot describes one checkpoint directory, ordered by modification time
-// (touched only after a successful copy, so it is reliable ordering metadata).
+// Snapshot describes one checkpoint directory, ordered by modification time. The
+// snapshot's mtime is stamped to "now" at creation (see TouchNow) — the reflink
+// clone that builds it copies the live data dir with `cp -a`, which would
+// otherwise preserve the SOURCE's mtime and make every snapshot share the PGDATA
+// top-dir's timestamp — so it is reliable creation-order metadata.
 type Snapshot struct {
 	Name    string
 	ModUnix int64
 }
 
-// List returns a slot's snapshots in creation order (oldest first).
+// List returns a slot's snapshots in creation order (oldest first). It sorts on
+// the full-resolution mtime (not the truncated ModUnix) so two snapshots taken
+// in the same wall-clock second still order deterministically.
 func (s *Store) List(slot string) ([]Snapshot, error) {
 	entries, err := os.ReadDir(s.SnapshotsDir(slot))
 	if err != nil {
@@ -86,7 +92,11 @@ func (s *Store) List(slot string) ([]Snapshot, error) {
 		}
 		return nil, err
 	}
-	var snaps []Snapshot
+	type item struct {
+		name string
+		mod  time.Time
+	}
+	var items []item
 	for _, e := range entries {
 		if !e.IsDir() || e.Name()[0] == '.' {
 			continue // skip staging/hidden transaction artifacts
@@ -95,10 +105,22 @@ func (s *Store) List(slot string) ([]Snapshot, error) {
 		if err != nil {
 			return nil, err
 		}
-		snaps = append(snaps, Snapshot{Name: e.Name(), ModUnix: info.ModTime().Unix()})
+		items = append(items, item{name: e.Name(), mod: info.ModTime()})
 	}
-	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].ModUnix < snaps[j].ModUnix })
+	sort.SliceStable(items, func(i, j int) bool { return items[i].mod.Before(items[j].mod) })
+	snaps := make([]Snapshot, len(items))
+	for i, it := range items {
+		snaps[i] = Snapshot{Name: it.name, ModUnix: it.mod.Unix()}
+	}
 	return snaps, nil
+}
+
+// TouchNow stamps a path's mtime to the current time. Snapshot creation calls it
+// on the freshly-cloned checkpoint directory so List orders snapshots by real
+// creation time rather than the source data dir's mtime that `cp -a` preserved.
+func TouchNow(path string) error {
+	now := time.Now()
+	return os.Chtimes(path, now, now)
 }
 
 // After returns the snapshot names created strictly after `name` (the timeline
@@ -204,6 +226,15 @@ func reflinkClone(ctx context.Context, srcDir, dstDir string) error {
 	if err := os.MkdirAll(filepath.Dir(dstDir), 0o755); err != nil {
 		return err
 	}
+	// Why cp and not rsync: --reflink=always is what makes a snapshot cheap — an
+	// XFS copy-on-write clone that is near-instant and shares blocks until written,
+	// which the whole snapshot store (and its disk-space math / disk.check guard)
+	// depends on. Mainline rsync has no reflink support, so `rsync -av` would do a
+	// full physical byte copy of the entire PostgreSQL data dir on every snapshot —
+	// slow and full-size. It also would NOT fix snapshot ordering: rsync -a implies
+	// -t (preserve times), so like cp -a it copies the source's mtime onto the clone
+	// (that was the ordering bug); we deliberately re-stamp the top-level dir's mtime
+	// afterwards via store.TouchNow rather than switch copy tools and lose CoW.
 	cmd := exec.CommandContext(ctx, "cp", "-a", "--reflink=always", "--sparse=auto", srcDir, dstDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reflink clone %s -> %s: %w: %s", srcDir, dstDir, err, out)

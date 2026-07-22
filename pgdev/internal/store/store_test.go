@@ -113,7 +113,52 @@ func TestListAndAfterOrdering(t *testing.T) {
 	}
 }
 
+// TestTouchNowFixesCloneMtimeOrdering reproduces the snapshot-ordering bug: a
+// `cp -a` reflink clone preserves the SOURCE data dir's mtime, so every snapshot
+// shares one stale timestamp and List falls back to lexical order — pushing an
+// early "initial" snapshot to the end. Stamping each with TouchNow at creation
+// (as the snapshot task does) restores true creation order.
+func TestTouchNowFixesCloneMtimeOrdering(t *testing.T) {
+	st := &Store{Root: t.TempDir(), Clone: copyTree}
+	if err := st.EnsureLayout("a"); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Unix(1_600_000_000, 0)
+	// Creation order is initial → dump → later; names sort lexically the other way.
+	for _, name := range []string{"initial", "2026-07-21_dump", "2026-07-22_later"} {
+		p := st.Snapshot("a", name)
+		mustMkdir(t, p)
+		if err := os.Chtimes(p, stale, stale); err != nil { // the cp -a symptom
+			t.Fatal(err)
+		}
+		if err := TouchNow(p); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond) // distinct mtimes across snapshots
+	}
+
+	if got := join(names(mustList(t, st))); got != "initial,2026-07-21_dump,2026-07-22_later" {
+		t.Fatalf("List order = %q, want creation order (initial first)", got)
+	}
+	if last, _ := st.Last("a"); last != "2026-07-22_later" {
+		t.Fatalf("Last = %q, want 2026-07-22_later", last)
+	}
+	if after, _ := st.After("a", "initial"); join(after) != "2026-07-21_dump,2026-07-22_later" {
+		t.Fatalf("After(initial) = %v, want the two newer snapshots", after)
+	}
+}
+
 // ----- test helpers --------------------------------------------------------
+
+func mustList(t *testing.T, st *Store) []Snapshot {
+	t.Helper()
+	snaps, err := st.List("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snaps
+}
+
 
 func mustMkdir(t *testing.T, p string) {
 	t.Helper()
