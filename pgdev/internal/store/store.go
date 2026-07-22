@@ -61,6 +61,13 @@ func (s *Store) EnsureLayout(slot string) error {
 func (s *Store) RequireMounted() error {
 	out, err := exec.Command("findmnt", "-T", s.Root, "-n", "-o", "FSTYPE").Output()
 	if err != nil {
+		// findmnt not installed (e.g. host-side macOS tests): honour the best-effort
+		// contract and skip rather than block the transaction logic. A findmnt that
+		// ran but found no mount exits non-zero (an *exec.ExitError), which is a real
+		// "not mounted" failure and falls through.
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil
+		}
 		return fmt.Errorf("%s is not mounted from the XFS data store; run 'make machine' first", s.Root)
 	}
 	if fstype := trim(string(out)); fstype != "xfs" {

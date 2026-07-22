@@ -16,7 +16,9 @@ import (
 // unitTemplate is the systemd unit for the resident daemon. It runs the
 // machine-local binary (not the home-mount copy) so it survives a boot where the
 // mount isn't up yet; the home-mount is the delivery channel, not the run path
-// (§5.11). EnvironmentFile is optional (`-`) so a bare boot still starts.
+// (§5.11). EnvironmentFile is optional (`-`) so a bare boot still starts, and the
+// path is double-quoted so a repo dir containing spaces isn't word-split by
+// systemd (the `-` ignore-if-missing prefix stays outside the quotes).
 const unitTemplate = `[Unit]
 Description=pgdev in-machine control daemon
 After=incus.service network-online.target
@@ -24,7 +26,7 @@ Wants=incus.service
 
 [Service]
 Type=simple
-EnvironmentFile=-%s
+EnvironmentFile=-"%s"
 # Non-fatal (the '-'): bootstrap still creates/mounts the store and topology on
 # success, but if it can't (e.g. a full disk shut the XFS store down), the daemon
 # still starts so 'pgdev status' stays usable to diagnose, instead of the whole
