@@ -61,8 +61,8 @@ pgdev (macOS) ── HTTP/JSON ──▶ pgdevd (machine) ──▶ Incus socket
 ```
 
 `pgdev up`/`down`/`status`/`promote`/`refresh`/`snapshots`/`ip`/`snapshot`/
-`restore` are all API calls — after boot there are **zero `container machine run`
-execs on the control path**. `promote` collapses to "flip the active-slot
+`restore`/`staging {start,stop}` are all API calls — after boot there are **zero
+`container machine run` execs on the control path**. `promote` collapses to "flip the active-slot
 pointer, then reconcile the proxy `connect=` targets"; `up` provisions both
 backends from a golden `pg-dev-base` image (PostgreSQL installed once, then
 `incus publish`ed — minutes → seconds) and creates each slot's cluster on its
@@ -73,9 +73,11 @@ built by `make pgdevd` (they share one git-stamped version); `pgdev agent
 deploy` — run automatically by `make start` — cross-compiles nothing new, it
 delivers the prebuilt daemon over the home mount, installs it atomically to a
 machine-local path, restarts the unit, and confirms the `GET /v1/version`
-handshake so a stale daemon fails loudly. Only the interactive/per-slot
-passthroughs (`psql`, `shell`, `logs`, `staging.{start,stop}`) still run through
-`scripts/pg-dev-local` for now; it is deleted in the last slice.
+handshake so a stale daemon fails loudly. The only passthroughs still riding
+`container exec` are the interactive per-slot `shell` and `logs` (active +
+staging) in `scripts/pg-dev-local`; `psql` is now a plain local `psql` against
+the `127.0.0.1` endpoint. That script is deleted in the last slice, once
+`shell`/`logs` move to their real transport (SSH).
 
 ### Networking
 
@@ -346,5 +348,8 @@ See `.env.example`. The main settings are:
 
 ## Why a Makefile if there is a script?
 
-Shell completion for `make` targets is convenient; the script contains the
-actual lifecycle logic.
+The lifecycle logic lives in the Go binaries — `pgdev` on the host, `pgdevd` in
+the machine — not in the script. The `make` targets are thin, tab-completable
+wrappers that call those binaries and cover the Apple-machine chores around them
+(`make start`/`delete`/`disk`). The residual `scripts/pg-dev-local` now holds
+only the interactive `shell`/`logs` passthroughs, pending their move to SSH.
