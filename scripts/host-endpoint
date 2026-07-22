@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# host-endpoint — a stable macOS-side client endpoint for the Apple container
+# machine's PostgreSQL.
+#
+# The Apple machine's IP on macOS's internal virtualization bridge is a bootpd
+# DHCP lease that is NOT pinnable: it (and even its /24) drifts across macOS
+# reboots and machine recreation. Apple's `container machine` CLI exposes no way
+# to fix it (no --network / --publish / static IP), and the machine registers no
+# resolvable DNS name. So instead of chasing the address, we publish a permanent
+# endpoint on the Mac's loopback and relay it to whatever the machine's current
+# IP happens to be:
+#
+#   client ── 127.0.0.1:5442/:5443 ──▶ socat ──▶ <machine-ip>:5432/:5433
+#
+# A per-user launchd LaunchAgent keeps the socat forwarders alive across logins.
+# The relay target is re-resolved on every `make start` (the only lifecycle
+# event that changes the IP — the machine is down until then anyway).
+#
+# Unlike the in-machine scripts/pg-dev-local, THIS script runs on macOS.
+#
+# Usage: host-endpoint {ip|install|refresh|uninstall|status}
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../.env
+[[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
+
+MACHINE_NAME="${MACHINE_NAME:-vpg}"
+# Machine-side proxy ports we relay TO.
+ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"
+STAGING_PORT="${PG_STAGING_PORT:-5433}"
+# Host loopback ports we listen ON — offset from 5432/5433 so a local
+# PostgreSQL on the default port isn't shadowed on 127.0.0.1.
+CLIENT_ACTIVE_PORT="${PG_CLIENT_ACTIVE_PORT:-5442}"
+CLIENT_STAGING_PORT="${PG_CLIENT_STAGING_PORT:-5443}"
+
+LABEL="me.pansen.${MACHINE_NAME}-forward"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+IPFILE="$REPO_ROOT/var/machine-ip"
+LOGFILE="$REPO_ROOT/var/${MACHINE_NAME}-forward.log"
+DOMAIN="gui/$(id -u)"
+
+# The machine's current eth0 address, discovered live from inside the machine —
+# the same value scripts/pg-dev-local shows as the "machine IP". Empty if the
+# machine isn't running. Mirrors _proxy_ip's parsing in scripts/pg-dev-local.
+_machine_ip() {
+    container machine run --name "$MACHINE_NAME" --root -- \
+        ip -4 -o addr show dev eth0 2>/dev/null \
+        | awk '{ split($4, a, "/"); print a[1]; exit }' || true
+}
+
+_agent_installed() { [[ -f "$PLIST" ]]; }
+
+_write_plist() {
+    # socat lives in a Homebrew prefix that launchd's minimal PATH omits, so we
+    # pin its directory into the agent's PATH. If it moves, re-run install.
+    local socat_dir
+    socat_dir="$(cd "$(dirname "$(command -v socat)")" && pwd)"
+    mkdir -p "$(dirname "$PLIST")"
+    cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${REPO_ROOT}/scripts/host-endpoint</string>
+        <string>_serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${socat_dir}:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>${LOGFILE}</string>
+    <key>StandardErrorPath</key>
+    <string>${LOGFILE}</string>
+</dict>
+</plist>
+EOF
+}
+
+# The long-running relay, launched by launchd (never by hand). Reads the cached
+# machine IP and runs one socat listener per role port, supervising both so a
+# crash of either takes the agent down for KeepAlive to restart cleanly.
+_serve() {
+    local ip
+    ip="$(cat "$IPFILE" 2>/dev/null || true)"
+    if [[ -z "$ip" ]]; then
+        echo "$(date '+%F %T') no machine IP cached ($IPFILE); run 'make start'." >&2
+        sleep 30   # throttle KeepAlive so we don't hot-loop before the first refresh
+        exit 1
+    fi
+    echo "$(date '+%F %T') forwarding 127.0.0.1:${CLIENT_ACTIVE_PORT}->${ip}:${ACTIVE_PORT}, 127.0.0.1:${CLIENT_STAGING_PORT}->${ip}:${STAGING_PORT}" >&2
+
+    socat "TCP-LISTEN:${CLIENT_ACTIVE_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${ip}:${ACTIVE_PORT}" &
+    local a=$!
+    socat "TCP-LISTEN:${CLIENT_STAGING_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${ip}:${STAGING_PORT}" &
+    local b=$!
+
+    trap 'kill "$a" "$b" 2>/dev/null || true' TERM INT
+    while kill -0 "$a" 2>/dev/null && kill -0 "$b" 2>/dev/null; do sleep 5; done
+    kill "$a" "$b" 2>/dev/null || true
+    exit 1
+}
+
+_refresh_ip_file() {
+    local ip
+    ip="$(_machine_ip)"
+    if [[ -z "$ip" ]]; then
+        echo "WARNING: could not read the machine IP (is '$MACHINE_NAME' running?)." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$IPFILE")"
+    printf '%s\n' "$ip" >"$IPFILE"
+    echo "$ip"
+}
+
+_print_endpoints() {
+    cat <<EOF
+Stable client endpoint (127.0.0.1 is permanent; the forwarder tracks the machine IP):
+  active   psql -h 127.0.0.1 -p ${CLIENT_ACTIVE_PORT}  -U ${PG_USER:-<user>} ${PG_DB:-<db>}
+  staging  psql -h 127.0.0.1 -p ${CLIENT_STAGING_PORT} -U ${PG_USER:-<user>} ${PG_DB:-<db>}
+
+.pgpass lines:
+127.0.0.1:${CLIENT_ACTIVE_PORT}:*:${PG_USER:-<user>}:${PG_PASSWORD:-<password>}
+127.0.0.1:${CLIENT_STAGING_PORT}:*:${PG_USER:-<user>}:${PG_PASSWORD:-<password>}
+EOF
+}
+
+cmd_ip() { _machine_ip; }
+
+cmd_install() {
+    local ip
+    ip="$(_refresh_ip_file)" || { echo "Start the machine first: make start" >&2; return 1; }
+    _write_plist
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
+        echo "ERROR: launchctl bootstrap failed for $LABEL." >&2
+        return 1
+    fi
+    launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null || true
+    echo "==> Forwarder '$LABEL' installed (machine IP ${ip})."
+    _print_endpoints
+}
+
+cmd_refresh() {
+    # Called from every `make start`. First time (no agent yet) it installs
+    # itself so the forwarder is fully hands-off; afterwards it just re-points.
+    # Opt out with PG_ENDPOINT_AUTOINSTALL=0 to keep a deliberate uninstall.
+    if ! _agent_installed; then
+        if [[ "${PG_ENDPOINT_AUTOINSTALL:-1}" == 0 ]]; then
+            echo "==> Endpoint forwarder not installed; skipping (PG_ENDPOINT_AUTOINSTALL=0)."
+            return 0
+        fi
+        echo "==> Endpoint forwarder not installed; installing it now..."
+        cmd_install || echo "WARNING: auto-install failed; run 'make endpoint.install' manually." >&2
+        return 0   # never fail 'make start' on the endpoint step
+    fi
+    local ip
+    ip="$(_refresh_ip_file)" || return 0   # tolerate: don't fail 'make start'
+    launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null \
+        || { launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null || true; }
+    echo "==> Forwarder re-pointed at machine IP ${ip} (endpoint stays 127.0.0.1)."
+}
+
+cmd_uninstall() {
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "==> Forwarder '$LABEL' removed."
+}
+
+cmd_status() {
+    if _agent_installed; then
+        echo "plist:      $PLIST"
+        echo "cached IP:  $(cat "$IPFILE" 2>/dev/null || echo '(none)')"
+        echo "live IP:    $(_machine_ip || true)"
+        launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || \
+            echo "launchd:    not loaded"
+    else
+        echo "Forwarder not installed. Run 'make endpoint.install'."
+    fi
+}
+
+case "${1:-}" in
+    ip)        cmd_ip ;;
+    install)   cmd_install ;;
+    refresh)   cmd_refresh ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status ;;
+    _serve)    _serve ;;
+    *) echo "Usage: host-endpoint {ip|install|refresh|uninstall|status}" >&2; exit 2 ;;
+esac

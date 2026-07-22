@@ -1,0 +1,283 @@
+// Command pgdevd is the in-machine agent for the snapshottable-PostgreSQL setup.
+//
+// Since Slice 2 its primary mode is `serve`: a resident HTTP/JSON daemon (the
+// systemd unit runs it) that owns the journaled task engine, the single-mutation
+// mutex, blueprint reconciliation, and boot-time recovery. The Slice 1 one-shot
+// snapshot/restore subcommands remain for the strangler transition, running each
+// mutation through the same task engine. Staging start/stop is now a daemon API
+// (StartStaging/StopStaging), so the old `start --slot` one-shot is gone.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"pansen.me/pgdev/internal/agentapi"
+	"pansen.me/pgdev/internal/backend"
+	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/daemon"
+	"pansen.me/pgdev/internal/logx"
+	"pansen.me/pgdev/internal/ops"
+	"pansen.me/pgdev/internal/store"
+	"pansen.me/pgdev/internal/task"
+)
+
+// version is stamped at build time (see Makefile).
+var version = "dev"
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR: "+err.Error())
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	switch args[0] {
+	case "serve":
+		return cmdServe(ctx, args[1:])
+	case "bootstrap":
+		return cmdBootstrap(ctx, args[1:])
+	case "snapshot":
+		return cmdSnapshot(ctx, args[1:])
+	case "restore":
+		return cmdRestore(ctx, args[1:], false)
+	case "restore-last":
+		return cmdRestore(ctx, args[1:], true)
+	case "version", "--version", "-v":
+		fmt.Println(version)
+		return nil
+	case "-h", "--help", "help":
+		return usage()
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+// cmdBootstrap ensures the XFS store, Incus topology and boot-ordering drop-ins
+// are in place (ports scripts/apple-machine-init). It runs as the systemd unit's
+// ExecStartPre and is safe to run standalone.
+func cmdBootstrap(ctx context.Context, _ []string) error {
+	cfg := config.Load()
+	svc, err := daemon.New(cfg, version, logx.Stderr)
+	if err != nil {
+		return err
+	}
+	return svc.Bootstrap(ctx)
+}
+
+// cmdServe runs the resident HTTP daemon: recover any interrupted mutation,
+// then serve the agentapi on the machine's eth0 until signalled. This is the
+// control path — the systemd unit runs `pgdevd serve`.
+func cmdServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := fs.String("addr", "", "listen address (default :<PG_AGENT_PORT>)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg := config.Load()
+	svc, err := daemon.New(cfg, version, logx.Stderr)
+	if err != nil {
+		return err
+	}
+	if err := svc.RecoverPending(ctx); err != nil {
+		return fmt.Errorf("recovering interrupted operation on start: %w", err)
+	}
+	token, err := agentapi.ReadToken(cfg.AgentTokenPath)
+	if err != nil {
+		return fmt.Errorf("reading agent token: %w", err)
+	}
+	if token == "" {
+		logx.Stderr("WARNING: no agent token at %s yet; API rejects all requests until 'pgdev agent deploy' writes one", cfg.AgentTokenPath)
+	}
+
+	listen := *addr
+	if listen == "" {
+		listen = fmt.Sprintf(":%d", cfg.AgentPort)
+	}
+	srv := &http.Server{Addr: listen, Handler: agentapi.NewServer(svc, token), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	logx.Stderr("pgdevd %s serving on %s", version, listen)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// env wires up the shared dependencies and runs recovery for any interrupted
+// prior mutation before returning.
+func env(ctx context.Context) (*ops.Ops, task.Journal, error) {
+	cfg := config.Load()
+	st := store.NewOSStore(cfg.DataRoot)
+	if err := st.RequireMounted(); err != nil {
+		return nil, nil, err
+	}
+	j, err := task.NewFileJournal(st.JournalDir())
+	if err != nil {
+		return nil, nil, err
+	}
+	be := backend.NewIncus(cfg)
+	be.Log = logx.Stderr
+	o := ops.New(st, be, cfg)
+	o.Log = logx.Stderr
+	if err := task.Recover(ctx, j, o.Registry()); err != nil {
+		return nil, nil, fmt.Errorf("recovering interrupted operation: %w", err)
+	}
+	return o, j, nil
+}
+
+func cmdSnapshot(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	slot := fs.String("slot", "", "backend slot (a|b)")
+	name := fs.String("name", "", "snapshot name")
+	force := fs.Bool("force", false, "replace an existing same-named snapshot")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requireSlot(*slot); err != nil {
+		return err
+	}
+	if *name == "" {
+		return errors.New("--name is required")
+	}
+	o, j, err := env(ctx)
+	if err != nil {
+		return err
+	}
+	t, err := o.Snapshot(ctx, *slot, *name, *force)
+	if err != nil {
+		return err
+	}
+	if err := task.Run(ctx, j, t); err != nil {
+		return err
+	}
+	fmt.Printf("Snapshot %q created on %s.\n", *name, o.Cfg.Container(*slot))
+	return nil
+}
+
+func cmdRestore(ctx context.Context, args []string, last bool) error {
+	name := "restore"
+	if last {
+		name = "restore-last"
+	}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	slot := fs.String("slot", "", "backend slot (a|b)")
+	snap := fs.String("name", "", "snapshot name (ignored with restore-last)")
+	force := fs.Bool("force", false, "delete newer snapshots without confirmation")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requireSlot(*slot); err != nil {
+		return err
+	}
+	o, j, err := env(ctx)
+	if err != nil {
+		return err
+	}
+
+	target := *snap
+	if last {
+		if target, err = o.Store.Last(*slot); err != nil {
+			return err
+		}
+		if target == "" {
+			return fmt.Errorf("no snapshots on %s", o.Cfg.Container(*slot))
+		}
+		fmt.Printf("==> Restoring %s to most recent snapshot: %s\n", o.Cfg.Container(*slot), target)
+	}
+	if target == "" {
+		return errors.New("--name is required")
+	}
+
+	// Preserve the shell's timeline semantics: restoring an older checkpoint
+	// discards every later one, after confirmation.
+	after, err := o.After(*slot, target)
+	if err != nil {
+		return err
+	}
+	if len(after) > 0 {
+		fmt.Printf("==> Snapshots on %s that will be deleted:\n     %s\n",
+			o.Cfg.Container(*slot), strings.Join(after, "\n     "))
+		if !*force {
+			ok, err := confirm()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("aborted")
+			}
+		}
+	}
+
+	t, err := o.Restore(ctx, *slot, target)
+	if err != nil {
+		return err
+	}
+	if err := task.Run(ctx, j, t); err != nil {
+		return err
+	}
+	fmt.Printf("Restored %s to snapshot %q.\n", o.Cfg.Container(*slot), target)
+	return nil
+}
+
+// confirm prompts on a TTY; through the non-TTY machine transport it refuses
+// (stdin delivers EOF immediately), matching the shell and telling the caller to
+// pass --force.
+func confirm() (bool, error) {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false, err
+	}
+	if fi.Mode()&os.ModeCharDevice == 0 {
+		return false, errors.New("this confirmation needs a terminal; re-run with force=1 (make) or --force")
+	}
+	fmt.Fprint(os.Stderr, "Continue? [Y/n] ")
+	var reply string
+	if _, err := fmt.Scanln(&reply); err != nil && err.Error() != "unexpected newline" {
+		// A bare Enter (EOF/newline) defaults to yes, like the shell's ${reply:-Y}.
+		reply = "Y"
+	}
+	reply = strings.TrimSpace(reply)
+	return reply == "" || reply == "Y" || reply == "y", nil
+}
+
+func requireSlot(slot string) error {
+	if slot != "a" && slot != "b" {
+		return fmt.Errorf("--slot must be a or b (got %q)", slot)
+	}
+	return nil
+}
+
+func usage() error {
+	fmt.Fprintln(os.Stderr, strings.TrimSpace(`
+pgdevd — in-machine agent (resident daemon + one-shot task engine)
+
+Usage:
+  pgdevd serve        [--addr :5440]         resident HTTP/JSON control daemon
+  pgdevd bootstrap                            XFS store + Incus topology (ExecStartPre)
+  pgdevd snapshot     --slot <a|b> --name <name> [--force]
+  pgdevd restore      --slot <a|b> --name <name> [--force]
+  pgdevd restore-last --slot <a|b> [--force]
+  pgdevd version
+`))
+	return nil
+}
