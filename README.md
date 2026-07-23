@@ -20,7 +20,7 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
   (staging).
 - **On-demand disk reclaim** — `make pg.staging.rebuild` delete+recreates the
   staging machine to free its grown macOS disk, while active keeps serving.
-- **Low power at runtime**, thanks to Apple `container`.
+- **Low power at runtime**, thanks to Apple [`container`](https://github.com/apple/container).
 
 ### A view
 
