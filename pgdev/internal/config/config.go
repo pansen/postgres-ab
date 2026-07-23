@@ -65,6 +65,12 @@ type Config struct {
 	// Defaults to host.docker.internal so the endpoint is reachable both from the
 	// Mac and from sibling containers/k3d; 127.0.0.1 also works host-only.
 	ProxyHostname string
+	// ForwardBind is the address the host forwarder (internal/forward) binds its
+	// client listeners to (PG_FORWARD_BIND). Default 127.0.0.1 (loopback only, as
+	// socat did); set to 0.0.0.0 to reach the endpoints from sibling
+	// containers/k3d that can't hit the Mac's loopback — this exposes the
+	// dev-credentialed backend to every interface, so widen deliberately.
+	ForwardBind string
 
 	BackendPrefix string // pg-dev
 	ProxyName     string // pg-proxy — LEGACY (single-machine in-machine proxy)
@@ -129,6 +135,7 @@ func Load() Config {
 		ClientActivePort:  atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
 		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
 		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
+		ForwardBind:       get("PG_FORWARD_BIND", "127.0.0.1"),
 		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
 		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),
 		BackendAIP:        get("PG_BACKEND_A_IP", ""),
@@ -210,6 +217,17 @@ func (c Config) ActiveMachinePath() string {
 // independently and the forwarder must track both.
 func (c Config) MachineIPPath(slot string) string {
 	return filepath.Join(c.RepoRoot, "var", "machine-ip-"+slot)
+}
+
+// ForwardStatePath is where a running `pgdev forward serve` writes its live
+// mapping + heartbeat (internal/forward.State), read by promote/status.
+func (c Config) ForwardStatePath() string {
+	return filepath.Join(c.RepoRoot, "var", "forward-state.json")
+}
+
+// ForwardLogPath is the LaunchAgent's combined stdout/stderr log.
+func (c Config) ForwardLogPath() string {
+	return filepath.Join(c.RepoRoot, "var", c.MachinePrefix+"-forward.log")
 }
 
 // ClientPort returns the host client port for a role ("active"/"staging").

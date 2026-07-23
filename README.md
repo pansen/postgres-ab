@@ -29,10 +29,10 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
 ## Requirements
 
 - Apple silicon running macOS 26.
-- Apple's `container` CLI (1.1+), `socat`, and Go — via Homebrew:
+- Apple's `container` CLI (1.1+) and Go — via Homebrew:
 
   ```shell
-  brew install container socat go
+  brew install container go
   ```
 
 ## Design
@@ -41,7 +41,7 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
 macOS client
     │ 127.0.0.1:5442 (active) / :5443 (staging)   — stable, never changes
     ▼
-socat forwarder (host launchd agent)             — re-points on start/promote
+Go forwarder (host launchd agent, internal/forward) — re-points itself on promote
     │  maps each role port to whichever machine holds that role
     ├───────────────────────────────┬───────────────────────────────┐
     ▼                               ▼
@@ -99,18 +99,24 @@ static-IP pinning. Do not use a backend's 10.x address from macOS.
 Each machine's `eth0` IP is an unpinnable `bootpd` DHCP lease that can change
 (the whole `/24` too) after a macOS reboot or machine recreation, and the two
 leases drift independently. So the client endpoint is decoupled from them: a
-per-user `launchd` agent runs `socat` on `127.0.0.1:5442` (active) / `:5443`
-(staging) and relays each to whichever machine currently holds that role. The
-ports are offset from `5432` so a local PostgreSQL isn't shadowed. Clients always
-use **`127.0.0.1:5442`** / **`:5443`** — permanent, identical on every Mac.
+per-user `launchd` agent runs an in-process Go forwarder (`pgdev forward serve`,
+`internal/forward`) that owns `127.0.0.1:5442` (active) / `:5443` (staging) for
+its whole lifetime and relays each to whichever machine currently holds that
+role. It re-points **in place** by swapping the dial target — never rebinding —
+so promote can't orphan a listener or leave a stale mapping. The ports are offset
+from `5432` so a local PostgreSQL isn't shadowed. Clients always use
+**`127.0.0.1:5442`** / **`:5443`** — permanent, identical on every Mac.
 
-Hands-off: **`make start` installs the forwarder and re-points it; `pgdev
-promote`/`refresh` re-point it too** (that is what follows a promote to the new
-active machine). Needs `socat` (`brew install socat`). `make endpoint.status` /
-`endpoint.uninstall` manage it (`PG_ENDPOINT_AUTOINSTALL=0` opts out of
-auto-install). `PG_PROXY_HOSTNAME` sets the hostname printed in psql/.pgpass
-lines (default `host.docker.internal`, so the endpoint also resolves from sibling
-containers/k3d; use `127.0.0.1` for host-only).
+Hands-off: **`make start` installs the forwarder**; after that `pgdev promote` is
+just a pointer write — the resident forwarder notices within its poll interval,
+re-points, and drops the sessions that were on the demoted machine (reconnect to
+land on the new database). `make endpoint.status` / `endpoint.uninstall` manage
+the agent (`PG_ENDPOINT_AUTOINSTALL=0` opts out of auto-install).
+`PG_PROXY_HOSTNAME` sets the hostname printed in psql/.pgpass lines (default
+`host.docker.internal`, so the endpoint also resolves from sibling
+containers/k3d; use `127.0.0.1` for host-only). `PG_FORWARD_BIND` widens the
+listener bind (default `127.0.0.1`; set `0.0.0.0` only if a sibling container
+can't reach the Mac's loopback — it exposes the dev backend on every interface).
 
 No connection pooler: each port is a per-connection TCP passthrough, so
 `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory locks

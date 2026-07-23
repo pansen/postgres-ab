@@ -31,7 +31,6 @@ PG_DATA_DISK_SIZE ?= 140G
 DISK_MIN_FREE_GB ?= 40
 
 PG_DEV_SCRIPT := ./scripts/pg-dev-local
-HOST_ENDPOINT := ./scripts/host-endpoint
 PGDEV_DIR := pgdev
 # Host CLI (macOS). Since Slice 2 the stateful control path — status / promote /
 # refresh / snapshots / ip / snapshot / restore — runs through this binary over
@@ -70,10 +69,6 @@ endef
 deps: .env
 	@command -v container >/dev/null || { \
 		echo "Apple's container CLI is required: https://github.com/apple/container/releases" >&2; \
-		exit 1; \
-	}
-	@command -v socat >/dev/null || { \
-		echo "socat is required for the stable 127.0.0.1 client endpoint: brew install socat" >&2; \
 		exit 1; \
 	}
 	@version="$$(container --version | awk '{ print $$4 }')"; \
@@ -248,27 +243,25 @@ status: machine.exists pgdevd
 	@$(PGDEV) status
 
 # ----- stable macOS client endpoints --------------------------------------
-# Each Apple machine's IP drifts and cannot be pinned, so a host-side socat
-# forwarder publishes permanent 127.0.0.1:5442 (active) / :5443 (staging)
-# endpoints and relays each to whichever machine currently holds that role (on
-# its own eth0:5432). `pgdev refresh`/`pgdev promote` re-point it; `start`
-# installs it automatically on first run.
+# Each Apple machine's IP drifts and cannot be pinned, so a host-side in-process
+# Go forwarder (internal/forward, run by a per-user LaunchAgent) publishes
+# permanent 127.0.0.1:5442 (active) / :5443 (staging) endpoints and relays each
+# to whichever machine currently holds that role (on its own eth0:5432). It owns
+# the listeners for their whole lifetime and re-points itself from the pointer
+# file — `pgdev promote` is just a pointer write; `start` installs the agent
+# automatically on first run (PG_ENDPOINT_AUTOINSTALL=0 opts out).
 
 .PHONY: endpoint.install
 endpoint.install: machine.exists
-	@$(HOST_ENDPOINT) install
-
-.PHONY: endpoint.refresh
-endpoint.refresh:
-	@$(HOST_ENDPOINT) refresh
+	@$(PGDEV) forward install
 
 .PHONY: endpoint.uninstall
 endpoint.uninstall:
-	@$(HOST_ENDPOINT) uninstall
+	@$(PGDEV) forward uninstall
 
 .PHONY: endpoint.status
 endpoint.status:
-	@$(HOST_ENDPOINT) status
+	@$(PGDEV) forward status
 
 .PHONY: stop
 stop:
@@ -411,6 +404,6 @@ recreate: delete start
 
 .PHONY: check
 check:
-	bash -n scripts/pg-dev-local scripts/host-endpoint
+	bash -n scripts/pg-dev-local
 	@$(MAKE) --no-print-directory -n deps >/dev/null
 	$(MAKE) -C $(PGDEV_DIR) vet test build
