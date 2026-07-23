@@ -3,7 +3,8 @@
 Fast, snapshottable PostgreSQL for local development on Apple silicon — load a
 fresh dump into a spare instance and swap it in without downtime.
 
-`pg_restore` of a large dump can take ~90 minutes, and the dev database is
+`pg_restore` of a large dump can take ~90 minutes (in my case, having expensive GIN indexes), 
+and the dev database is 
 unreachable the whole time. This repo runs two persistent Apple `container`
 machines, **`vpg-a`** and **`vpg-b`**, each hosting one PostgreSQL 17 backend on
 its own Incus + copy-on-write XFS snapshot store. One machine is **active**
