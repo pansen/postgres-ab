@@ -255,6 +255,16 @@ status: machine.exists pgdevd
 endpoint.install: machine.exists
 	@$(PGDEV) forward install
 
+# Restart the running forwarder so a macOS Local Network permission granted
+# AFTER it started actually takes effect. TCC caches its allow/deny decision at
+# process start, so ticking the Local Network box (System Settings → Privacy &
+# Security → Local Network) does nothing for an already-running agent — it keeps
+# failing to reach the VM subnet with EHOSTUNREACH ("server closed the
+# connection unexpectedly") until it is restarted. Run this once after granting.
+.PHONY: endpoint.restart
+endpoint.restart:
+	@$(PGDEV) forward restart
+
 .PHONY: endpoint.uninstall
 endpoint.uninstall:
 	@$(PGDEV) forward uninstall

@@ -26,6 +26,7 @@ func (a *app) forwardCmd() *cobra.Command {
 	c.AddCommand(
 		a.forwardServeCmd(),
 		a.forwardInstallCmd(),
+		a.forwardRestartCmd(),
 		a.forwardUninstallCmd(),
 		a.forwardStatusCmd(),
 	)
@@ -94,6 +95,29 @@ func (a *app) forwardInstallCmd() *cobra.Command {
 			fmt.Printf("==> Forwarder '%s' installed and started.\n", ld.Label)
 			fmt.Printf("    active  127.0.0.1:%d  staging  127.0.0.1:%d  (re-points itself on promote)\n",
 				a.cfg.ClientActivePort, a.cfg.ClientStagingPort)
+			return nil
+		},
+	}
+}
+
+// forwardRestartCmd restarts the running agent so a permission granted after it
+// started (macOS Local Network Privacy caches the decision at process start) is
+// re-evaluated — without this, ticking the Local Network box has no effect until
+// the next reboot/reinstall and the forwarder keeps failing with EHOSTUNREACH.
+func (a *app) forwardRestartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the running forwarder (apply a freshly-granted macOS Local Network permission)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ld, err := a.launchd()
+			if err != nil {
+				return err
+			}
+			if err := ld.Restart(cmd.Context()); err != nil {
+				return err
+			}
+			fmt.Printf("==> Forwarder '%s' restarted.\n", ld.Label)
 			return nil
 		},
 	}

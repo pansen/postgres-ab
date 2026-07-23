@@ -298,6 +298,16 @@ its sparse image) and never touches active. `make recreate` is the full nuke.
 
 ## Constraints & gotchas
 
+### macOS Security
+
+Ensure the service has _Local Network_ permission.
+
+> Note that each time you re-build, it will ask for permission again and it will also add another item in the _Local Network_ list.
+
+![Local Network permission](doc/img/LocalNetworkpermission.png)
+
+### Disk Space
+
 **Disk space — the sparse-VM-disk trap (important):** the Apple container
 machine's root disk (`vdb`) is a **sparse image on macOS that only grows**.
 Blocks written inside the guest (the XFS PostgreSQL store, `pg_restore` output,

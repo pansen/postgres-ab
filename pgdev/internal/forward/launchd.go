@@ -125,6 +125,23 @@ func (l *Launchd) loaded(ctx context.Context) bool {
 	return runTimed(ctx, 10*time.Second, "print", l.domainTarget()) == nil
 }
 
+// Restart kicks the running agent in place so a freshly-granted permission is
+// re-evaluated. macOS TCC (notably Local Network Privacy on Tahoe) caches its
+// allow/deny decision at process start, so a grant applied while `serve` was
+// already running does not take effect until the process restarts — exactly the
+// trap where the forwarder keeps returning EHOSTUNREACH after the user has
+// ticked the Local Network box. `kickstart -k` SIGKILLs the current instance and
+// relaunches it from the loaded job, without rewriting the plist. Time-bounded
+// so a wedged launchctl can't hang the caller.
+func (l *Launchd) Restart(ctx context.Context) error {
+	out, err := combinedTimed(ctx, 15*time.Second, "kickstart", "-k", l.domainTarget())
+	if err != nil {
+		return fmt.Errorf("launchctl kickstart %s: %w: %s (is the agent installed? run 'pgdev forward install')",
+			l.Label, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // Uninstall stops the agent and removes its plist. Tolerant of an
 // already-removed agent.
 func (l *Launchd) Uninstall(ctx context.Context) error {

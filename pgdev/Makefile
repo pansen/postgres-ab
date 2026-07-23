@@ -17,6 +17,13 @@ GOARCH     ?= arm64
 # (host pgdev ↔ in-machine pgdevd via GET /v1/version) matches.
 VERSION    ?= $(shell git -C .. describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS    := -s -w -X main.version=$(VERSION)
+# Stable code-signing identity for the host CLI. macOS Local Network Privacy
+# (Tahoe+) keys the forwarder LaunchAgent's grant to this identifier; a plain
+# `go build` leaves an ad-hoc "a.out" identity, so every rebuild would drop the
+# grant and the forwarder's dial to the VM subnet would start failing again with
+# EHOSTUNREACH ("server closed the connection unexpectedly"). Re-sign on every
+# host build so the once-granted Local Network permission survives rebuilds.
+SIGN_ID    := me.pansen.pgdev
 
 .DEFAULT_GOAL := build
 
@@ -37,6 +44,10 @@ daemon:
 host:
 	@mkdir -p $(BIN_DIR)
 	@go build -trimpath -ldflags '$(LDFLAGS)' -o $(HOST_OUT) ./cmd/pgdev
+	@if command -v codesign >/dev/null 2>&1; then \
+		codesign --force --sign - --identifier $(SIGN_ID) $(HOST_OUT) || exit 1; \
+		echo "signed $(HOST_OUT) ($(SIGN_ID))"; \
+	fi
 	@echo "built $(HOST_OUT) (host, $(VERSION))"
 
 ## build-host: build for the host OS/arch (handy for local smoke runs)
