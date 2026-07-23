@@ -38,16 +38,33 @@ type Config struct {
 	// daemon never needs them (status returns raw facts; the host formats).
 	PGUser, PGDB, PGPassword string
 
-	MachineName string // vpg — the Apple container machine
+	MachineName string // vpg — the legacy single Apple container machine
 
-	// Machine-side proxy ports (the Incus proxy devices' listeners).
+	// ----- two-machine model (spec 0002) -----
+	// MachinePrefix yields the per-slot machine names vpg-a / vpg-b, each an
+	// Apple machine hosting exactly one backend. Slot is which of those THIS
+	// process serves: set (a/b) in a daemon's pgdevd.env, empty on the host.
+	MachinePrefix string // vpg
+	Slot          string // "" host-side; "a"/"b" inside a machine's pgdevd
+	// BackendPort is the single port each machine exposes its one backend on,
+	// over its own eth0 (no in-machine proxy). The host forwarder maps the
+	// client ports to <active-machine-ip>:BackendPort / <staging>:BackendPort.
+	BackendPort int // 5432
+	// Per-machine resources for host-orchestrated create/hard-reset. Two
+	// machines share the Mac, so the default memory is smaller than the old 12G.
+	MachineCPUs   int    // 4
+	MachineMemory string // 8G
+	MachineImage  string // local/pg-incus-machine:26.04
+
+	// Machine-side proxy ports (the Incus proxy devices' listeners). LEGACY —
+	// retired with the in-machine pg-proxy once routing moves host-side.
 	ActivePort, StagingPort int // 5432 / 5433
 	// Host loopback ports clients actually connect to.
 	ClientActivePort, ClientStagingPort int    // 5442 / 5443
 	ClientHost                          string // 127.0.0.1
 
 	BackendPrefix string // pg-dev
-	ProxyName     string // pg-proxy
+	ProxyName     string // pg-proxy — LEGACY (single-machine in-machine proxy)
 	// BackendAIP/BackendBIP are the pinned eth0 addresses; empty means "derive
 	// from incusbr0" (<prefix>.11 / .12), resolved live by the daemon.
 	BackendAIP, BackendBIP string
@@ -61,8 +78,14 @@ type Config struct {
 
 	// Agent transport (pgdev ↔ pgdevd).
 	AgentPort      int    // 5440 — HTTP/JSON on the machine's eth0
-	AgentTokenPath string // <repo>/var/agent-token (0600 bearer token)
-	MachineIP      string // override for the discovered machine eth0 IP
+	AgentTokenPath string // <repo>/var/agent-token (0600) — HOST-side secret store
+	// AgentToken is the token VALUE (PG_AGENT_TOKEN). The daemon reads ONLY this,
+	// delivered in its machine-local env file, never the home-mounted token file:
+	// that virtiofs cache can serve a stale empty read to the long-running daemon
+	// right after boot (spec 0002 deploy note). Host-side, the token comes from
+	// AgentTokenPath via EnsureToken.
+	AgentToken string
+	MachineIP  string // override for the discovered machine eth0 IP
 
 	RepoRoot string // repo root, visible in-machine at the same path (home-mount)
 
@@ -92,6 +115,12 @@ func Load() Config {
 		PGDB:              get("PG_DB", ""),
 		PGPassword:        get("PG_PASSWORD", ""),
 		MachineName:       get("MACHINE_NAME", "vpg"),
+		MachinePrefix:     get("MACHINE_PREFIX", get("MACHINE_NAME", "vpg")),
+		Slot:              get("PG_SLOT", ""),
+		BackendPort:       atoi(get("PG_BACKEND_PORT", "5432")),
+		MachineCPUs:       atoi(get("MACHINE_CPUS", "4")),
+		MachineMemory:     get("MACHINE_MEMORY", "8G"),
+		MachineImage:      get("MACHINE_IMAGE", "local/pg-incus-machine:26.04"),
 		ActivePort:        atoi(get("PG_ACTIVE_PORT", "5432")),
 		StagingPort:       atoi(get("PG_STAGING_PORT", "5433")),
 		ClientActivePort:  atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
@@ -107,6 +136,7 @@ func Load() Config {
 		BaseImage:         get("PG_BASE_IMAGE", "images:ubuntu/24.04/cloud"),
 		GoldenImage:       get("PG_GOLDEN_IMAGE", "pg-dev-base"),
 		AgentPort:         atoi(get("PG_AGENT_PORT", "5440")),
+		AgentToken:        get("PG_AGENT_TOKEN", ""),
 		MachineIP:         get("PG_MACHINE_IP", ""),
 		RepoRoot:          repo,
 		HostUID:           get("HOST_UID", ""),
@@ -159,6 +189,25 @@ func (c Config) BackendIP(slot string) string {
 
 // ActiveSlotPath is the host-visible pointer file (default active slot: "a").
 func (c Config) ActiveSlotPath() string { return filepath.Join(c.RepoRoot, "var", "active-slot") }
+
+// ----- two-machine helpers (spec 0002) -------------------------------------
+
+// MachineNameForSlot maps a slot ("a"/"b") to its Apple machine name, e.g.
+// vpg-a / vpg-b. Each machine hosts exactly one backend.
+func (c Config) MachineNameForSlot(slot string) string { return c.MachinePrefix + "-" + slot }
+
+// ActiveMachinePath is the host-side pointer to which machine is active (behind
+// the :5442 client port). Holds "a" or "b"; the other machine is staging.
+func (c Config) ActiveMachinePath() string {
+	return filepath.Join(c.RepoRoot, "var", "active-machine")
+}
+
+// MachineIPPath is the host-side cache of a machine's drifting eth0 IP, one file
+// per machine (var/machine-ip-a, var/machine-ip-b), since the two leases drift
+// independently and the forwarder must track both.
+func (c Config) MachineIPPath(slot string) string {
+	return filepath.Join(c.RepoRoot, "var", "machine-ip-"+slot)
+}
 
 // ClientPort returns the host client port for a role ("active"/"staging").
 func (c Config) ClientPort(role string) int {

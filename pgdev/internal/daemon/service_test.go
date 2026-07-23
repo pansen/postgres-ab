@@ -1,27 +1,20 @@
 package daemon
 
 import (
-	"context"
 	"testing"
 
 	"pansen.me/pgdev/internal/config"
 )
 
-// With both backend IPs pinned in .env, resolution is pure config — no incusbr0
-// lookup, so the daemon needs no live Incus to build a blueprint.
-func TestResolveBackendIPsUsesOverrides(t *testing.T) {
-	s := &Service{Cfg: config.Config{BackendAIP: "10.9.9.11", BackendBIP: "10.9.9.12"}}
-	a, b, err := s.resolveBackendIPs(context.Background())
-	if err != nil {
-		t.Fatal(err)
+// Each daemon serves exactly one backend, chosen by PG_SLOT.
+func TestSlotAndContainer(t *testing.T) {
+	sb := &Service{Cfg: config.Config{BackendPrefix: "pg-dev", Slot: "b"}}
+	if sb.slot() != "b" || sb.container() != "pg-dev-b" {
+		t.Fatalf("slot=%q container=%q", sb.slot(), sb.container())
 	}
-	if a != "10.9.9.11" || b != "10.9.9.12" {
-		t.Fatalf("resolved %s/%s, want the overrides", a, b)
-	}
-}
-
-func TestOtherSlot(t *testing.T) {
-	if other("a") != "b" || other("b") != "a" {
-		t.Fatal("other() should flip a↔b")
+	// Unset slot defaults to "a" so a legacy/single-machine deploy still resolves.
+	sa := &Service{Cfg: config.Config{BackendPrefix: "pg-dev", Slot: ""}}
+	if sa.slot() != "a" || sa.container() != "pg-dev-a" {
+		t.Fatalf("default slot=%q container=%q", sa.slot(), sa.container())
 	}
 }

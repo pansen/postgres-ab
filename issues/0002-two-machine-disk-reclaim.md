@@ -44,13 +44,19 @@ are all **unchanged**.
 2. **Keep in-machine reflink snapshots** — the Slice 1–3 engine is kept per
    machine; soft reset (reflink) stays the day-to-day default, hard reset
    (machine recreate) is the reclaim tier.
-3. Snapshot-store location (home-mount vs accept-loss-on-nuke): **still open**,
-   low priority — a hard reset intentionally discards staging snapshots.
+3. Snapshot-store location (home-mount vs accept-loss-on-nuke): **decided —
+   accept-loss** for this scope. The XFS store stays machine-local (inside each
+   machine's `vdb`); a hard reset intentionally discards that machine's
+   snapshots, which is the whole point of the reclaim tier. Home-mount
+   persistence remains a possible future enhancement, not needed now.
 4. **Per-machine memory is configurable** (`MACHINE_MEMORY` today is `12G`; two
    machines must each drop, e.g. 6–8G). The 2× RAM concern in §4 is **dismissed**
    as a temporary loading-phase cost.
-5. Golden image (keep per-machine vs bake PG into `Dockerfile.machine`): **still
-   open**, decide during the daemon slice.
+5. Golden image (keep per-machine vs bake PG into `Dockerfile.machine`):
+   **decided — keep per-machine golden for now.** The daemon still builds its
+   `pg-dev-base` image on first `up`. Correctness first; baking PostgreSQL into
+   `Dockerfile.machine` (which would remove one ~minutes build per machine, ×2)
+   is a deferred optimization tracked as a follow-up, not a blocker.
 6. **Concurrency smoke test: this was Slice 0 — PASSED 2026-07-22** (see §0.3).
 7. Sequencing: adopt now; the host forwarder (Slice 4 of 0001) is pulled in
    because routing must move host-side.
@@ -84,13 +90,123 @@ feasible; a Fable subagent serves as architect/second-opinion.
   ./scripts/two-machine-smoke.sh   # ITERS=5 by default; SMOKE_CPUS/SMOKE_MEMORY overridable
   ```
 
-- **Slices 1+ (in progress):** the code changes sketched in §5 — `internal/config`
-  two machine names, shrink `blueprint`/`reconcile`, `applecli` machine lifecycle,
-  host forwarder tracking two drifting IPs, one-backend-per-`pgdevd`, and the
-  `cmd/pgdev` promote/rebuild wiring. A Fable architect is producing the detailed
-  slice-by-slice plan; the existing `vpg` machine + its data must keep working
-  during migration (`vpg-a`/`vpg-b` coexist with `vpg` during dev — do not purge
-  `vpg` prematurely).
+- **Slices 1+ (in progress):** the code changes sketched in §5. The existing `vpg`
+  machine + its data must keep working during migration (`vpg-a`/`vpg-b` coexist
+  with `vpg` during dev — do not purge `vpg` prematurely). Landed so far (all
+  additive, build stays green; consumers migrate in later slices):
+
+  - **`internal/applecli` machine lifecycle ✅** — `Create`/`Boot`/`Stop`/`Delete`/
+    `Recreate` (`CreateOpts{CPUs,Memory,Image}`), the host-orchestrated hard-reset
+    primitives. `Delete` mirrors the Makefile tolerate-and-verify semantics (judge
+    success by absence, not exit code); `Boot` clears both Apple early-boot races
+    (execable retry → systemd bus). A package-level mutex serializes EVERY real
+    `container` invocation across all CLI instances — the Slice-0 invariant that
+    concurrent lifecycle execs are unsafe. Unit tests via the injectable `run`
+    hook + a fast `pollInterval` override.
+  - **`internal/config` two-machine model ✅** — `MachinePrefix` (→ `vpg-a`/`vpg-b`
+    via `MachineNameForSlot`), daemon-side `Slot` (`PG_SLOT`), single `BackendPort`
+    (5432 on each machine's eth0, no proxy), per-machine `MachineCPUs`/`MachineMemory`
+    (default 8G, down from 12G)/`MachineImage`, host-side `ActiveMachinePath()`
+    (`var/active-machine`) and per-machine `MachineIPPath(slot)`
+    (`var/machine-ip-a|b`). Legacy single-machine fields kept until their
+    consumers migrate.
+
+  - **Machine-side one-backend rewrite ✅** (all `go build/vet/test ./internal/...`
+    green). Topology decision recorded: NO separate `pg-proxy` container and NO
+    incusbr0 `.11/.12` pinning — each machine's single backend container carries
+    ONE Incus proxy device (`pgforward`) listening on the machine's `eth0:5432` →
+    `127.0.0.1:5432` inside the container, so the connect target is
+    container-loopback and never drifts.
+    - `internal/blueprint` collapsed to one `Backend` + one `Forward` (device on
+      the backend itself); `Compute(cfg, slot)` is pure (no live IP resolution).
+    - `internal/reconcile` collapsed to "if the backend is RUNNING, assert its
+      `pgforward` device" — no proxy container, no IP repair.
+    - `internal/agentapi` is now **slot-implicit, one backend per daemon**
+      (APIVersion→2): `StatusResponse` is a single backend; `Promote` and
+      `StartStaging`/`StopStaging` removed; added `Start`/`Stop`; `Snapshots`/
+      `Snapshot`/`Restore` dropped their slot param. Promote is host-side only.
+    - `internal/daemon` serves exactly its `PG_SLOT` backend: `Up` provisions one
+      backend + the forward, `Down` removes one slot, `Start`/`Stop`, slot-implicit
+      snapshot/restore; dropped the proxy container, active pointer, IP pinning.
+    - `internal/backend` gained `HasProxyDevice`; `cmd/pgdevd` unchanged.
+    - All four affected internal test files rewritten for the new contract.
+
+  - **Host-side rewrite ✅** (all `go build/vet/test ./...`, `bash -n
+    host-endpoint`, and `make check` green; CLI smoke-tested — `pgdev status`
+    with no machines degrades to a clean UNREACHABLE table).
+    - `cmd/pgdev`: `app` drops the single Apple CLI; `apple(slot)`/
+      `clientFor(slot)`/`roleSlot`/`clientForRole` give two per-machine clients
+      routed by the active-machine pointer. `up`/`down`/`status`/`snapshots`/`ip`
+      fan out over `[a,b]` (tolerating a down machine → UNREACHABLE). `promote`
+      is host-side: verify both backends RUNNING → flip `var/active-machine` →
+      `refreshForwarder()`, rolling the pointer back on forwarder failure. New
+      **`staging rebuild`** = the hard-reset reclaim tier (`Recreate` staging
+      machine → `deploy` → `Up` → re-point forwarder), guarded by an explicit
+      `staging != active` assertion and a `--force`/TTY confirm. `agent deploy`/
+      `agent version` gained `--machine a|b|both` (default both).
+    - `deploy.go`: `deploy(ctx, slot)` writes per-machine `var/pgdevd-<slot>.{env,
+      service}`; `daemonEnv(slot)` emits `PG_SLOT`+`PG_BACKEND_PORT`, drops the
+      proxy/pinned-IP vars.
+    - `scripts/host-endpoint`: tracks both machines — reads `var/active-machine`
+      + `var/machine-ip-a|b`, one socat per role to `<role-machine-ip>:5432`,
+      re-points on `refresh` via `launchctl kickstart` (so `promote` is picked up).
+      A missing IP for one role never blocks the other.
+    - `Makefile`: `MACHINE_PREFIX?=vpg`, `MACHINE_MEMORY` default `8G`;
+      `machine`/`delete`/`stop`/`disk`/`machine.status` loop `a b`; added
+      `pg.staging.rebuild`. `.env` updated: `MACHINE_MEMORY=8G`, `MACHINE_CPUS=4`,
+      explicit `MACHINE_PREFIX=vpg`.
+
+  **Known gaps (follow-ups, not blockers):**
+  - ~~`scripts/pg-dev-local` + shell/logs Makefile targets still use one legacy
+    `MACHINE_NAME`~~ **FIXED** — `pg.shell`/`pg.logs` now resolve the ACTIVE machine
+    and `pg.staging.shell`/`pg.staging.logs` the STAGING machine host-side (from
+    `var/active-machine`, via the `PG_DEV_IN`/`ACTIVE_SLOT`/`STAGING_SLOT` macros),
+    exec into that machine with `PG_SLOT`, and the shim operates on that machine's
+    one backend `pg-dev-$PG_SLOT`. `machine.shell` defaults to active (override
+    `slot=a|b`); `status/incus` loops both. Legacy `MACHINE_NAME` removed from the
+    Makefile and `.env`. Verified live: `pg.shell`→pg-dev-b (active), `pg.staging.
+    shell`→pg-dev-a (staging), both PG_READY.
+  - `.env.example` still documents the retired `PG_ACTIVE_PORT`/`PG_STAGING_PORT`/
+    `PG_BACKEND_A_IP`/`PG_BACKEND_B_IP` vars (now ignored) — cosmetic.
+  - `staging rebuild` is a linear sequence with no mid-rebuild rollback: if
+    `deploy`/`Up` fails after the machine delete, staging is left half-provisioned
+    until the command is re-run (acceptable — the active machine is untouched).
+
+  **Live end-to-end validation** (real `vpg-a`/`vpg-b`; the stopped `vpg` is a
+  different name, left untouched):
+  - Control plane ✅ — `make start` brings up both machines, deploys `pgdevd` to
+    each, both pass the version handshake (api v2), and `pgdev status` renders the
+    two-machine table (active=vpg-a / staging=vpg-b, backends ABSENT pre-`up`).
+  - Two bugs found + fixed during bring-up:
+    1. **Makefile boot race** — the `machine` target's single `container machine
+       run -- true` hit Apple's "Operation not supported by device" early-boot
+       race and aborted; now retries for 150s (mirrors the smoke test).
+    2. **Daemon token cold-cache** — `pgdevd` read `var/agent-token` as 0 bytes
+       over the virtiofs home-mount and 401'd everything. Fix: deliver the token
+       VALUE + creds machine-local (`PG_AGENT_TOKEN` in `/usr/local/etc/pgdevd.env`,
+       copied by a fresh exec; unit `EnvironmentFile` points local). The daemon no
+       longer reads its config over the mount. See memory
+       `pgdevd-token-home-mount-cold-cache`.
+  - Provisioning ✅ — `make pg.up` built the golden image on each machine and
+    provisioned both backends; both reach `RUNNING` with an `initial` snapshot.
+    Verified end-to-end with `psql` straight to each machine's `eth0:5432`: both
+    answer as PostgreSQL 17, and `inet_server_addr()` is `127.0.0.1/32` —
+    confirming the self-hosted `pgforward` device forwards machine-eth0 → the
+    container's loopback exactly as designed (no IP pinning).
+  - `promote` ✅ — flips `var/active-machine` a→b; `status` reflects
+    active=vpg-b/staging=vpg-a.
+  - **`staging rebuild` ✅ (the headline reclaim tier)** — with active=vpg-b,
+    rebuilt staging vpg-a: it was deleted + recreated (fresh DHCP lease, a marker
+    table inserted beforehand was GONE afterward = truly recreated), redeployed,
+    and re-provisioned; **active vpg-b served continuously throughout and its
+    marker survived** (the load-bearing "never touch active" property, live). The
+    macOS reclaim mechanism itself is the machine-delete proven in Slice 0.
+  - `make check` green (vet + all tests + build). The stopped `vpg` was never
+    touched.
+  - Forwarder note: `host-endpoint`'s launchd auto-install fails in the current
+    **nono sandbox** (`~/Library/LaunchAgents` not writable) — a sandbox limit,
+    not a code bug; it works outside the sandbox. All validation above went
+    straight to the machine IPs, bypassing the loopback forwarder.
 
 ---
 

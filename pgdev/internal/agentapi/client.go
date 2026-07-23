@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -45,15 +44,9 @@ func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
 	return out, err
 }
 
-func (c *Client) Snapshots(ctx context.Context, slot string) (SnapshotsResponse, error) {
+func (c *Client) Snapshots(ctx context.Context) (SnapshotsResponse, error) {
 	var out SnapshotsResponse
-	err := c.do(ctx, http.MethodGet, "/v1/snapshots?slot="+url.QueryEscape(slot), nil, &out)
-	return out, err
-}
-
-func (c *Client) Promote(ctx context.Context) (PromoteResponse, error) {
-	var out PromoteResponse
-	err := c.do(ctx, http.MethodPost, "/v1/promote", struct{}{}, &out)
+	err := c.do(ctx, http.MethodGet, "/v1/snapshots", nil, &out)
 	return out, err
 }
 
@@ -87,15 +80,15 @@ func (c *Client) Down(ctx context.Context) (OpResponse, error) {
 	return out, err
 }
 
-func (c *Client) StartStaging(ctx context.Context) (OpResponse, error) {
+func (c *Client) Start(ctx context.Context) (OpResponse, error) {
 	var out OpResponse
-	err := c.do(ctx, http.MethodPost, "/v1/staging/start", struct{}{}, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/start", struct{}{}, &out)
 	return out, err
 }
 
-func (c *Client) StopStaging(ctx context.Context) (OpResponse, error) {
+func (c *Client) Stop(ctx context.Context) (OpResponse, error) {
 	var out OpResponse
-	err := c.do(ctx, http.MethodPost, "/v1/staging/stop", struct{}{}, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/stop", struct{}{}, &out)
 	return out, err
 }
 

@@ -97,12 +97,15 @@ func cmdServe(ctx context.Context, args []string) error {
 	if err := svc.RecoverPending(ctx); err != nil {
 		return fmt.Errorf("recovering interrupted operation on start: %w", err)
 	}
-	token, err := agentapi.ReadToken(cfg.AgentTokenPath)
-	if err != nil {
-		return fmt.Errorf("reading agent token: %w", err)
-	}
-	if token == "" {
-		logx.Stderr("WARNING: no agent token at %s yet; API rejects all requests until 'pgdev agent deploy' writes one", cfg.AgentTokenPath)
+	// The token comes from the environment (PG_AGENT_TOKEN), delivered in the
+	// machine-local env file by `pgdev agent deploy`. It is deliberately NOT read
+	// from the home-mounted token file: that virtiofs cache can return an empty
+	// read for a just-written file right after boot (observed: a `cat` sees 0
+	// bytes while the file is really 65), which would 401 every request. An empty
+	// value (a bare `pgdevd serve` with no deploy) rejects all requests.
+	token := agentapi.FixedToken(cfg.AgentToken)
+	if cfg.AgentToken == "" {
+		logx.Stderr("WARNING: PG_AGENT_TOKEN unset; API rejects all requests until 'pgdev agent deploy' delivers one")
 	}
 
 	listen := *addr

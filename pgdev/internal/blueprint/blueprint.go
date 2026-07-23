@@ -1,10 +1,14 @@
-// Package blueprint expresses the desired topology as data. Compute() returns
-// the full intended state as a pure function of (config, active slot, resolved
-// backend IPs); the reconciler (internal/reconcile) makes reality match it.
+// Package blueprint expresses the desired in-machine topology as data.
+// Compute() returns the intended state as a pure function of (config, slot); the
+// reconciler (internal/reconcile) makes reality match it.
 //
-// The load-bearing collapse (§5.2 of issues/0001): the proxy devices' connect
-// targets are a pure function of the active slot, so promote becomes
-// "SetActive(other) then Reconcile()" — no hand-threaded rollback, no drift.
+// Two-machine model (spec 0002): each machine hosts exactly ONE backend and no
+// separate proxy container. The backend is exposed on the machine's own eth0 by
+// a single Incus proxy device attached to the backend container itself
+// (listen on the machine host, connect to PostgreSQL on the container's
+// loopback) — so there is no incusbr0 static-IP pinning to reason about: the
+// connect target never drifts. promote is a host-side concern and does not
+// appear here.
 package blueprint
 
 import (
@@ -13,73 +17,40 @@ import (
 	"pansen.me/pgdev/internal/config"
 )
 
-// Backend is one PostgreSQL slot container.
+// ForwardDevice is the name of the proxy device that exposes the backend on the
+// machine's eth0. Kept stable so reconcile re-points the same device.
+const ForwardDevice = "pgforward"
+
+// Backend is this machine's single PostgreSQL container.
 type Backend struct {
 	Name string // pg-dev-a
 	Slot string // a | b
-	IP   string // pinned eth0 (.11 / .12)
 }
 
-// ProxyDevice is one Incus proxy device on the proxy container. bind=host puts
-// the listener on the Apple machine's eth0 (reachable from macOS); the connect
-// target is the backend's pinned incusbr0 address.
-type ProxyDevice struct {
-	Name    string // "main" | "staging"
-	Listen  string // tcp:0.0.0.0:<clientPort-on-machine>
-	Connect string // tcp:<backendIP>:5432
+// Forward is the proxy device on the backend container. bind=host puts the
+// listener on the Apple machine's eth0 (reachable from macOS); connect targets
+// PostgreSQL on the container's loopback.
+type Forward struct {
+	Device  string // pgforward
+	Listen  string // tcp:0.0.0.0:<backendPort>
+	Connect string // tcp:127.0.0.1:<backendPort>
 }
 
-// Proxy is the bare container that owns the two proxy devices.
-type Proxy struct {
-	Name    string        // pg-proxy
-	Devices []ProxyDevice // main → active, staging → staging
-}
-
-// Blueprint is the complete intended topology for a given active slot.
+// Blueprint is the complete intended topology for this machine's one backend.
 type Blueprint struct {
-	Active   string // active slot
-	Backends [2]Backend
-	Proxy    Proxy
+	Backend Backend
+	Forward Forward
 }
 
-// Device names on the proxy container (kept identical to the shell's constants).
-const (
-	MainDevice    = "main"
-	StagingDevice = "staging"
-	// backendPGPort is the PostgreSQL port inside every backend container.
-	backendPGPort = 5432
-)
-
-// Compute returns the intended topology. aIP/bIP are the resolved pinned
-// addresses for slots a/b (the caller resolves any incusbr0-derived defaults so
-// this stays pure and testable).
-func Compute(cfg config.Config, active, aIP, bIP string) Blueprint {
-	staging := "b"
-	if active == "b" {
-		staging = "a"
-	}
-	ip := map[string]string{"a": aIP, "b": bIP}
-
+// Compute returns the intended topology for the given slot. Pure and testable:
+// no live IP resolution is needed because the forward connects to loopback.
+func Compute(cfg config.Config, slot string) Blueprint {
 	return Blueprint{
-		Active: active,
-		Backends: [2]Backend{
-			{Name: cfg.Container("a"), Slot: "a", IP: aIP},
-			{Name: cfg.Container("b"), Slot: "b", IP: bIP},
-		},
-		Proxy: Proxy{
-			Name: cfg.ProxyName,
-			Devices: []ProxyDevice{
-				{
-					Name:    MainDevice,
-					Listen:  fmt.Sprintf("tcp:0.0.0.0:%d", cfg.ActivePort),
-					Connect: fmt.Sprintf("tcp:%s:%d", ip[active], backendPGPort),
-				},
-				{
-					Name:    StagingDevice,
-					Listen:  fmt.Sprintf("tcp:0.0.0.0:%d", cfg.StagingPort),
-					Connect: fmt.Sprintf("tcp:%s:%d", ip[staging], backendPGPort),
-				},
-			},
+		Backend: Backend{Name: cfg.Container(slot), Slot: slot},
+		Forward: Forward{
+			Device:  ForwardDevice,
+			Listen:  fmt.Sprintf("tcp:0.0.0.0:%d", cfg.BackendPort),
+			Connect: fmt.Sprintf("tcp:127.0.0.1:%d", cfg.BackendPort),
 		},
 	}
 }
