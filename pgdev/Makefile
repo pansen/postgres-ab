@@ -17,13 +17,21 @@ GOARCH     ?= arm64
 # (host pgdev ↔ in-machine pgdevd via GET /v1/version) matches.
 VERSION    ?= $(shell git -C .. describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS    := -s -w -X main.version=$(VERSION)
-# Stable code-signing identity for the host CLI. macOS Local Network Privacy
-# (Tahoe+) keys the forwarder LaunchAgent's grant to this identifier; a plain
-# `go build` leaves an ad-hoc "a.out" identity, so every rebuild would drop the
-# grant and the forwarder's dial to the VM subnet would start failing again with
-# EHOSTUNREACH ("server closed the connection unexpectedly"). Re-sign on every
-# host build so the once-granted Local Network permission survives rebuilds.
+# Code-signing for the host CLI. macOS Local Network Privacy (Tahoe+) keys the
+# forwarder LaunchAgent's grant to the binary's SIGNING IDENTITY, and we re-sign
+# on every host build so a plain `go build` can't drop it.
+#
+#   SIGN_CERT — the `codesign --sign` identity. Default "-" is ad-hoc: it has no
+#     stable identity, so macOS falls back to the cdhash, which changes every
+#     build → each rebuild re-prompts for Local Network AND adds a duplicate row
+#     to the list. Set it to a stable keychain code-signing identity (a one-time
+#     self-signed cert is enough for local dev — see README "macOS Security") and
+#     the once-granted permission survives every rebuild, no re-prompt:
+#       make build SIGN_CERT="PGDev Signing"      (or set it in .env)
+#   SIGN_ID   — the stable --identifier, so the Local Network entry shows a fixed
+#     name (me.pansen.pgdev) regardless of which cert signs it.
 SIGN_ID    := me.pansen.pgdev
+SIGN_CERT  ?= -
 
 .DEFAULT_GOAL := build
 
@@ -45,8 +53,8 @@ host:
 	@mkdir -p $(BIN_DIR)
 	@go build -trimpath -ldflags '$(LDFLAGS)' -o $(HOST_OUT) ./cmd/pgdev
 	@if command -v codesign >/dev/null 2>&1; then \
-		codesign --force --sign - --identifier $(SIGN_ID) $(HOST_OUT) || exit 1; \
-		echo "signed $(HOST_OUT) ($(SIGN_ID))"; \
+		codesign --force --sign "$(SIGN_CERT)" --identifier $(SIGN_ID) $(HOST_OUT) || exit 1; \
+		echo "signed $(HOST_OUT) ($(SIGN_ID), cert=$(SIGN_CERT))"; \
 	fi
 	@echo "built $(HOST_OUT) (host, $(VERSION))"
 

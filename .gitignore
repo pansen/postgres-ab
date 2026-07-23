@@ -1,5 +1,6 @@
 /.zed
 .env
+/etc/keys/*
 
 # Everything under var/ is machine-local runtime or generated state — nothing
 # there is source: the agent-token SECRET, the active-slot/machine-ip pointers,

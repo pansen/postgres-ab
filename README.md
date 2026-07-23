@@ -3,8 +3,8 @@
 Fast, snapshottable PostgreSQL for local development on Apple silicon — load a
 fresh dump into a spare instance and swap it in without downtime.
 
-`pg_restore` of a large dump can take ~90 minutes (in my case, having expensive GIN indexes), 
-and the dev database is 
+`pg_restore` of a large dump can take ~90 minutes (in my case, having expensive GIN indexes),
+and the dev database is
 unreachable the whole time. This repo runs two persistent Apple `container`
 machines, **`vpg-a`** and **`vpg-b`**, each hosting one PostgreSQL 17 backend on
 its own Incus + copy-on-write XFS snapshot store. One machine is **active**
@@ -300,11 +300,56 @@ its sparse image) and never touches active. `make recreate` is the full nuke.
 
 ### macOS Security
 
-Ensure the service has _Local Network_ permission.
+On macOS 15 Sequoia and later (incl. 26 Tahoe), **Local Network Privacy** gates
+the forwarder's connection to the machines' `192.168.64.0/24` subnet. Until it is
+granted, the forwarder accepts the client on `:5442`/`:5443` then can't reach the
+backend (`EHOSTUNREACH`), and `psql` reports _"server closed the connection
+unexpectedly."_ Grant it under **System Settings → Privacy & Security → Local
+Network** (enable `pgdev`), then apply the grant to the already-running agent:
 
-> Note that each time you re-build, it will ask for permission again and it will also add another item in the _Local Network_ list.
+```sh
+make endpoint.restart
+```
+
+(The grant is cached at process start, so a service that was already running when
+you ticked the box stays blocked until restarted.)
 
 ![Local Network permission](doc/img/LocalNetworkpermission.png)
+
+#### Making the grant survive rebuilds
+
+The permission is keyed to the binary's **code-signing identity**. By default
+`make build` signs `bin/pgdev` **ad-hoc**, which has no stable identity — macOS
+falls back to the binary's content hash (cdhash), so **every rebuild looks like a
+new program**: it re-prompts and adds another duplicate row to the _Local
+Network_ list.
+
+To fix that permanently, sign with a stable **self-signed code-signing
+certificate** (local-dev only; no Apple account needed). One-time setup:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -days 3650 -keyout etc/keys/dev.key -out etc/keys/dev.crt -nodes \
+  -subj "/CN=PGDev Signing" -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=codeSigning"
+openssl pkcs12 -export -legacy -in etc/keys/dev.crt -inkey etc/keys/dev.key -out etc/keys/dev.p12 -password pass:dev
+security import etc/keys/dev.p12 -k ~/Library/Keychains/login.keychain-db -P dev -T /usr/bin/codesign
+# Keychain Access → "PGDev Signing" → Trust → Code Signing: Always Trust
+```
+
+Then build with that identity (put it in `.env` so it's automatic):
+
+```sh
+make build SIGN_CERT="PGDev Signing"     # or: echo 'SIGN_CERT=PGDev Signing' >> .env
+```
+
+Grant _Local Network_ once; because the signing identity is now stable, every
+later `make build` keeps the same grant — no re-prompt, no duplicate entries.
+
+> Alternative — skip the permission entirely: Local Network Privacy does **not**
+> apply to code running as **root**, so installing the forwarder as a
+> _LaunchDaemon_ (`/Library/LaunchDaemons`, system domain) instead of a per-user
+> _LaunchAgent_ sidesteps it — at the cost of running as root and needing `sudo`
+> to install. Not the default here.
 
 ### Disk Space
 
