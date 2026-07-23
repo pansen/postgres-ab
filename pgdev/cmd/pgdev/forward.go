@@ -44,6 +44,7 @@ func (a *app) forwardOptions() forward.Options {
 		MachineIPPath:     a.cfg.MachineIPPath,
 		StatePath:         a.cfg.ForwardStatePath(),
 		Log:               logf,
+		Verbose:           a.cfg.ForwardVerbose,
 	}
 }
 

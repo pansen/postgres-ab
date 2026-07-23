@@ -70,8 +70,8 @@ func TestReloadDropsStaleSessionsOnRepoint(t *testing.T) {
 	// Register a fake session on each role at the current target.
 	activeCli, activeUp := net.Pipe()
 	stagingCli, stagingUp := net.Pipe()
-	s.register(liveConn{role: "active", target: s.target("active"), client: activeCli, up: activeUp})
-	s.register(liveConn{role: "staging", target: s.target("staging"), client: stagingCli, up: stagingUp})
+	s.register(s.nextConnID(), liveConn{role: "active", target: s.target("active"), client: activeCli, up: activeUp})
+	s.register(s.nextConnID(), liveConn{role: "staging", target: s.target("staging"), client: stagingCli, up: stagingUp})
 
 	// Promote: flip the pointer. Both role targets change (a<->b swap), so BOTH
 	// sessions are stale and must be dropped.
@@ -100,7 +100,7 @@ func TestReloadKeepsUnaffectedSession(t *testing.T) {
 	s.reload()
 
 	cli, up := net.Pipe()
-	s.register(liveConn{role: "active", target: s.target("active"), client: cli, up: up})
+	s.register(s.nextConnID(), liveConn{role: "active", target: s.target("active"), client: cli, up: up})
 
 	// Only staging's IP changes; active target is untouched.
 	writeFile(t, filepath.Join(dir, "machine-ip-b"), "10.0.0.99\n")

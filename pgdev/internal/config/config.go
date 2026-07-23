@@ -71,6 +71,11 @@ type Config struct {
 	// containers/k3d that can't hit the Mac's loopback — this exposes the
 	// dev-credentialed backend to every interface, so widen deliberately.
 	ForwardBind string
+	// ForwardVerbose enables the forwarder's per-poll DBG trace (PG_FORWARD_DEBUG=1)
+	// on top of its always-on lifecycle logging. Read from .env like the rest so
+	// the LaunchAgent (which loads config via PG_REPO_ROOT/.env, not the process
+	// env) actually honors it.
+	ForwardVerbose bool
 
 	BackendPrefix string // pg-dev
 	ProxyName     string // pg-proxy — LEGACY (single-machine in-machine proxy)
@@ -136,6 +141,7 @@ func Load() Config {
 		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
 		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
 		ForwardBind:       get("PG_FORWARD_BIND", "127.0.0.1"),
+		ForwardVerbose:    get("PG_FORWARD_DEBUG", "") == "1",
 		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
 		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),
 		BackendAIP:        get("PG_BACKEND_A_IP", ""),
