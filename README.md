@@ -22,6 +22,10 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
   staging machine to free its grown macOS disk, while active keeps serving.
 - **Low power at runtime**, thanks to Apple `container`.
 
+### A view
+
+![How it looks like](doc/img/how_it_looks_like.png)
+
 ## Requirements
 
 Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or newer — install the
