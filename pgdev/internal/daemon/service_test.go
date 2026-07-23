@@ -18,3 +18,16 @@ func TestSlotAndContainer(t *testing.T) {
 		t.Fatalf("default slot=%q container=%q", sa.slot(), sa.container())
 	}
 }
+
+// New fails fast on a misconfigured slot instead of silently defaulting to "a".
+func TestNewRejectsInvalidSlot(t *testing.T) {
+	if _, err := New(config.Config{Slot: "x"}, "v", nil); err == nil {
+		t.Fatal("New should reject an invalid PG_SLOT")
+	}
+	// Unset and a/b are accepted (unset → legacy default).
+	for _, s := range []string{"", "a", "b"} {
+		if _, err := New(config.Config{Slot: s, DataRoot: t.TempDir()}, "v", nil); err != nil {
+			t.Fatalf("New(slot=%q): %v", s, err)
+		}
+	}
+}

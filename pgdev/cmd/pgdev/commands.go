@@ -274,7 +274,14 @@ func (a *app) promoteCmd() *cobra.Command {
 					return fmt.Errorf("promote: %s: %w — run 'make start'", machine, err)
 				}
 				if st.State != "RUNNING" {
-					return fmt.Errorf("promote: %s backend is %s, not RUNNING — run 'make start'", machine, orAbsent(st.State))
+					fix := "run 'make start'"
+					switch {
+					case st.State == "": // never provisioned
+						fix = "run 'make pg.up'"
+					case slot == to: // staging backend merely stopped
+						fix = "run 'make pg.staging.start'"
+					}
+					return fmt.Errorf("promote: %s backend is %s, not RUNNING — %s", machine, orAbsent(st.State), fix)
 				}
 			}
 

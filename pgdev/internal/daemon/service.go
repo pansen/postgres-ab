@@ -42,6 +42,14 @@ type Service struct {
 // New wires a Service from a resolved config. version is the build stamp the
 // deploy handshake checks.
 func New(cfg config.Config, version string, log logx.Func) (*Service, error) {
+	// Fail fast on a misconfigured slot rather than silently defaulting to "a"
+	// (which would make a machine meant to serve "b" operate on pg-dev-a). An
+	// unset PG_SLOT is allowed and defaults to "a" for legacy/single-machine use.
+	switch cfg.Slot {
+	case "", "a", "b":
+	default:
+		return nil, fmt.Errorf("PG_SLOT must be \"a\" or \"b\" (got %q)", cfg.Slot)
+	}
 	st := store.NewOSStore(cfg.DataRoot)
 	j, err := task.NewFileJournal(st.JournalDir())
 	if err != nil {
@@ -62,8 +70,9 @@ func New(cfg config.Config, version string, log logx.Func) (*Service, error) {
 	}, nil
 }
 
-// slot is this daemon's backend slot (a|b), from PG_SLOT. Defaults to "a" for a
-// legacy/unset environment so a single-machine deploy still resolves a backend.
+// slot is this daemon's backend slot (a|b), from PG_SLOT. Invalid values are
+// rejected in New; an unset PG_SLOT defaults to "a" so a legacy/single-machine
+// deploy still resolves a backend.
 func (s *Service) slot() string {
 	if s.Cfg.Slot == "b" {
 		return "b"

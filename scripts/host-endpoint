@@ -162,13 +162,19 @@ _serve() {
     fi
 
     trap 'kill "${pids[@]}" 2>/dev/null || true' TERM INT
-    # Exit (letting KeepAlive restart us) once any started socat dies, or the
-    # active/staging pointer flips — either way the target mapping is now
-    # stale and a fresh _serve picks up the new one.
+    # Exit (letting KeepAlive restart us with a fresh mapping) once any started
+    # socat dies OR the active/staging pointer flips — either way the current
+    # targets are stale. `promote`/`refresh` also kickstart us; this poll is the
+    # backstop that re-points even if the pointer changes some other way.
     while :; do
         for pid in "${pids[@]}"; do
             kill -0 "$pid" 2>/dev/null || { kill "${pids[@]}" 2>/dev/null || true; exit 1; }
         done
+        if [[ "$(_active_slot)" != "$active" ]]; then
+            echo "$(date '+%F %T') active pointer flipped to $(_machine_name "$(_active_slot)"); restarting to re-point." >&2
+            kill "${pids[@]}" 2>/dev/null || true
+            exit 1
+        fi
         sleep 5
     done
 }
