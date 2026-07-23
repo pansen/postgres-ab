@@ -3,6 +3,7 @@ package forward
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -168,22 +169,34 @@ func (l *Launchd) Status(ctx context.Context) string {
 	return "launchd: " + strings.Join(lines, ", ")
 }
 
-var plistTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.0" encoding="UTF-8"?>
+// xmlEscape renders a value as XML character data. Paths and labels are "ours",
+// but a path can legally contain '&' or '<', which would otherwise produce an
+// invalid plist and fail bootstrap in a baffling way — so every interpolated
+// <string> goes through this.
+func xmlEscape(s string) (string, error) {
+	var b bytes.Buffer
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+var plistTemplate = template.Must(template.New("plist").Funcs(template.FuncMap{"xml": xmlEscape}).Parse(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{{.Label}}</string>
+    <string>{{xml .Label}}</string>
     <key>ProgramArguments</key>
     <array>
-{{range .Program}}        <string>{{.}}</string>
+{{range .Program}}        <string>{{xml .}}</string>
 {{end}}    </array>
     <key>WorkingDirectory</key>
-    <string>{{.RepoRoot}}</string>
+    <string>{{xml .RepoRoot}}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PG_REPO_ROOT</key>
-        <string>{{.RepoRoot}}</string>
+        <string>{{xml .RepoRoot}}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -192,9 +205,9 @@ var plistTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
-    <string>{{.LogPath}}</string>
+    <string>{{xml .LogPath}}</string>
     <key>StandardErrorPath</key>
-    <string>{{.LogPath}}</string>
+    <string>{{xml .LogPath}}</string>
 </dict>
 </plist>
 `))
@@ -204,8 +217,6 @@ func (l *Launchd) writePlist() error {
 		return err
 	}
 	var buf bytes.Buffer
-	// text/template escapes nothing for XML; the values here are our own binary
-	// path, a fixed label and a log path under the repo — no untrusted input.
 	if err := plistTemplate.Execute(&buf, l); err != nil {
 		return err
 	}

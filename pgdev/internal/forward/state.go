@@ -81,14 +81,18 @@ func ReadState(path string) (State, bool) {
 	return st, true
 }
 
-// ReapListeners kills any process still LISTENing on the given TCP ports. This
-// is a ONE-TIME migration step for `forward install`: orphaned socat children
-// from the retired shell forwarder may still hold :5442/:5443, and a fresh
-// `serve` would get EADDRINUSE and crash-loop under KeepAlive. The steady-state
-// design never orphans anything, so this is not on the serve path. Best-effort
-// and macOS-specific (lsof); a no-op where lsof is unavailable.
+// ReapListeners kills any *socat* process still LISTENing on the given TCP
+// ports. This is a ONE-TIME migration step for `forward install`: orphaned socat
+// children from the retired shell forwarder may still hold :5442/:5443, and a
+// fresh `serve` would get EADDRINUSE and crash-loop under KeepAlive. The
+// steady-state design never orphans anything, so this is not on the serve path.
+// It filters on the socat command name (lsof -c) so it can NEVER kill an
+// unrelated process that happens to hold those ports (e.g. after the user
+// re-points PG_CLIENT_*_PORT). Best-effort and macOS-specific (lsof); a no-op
+// where lsof is unavailable or no socat is found.
 func ReapListeners(ports ...int) {
-	args := []string{"-nP", "-t", "-sTCP:LISTEN"}
+	// -a ANDs the selectors: (command=socat) AND (one of the ports) AND LISTEN.
+	args := []string{"-nP", "-t", "-a", "-c", "socat", "-sTCP:LISTEN"}
 	for _, p := range ports {
 		args = append(args, "-iTCP:"+strconv.Itoa(p))
 	}

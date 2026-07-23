@@ -191,19 +191,37 @@ func (s *Server) target(role string) string {
 
 // acceptLoop accepts on ln until ctx is done or the listener is closed; each
 // accepted conn is handled on its own goroutine so a slow dial never stalls the
-// listener.
+// listener. A transient Accept error (e.g. EMFILE, a momentary resource pinch)
+// must NOT abandon the role for the process's lifetime — that would defeat the
+// whole point of a resident forwarder — so it backs off and retries (the
+// net/http.Server pattern), returning only on context cancellation.
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener, role string) {
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
-				return // shutdown: expected error from Close
+				return // shutdown: the listener was closed on purpose
 			default:
-				s.log("accept on %s: %v", role, err)
-				return
 			}
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+			}
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+			s.log("accept on %s: %v; retrying in %s", role, err, backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
 		}
+		backoff = 0
 		go s.handle(conn, role)
 	}
 }
