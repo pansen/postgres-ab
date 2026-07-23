@@ -28,9 +28,12 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
 
 ## Requirements
 
-Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or newer — install the
-signed package from the
-[Apple container releases](https://github.com/apple/container/releases).
+- Apple silicon running macOS 26.
+- Apple's `container` CLI (1.1+), `socat`, and Go — via Homebrew:
+
+  ```shell
+  brew install container socat go
+  ```
 
 ## Design
 
