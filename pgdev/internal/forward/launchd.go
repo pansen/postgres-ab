@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -140,6 +141,99 @@ func (l *Launchd) Restart(ctx context.Context) error {
 			l.Label, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// EnsureResult reports what Ensure observed and did, so the caller can print an
+// honest one-liner (silent on the healthy common path, loud when it healed).
+type EnsureResult struct {
+	Action string // "healthy", "installed", or "reinstalled"
+	Reason string // why it (re)installed; empty when Action == "healthy"
+}
+
+// Ensure validates the installed LaunchAgent against this Launchd's desired
+// configuration and self-heals a missing, unloaded, stale, or dead agent by
+// (re)installing it. It is the guard `make start` runs so the moved/renamed-repo
+// trap — a plist left pointing at a deleted binary, which merely being "on disk"
+// (Installed) does not catch — can no longer silently persist and leave the
+// client ports dead behind an opaque EX_CONFIG. Healthy is the cheap common
+// path: a single `launchctl print` and a compare, no writes, no reload.
+func (l *Launchd) Ensure(ctx context.Context) (EnsureResult, error) {
+	heal := func(action, reason string) (EnsureResult, error) {
+		if err := l.Install(ctx); err != nil {
+			return EnsureResult{}, err
+		}
+		return EnsureResult{Action: action, Reason: reason}, nil
+	}
+	if !l.Installed() {
+		return heal("installed", "no LaunchAgent was installed")
+	}
+	info, ok := l.inspect(ctx)
+	if !ok {
+		return heal("reinstalled", "the plist was on disk but launchd had not loaded it")
+	}
+	if got, stale := info.stale(l.Program); stale {
+		return heal("reinstalled", fmt.Sprintf("it pointed at a stale program (%s)", got))
+	}
+	if !info.running {
+		return heal("reinstalled", "the agent was loaded but not running (crashed?)")
+	}
+	return EnsureResult{Action: "healthy"}, nil
+}
+
+// printInfo is the slice of `launchctl print` output Ensure reasons over.
+type printInfo struct {
+	program string   // the scalar `program =` line
+	args    []string // the `arguments = { ... }` block (ProgramArguments)
+	running bool     // a live pid / `state = running`
+}
+
+// stale reports the observed program (for the message) and whether it differs
+// from want (the desired argv). It prefers the full arguments array and falls
+// back to the scalar program path; with neither readable it reports NOT stale,
+// so a parse miss never triggers a needless reinstall.
+func (p printInfo) stale(want []string) (string, bool) {
+	if len(p.args) > 0 {
+		return strings.Join(p.args, " "), !slices.Equal(p.args, want)
+	}
+	if p.program != "" {
+		return p.program, p.program != want[0]
+	}
+	return "", false
+}
+
+func (l *Launchd) inspect(ctx context.Context) (printInfo, bool) {
+	out, err := combinedTimed(ctx, 10*time.Second, "print", l.domainTarget())
+	if err != nil {
+		return printInfo{}, false
+	}
+	return parsePrint(out), true
+}
+
+// parsePrint extracts the program path, ProgramArguments, and running state from
+// `launchctl print gui/<uid>/<label>` output — launchctl's human-readable dump,
+// with `program = <path>`, an `arguments = { ... }` block, and `state = running`
+// / `pid = N` when the job is up.
+func parsePrint(out string) printInfo {
+	var p printInfo
+	inArgs := false
+	for _, ln := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(ln)
+		switch {
+		case inArgs:
+			if t == "}" {
+				inArgs = false
+			} else if t != "" {
+				p.args = append(p.args, t)
+			}
+		case strings.HasPrefix(t, "arguments = {"):
+			inArgs = true
+		case strings.HasPrefix(t, "program ="):
+			p.program = strings.TrimSpace(strings.TrimPrefix(t, "program ="))
+		case strings.HasPrefix(t, "pid ="), strings.HasPrefix(t, "state = running"):
+			p.running = true
+		}
+	}
+	return p
 }
 
 // Uninstall stops the agent and removes its plist. Tolerant of an

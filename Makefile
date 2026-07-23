@@ -248,8 +248,10 @@ status: machine.exists pgdevd
 # permanent 127.0.0.1:5442 (active) / :5443 (staging) endpoints and relays each
 # to whichever machine currently holds that role (on its own eth0:5432). It owns
 # the listeners for their whole lifetime and re-points itself from the pointer
-# file — `pgdev promote` is just a pointer write; `start` installs the agent
-# automatically on first run (PG_ENDPOINT_AUTOINSTALL=0 opts out).
+# file — `pgdev promote` is just a pointer write. `start` (via `pgdev refresh`)
+# validates the LaunchAgent every run and self-heals a missing, unloaded, stale
+# (e.g. a plist left pointing at a deleted binary after the repo moved), or
+# crashed agent (PG_ENDPOINT_AUTOINSTALL=0 opts out).
 
 .PHONY: endpoint.install
 endpoint.install: machine.exists

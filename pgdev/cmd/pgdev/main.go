@@ -173,11 +173,16 @@ func (a *app) longClientForRole(ctx context.Context, role string) (*agentapi.Cli
 	return a.longClientFor(ctx, a.roleSlot(role))
 }
 
-// ensureForwarder makes the client forwarder hands-off: on first `make start`
-// (no LaunchAgent yet) it installs internal/forward's agent so 127.0.0.1:5442/
-// :5443 come up automatically; afterwards it is a no-op because the resident
-// serve re-points itself from the pointer file — no kickstart, no launchd
-// round-trip on promote/refresh (spec 0003 §3). It NEVER fails the caller:
+// ensureForwarder makes the client forwarder hands-off: on `make start` it
+// validates the LaunchAgent against the current build and self-heals a missing,
+// unloaded, stale, or crashed one, so 127.0.0.1:5442/:5443 come up (and stay
+// correct) automatically. This is deliberately stronger than the old bare
+// "is a plist on disk?" check: after the repo moves or is renamed, a plist is
+// still on disk but points at a deleted binary — it loads, exits EX_CONFIG, and
+// leaves the ports dead. Ensure catches that program drift. On the healthy
+// common path it is a single `launchctl print` + compare, no launchd writes, so
+// the resident serve keeps re-pointing itself from the pointer file untouched
+// (no kickstart on promote/refresh; spec 0003 §3). It NEVER fails the caller:
 // PG_ENDPOINT_AUTOINSTALL=0 opts out, and a sandbox that can't write
 // ~/Library/LaunchAgents just warns.
 func (a *app) ensureForwarder(ctx context.Context) {
@@ -191,12 +196,16 @@ func (a *app) ensureForwarder(ctx context.Context) {
 		fmt.Fprintf(os.Stderr, "WARNING: skipping forwarder auto-install: %v\n", err)
 		return
 	}
-	if ld.Installed() {
+	res, err := ld.Ensure(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: forwarder auto-install failed (run 'pgdev forward install'): %v\n", err)
 		return
 	}
-	fmt.Fprintln(os.Stderr, "==> Endpoint forwarder not installed; installing it now...")
-	if err := ld.Install(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: forwarder auto-install failed (run 'pgdev forward install'): %v\n", err)
+	switch res.Action {
+	case "installed":
+		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' installed (%s).\n", ld.Label, res.Reason)
+	case "reinstalled":
+		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' re-synced: %s.\n", ld.Label, res.Reason)
 	}
 }
 
