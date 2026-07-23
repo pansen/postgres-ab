@@ -1,13 +1,18 @@
 // Package agentapi is the daemon's HTTP/JSON contract and its typed client.
 // The machine stops being "a shell you inject scripts into over Apple's broken
 // container exec" and becomes "a service you send requests to" (§5.8 of
-// issues/0001): pgdev (host) → HTTP/JSON → pgdevd (machine). Stateful control
-// (status/promote/snapshot/restore/reconcile) rides this API; the daemon owns
-// the journal, the single-mutation mutex and boot-time recovery centrally.
+// issues/0001): pgdev (host) → HTTP/JSON → pgdevd (machine).
+//
+// Two-machine model (spec 0002): each daemon serves EXACTLY ONE backend — its
+// own machine's slot. The contract is therefore slot-implicit: the host holds
+// one client per machine and routes by choosing the client, not by passing a
+// slot. Active/staging roles and promote are host-side concepts and are not part
+// of this contract.
 package agentapi
 
-// APIVersion is bumped when the wire contract changes incompatibly.
-const APIVersion = 1
+// APIVersion is bumped when the wire contract changes incompatibly. v2 = the
+// one-backend-per-machine, slot-implicit contract (dropped promote/staging).
+const APIVersion = 2
 
 // VersionResponse answers GET /v1/version — the handshake `pgdev agent deploy`
 // polls to confirm the freshly-installed daemon is the one now running.
@@ -21,50 +26,36 @@ type HealthResponse struct {
 	OK bool `json:"ok"`
 }
 
-// SnapshotInfo is one checkpoint on a slot's timeline (creation-ordered).
+// SnapshotInfo is one checkpoint on the backend's timeline (creation-ordered).
 type SnapshotInfo struct {
 	Name        string `json:"name"`
 	CreatedUnix int64  `json:"createdUnix"`
 }
 
-// BackendStatus is one slot's live facts. Raw only — the host renders endpoints,
-// psql lines and credentials from its own .env.
-type BackendStatus struct {
-	Slot      string         `json:"slot"`      // a | b
-	Container string         `json:"container"` // pg-dev-a
-	Role      string         `json:"role"`      // active | staging
-	State     string         `json:"state"`     // RUNNING/STOPPED/… or "" if absent
-	IPs       []string       `json:"ips"`
-	Snapshots []SnapshotInfo `json:"snapshots"`
-}
-
-// StatusResponse answers GET /v1/status (ports cmd_status). Backends are ordered
-// active-first so the host renders them like the shell did.
+// StatusResponse answers GET /v1/status: this machine's single backend. Raw
+// facts only — the host assigns the active/staging role (from its own pointer),
+// renders endpoints/psql lines and formats credentials.
 type StatusResponse struct {
-	Active           string          `json:"active"`
-	ProxyName        string          `json:"proxyName"`
-	ProxyState       string          `json:"proxyState"` // "" if absent
-	DataStoreMounted bool            `json:"dataStoreMounted"`
-	IncusVersion     string          `json:"incusVersion"`
-	Backends         []BackendStatus `json:"backends"`
+	Slot             string         `json:"slot"`             // this machine's slot (a|b)
+	Container        string         `json:"container"`        // pg-dev-a
+	State            string         `json:"state"`            // RUNNING/STOPPED/… or "" if absent
+	IPs              []string       `json:"ips"`              // container addresses (informational)
+	BackendPort      int            `json:"backendPort"`      // port the backend is exposed on (machine eth0)
+	ProxyDevice      bool           `json:"proxyDevice"`      // the eth0→backend proxy device is present
+	DataStoreMounted bool           `json:"dataStoreMounted"` // the XFS reflink store is mounted
+	IncusVersion     string         `json:"incusVersion"`
+	Snapshots        []SnapshotInfo `json:"snapshots"`
 }
 
-// SnapshotsResponse answers GET /v1/snapshots?slot=.
+// SnapshotsResponse answers GET /v1/snapshots.
 type SnapshotsResponse struct {
 	Slot      string         `json:"slot"`
 	Snapshots []SnapshotInfo `json:"snapshots"`
 }
 
-// PromoteResponse answers POST /v1/promote.
-type PromoteResponse struct {
-	From   string         `json:"from"`
-	To     string         `json:"to"`
-	Status StatusResponse `json:"status"`
-}
-
-// SnapshotRequest is the body of POST /v1/snapshot.
+// SnapshotRequest is the body of POST /v1/snapshot (slot implicit — the daemon
+// owns exactly one).
 type SnapshotRequest struct {
-	Slot  string `json:"slot"`
 	Name  string `json:"name"`
 	Force bool   `json:"force"`
 }
@@ -73,7 +64,6 @@ type SnapshotRequest struct {
 // snapshot (Name ignored). Force skips the newer-timeline confirmation, which
 // the host has already resolved on its TTY (no interactive prompt in-machine).
 type RestoreRequest struct {
-	Slot  string `json:"slot"`
 	Name  string `json:"name"`
 	Last  bool   `json:"last"`
 	Force bool   `json:"force"`
@@ -84,10 +74,11 @@ type OpResponse struct {
 	Message string `json:"message"`
 }
 
-// ReconcileResponse answers POST /v1/reconcile.
+// ReconcileResponse answers POST /v1/reconcile: whether the backend is running
+// and which forward device was (re)asserted.
 type ReconcileResponse struct {
-	ProxyRunning bool     `json:"proxyRunning"`
-	Actions      []string `json:"actions"`
+	BackendRunning bool     `json:"backendRunning"`
+	Actions        []string `json:"actions"`
 }
 
 // errorBody is the JSON shape of a non-2xx response.

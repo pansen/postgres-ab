@@ -14,47 +14,49 @@ import (
 type Service interface {
 	Version() VersionResponse
 	Status(ctx context.Context) (StatusResponse, error)
-	Snapshots(ctx context.Context, slot string) ([]SnapshotInfo, error)
-	Promote(ctx context.Context) (PromoteResponse, error)
+	Snapshots(ctx context.Context) ([]SnapshotInfo, error)
 	Snapshot(ctx context.Context, req SnapshotRequest) (OpResponse, error)
 	Restore(ctx context.Context, req RestoreRequest) (OpResponse, error)
 	Reconcile(ctx context.Context) (ReconcileResponse, error)
 	Up(ctx context.Context) (StatusResponse, error)
 	Down(ctx context.Context) (OpResponse, error)
-	StartStaging(ctx context.Context) (OpResponse, error)
-	StopStaging(ctx context.Context) (OpResponse, error)
+	Start(ctx context.Context) (OpResponse, error)
+	Stop(ctx context.Context) (OpResponse, error)
 }
 
-// Server adapts a Service to the HTTP/JSON contract with bearer-token auth.
+// Server adapts a Service to the HTTP/JSON contract with bearer-token auth. The
+// token is supplied by a provider (see FixedToken) evaluated per auth check.
 type Server struct {
 	svc   Service
-	token string
+	token func() string
 }
 
-// NewServer returns an http.Handler serving the v1 API. A non-empty token is
-// required on every route except /v1/healthz (an unauthenticated liveness probe).
-func NewServer(svc Service, token string) http.Handler {
+// NewServer returns an http.Handler serving the v1 API. token provides the
+// expected bearer secret on each auth check; a non-empty token is required on
+// every route except /v1/healthz (an unauthenticated liveness probe). Use
+// FixedToken to wrap a known value.
+func NewServer(svc Service, token func() string) http.Handler {
 	s := &Server{svc: svc, token: token}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/healthz", s.health)
 	mux.HandleFunc("GET /v1/version", s.auth(s.version))
 	mux.HandleFunc("GET /v1/status", s.auth(s.status))
 	mux.HandleFunc("GET /v1/snapshots", s.auth(s.snapshots))
-	mux.HandleFunc("POST /v1/promote", s.auth(s.promote))
 	mux.HandleFunc("POST /v1/snapshot", s.auth(s.snapshot))
 	mux.HandleFunc("POST /v1/restore", s.auth(s.restore))
 	mux.HandleFunc("POST /v1/reconcile", s.auth(s.reconcile))
 	mux.HandleFunc("POST /v1/up", s.auth(s.up))
 	mux.HandleFunc("POST /v1/down", s.auth(s.down))
-	mux.HandleFunc("POST /v1/staging/start", s.auth(s.stagingStart))
-	mux.HandleFunc("POST /v1/staging/stop", s.auth(s.stagingStop))
+	mux.HandleFunc("POST /v1/start", s.auth(s.start))
+	mux.HandleFunc("POST /v1/stop", s.auth(s.stop))
 	return mux
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if s.token == "" || got != s.token {
+		want := s.token()
+		if want == "" || got != want {
 			writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
 			return
 		}
@@ -80,22 +82,12 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) snapshots(w http.ResponseWriter, r *http.Request) {
-	slot := r.URL.Query().Get("slot")
-	snaps, err := s.svc.Snapshots(r.Context(), slot)
+	snaps, err := s.svc.Snapshots(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, SnapshotsResponse{Slot: slot, Snapshots: snaps})
-}
-
-func (s *Server) promote(w http.ResponseWriter, r *http.Request) {
-	res, err := s.svc.Promote(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, res)
+	writeJSON(w, http.StatusOK, SnapshotsResponse{Snapshots: snaps})
 }
 
 func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -153,8 +145,8 @@ func (s *Server) down(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) stagingStart(w http.ResponseWriter, r *http.Request) {
-	res, err := s.svc.StartStaging(r.Context())
+func (s *Server) start(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.Start(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -162,8 +154,8 @@ func (s *Server) stagingStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) stagingStop(w http.ResponseWriter, r *http.Request) {
-	res, err := s.svc.StopStaging(r.Context())
+func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
+	res, err := s.svc.Stop(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return

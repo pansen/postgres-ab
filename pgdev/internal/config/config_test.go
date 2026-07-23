@@ -54,6 +54,51 @@ func TestLoadReadsDotEnvButEnvWins(t *testing.T) {
 	}
 }
 
+func TestTwoMachineDefaults(t *testing.T) {
+	repo := t.TempDir()
+	clearPGEnv(t)
+	t.Setenv("PG_REPO_ROOT", repo)
+
+	c := Load()
+	if c.MachinePrefix != "vpg" {
+		t.Fatalf("MachinePrefix = %q, want vpg", c.MachinePrefix)
+	}
+	if c.MachineNameForSlot("a") != "vpg-a" || c.MachineNameForSlot("b") != "vpg-b" {
+		t.Fatalf("machine names = %q/%q", c.MachineNameForSlot("a"), c.MachineNameForSlot("b"))
+	}
+	if c.BackendPort != 5432 {
+		t.Fatalf("BackendPort = %d", c.BackendPort)
+	}
+	if c.MachineCPUs != 4 || c.MachineMemory != "8G" {
+		t.Fatalf("machine resources = %d/%q", c.MachineCPUs, c.MachineMemory)
+	}
+	if c.Slot != "" {
+		t.Fatalf("Slot host-side = %q, want empty", c.Slot)
+	}
+	if c.ActiveMachinePath() != filepath.Join(repo, "var", "active-machine") {
+		t.Fatalf("active-machine path = %q", c.ActiveMachinePath())
+	}
+	if c.MachineIPPath("b") != filepath.Join(repo, "var", "machine-ip-b") {
+		t.Fatalf("machine-ip path = %q", c.MachineIPPath("b"))
+	}
+}
+
+func TestMachinePrefixFromEnvAndSlot(t *testing.T) {
+	repo := t.TempDir()
+	clearPGEnv(t)
+	t.Setenv("PG_REPO_ROOT", repo)
+	t.Setenv("MACHINE_PREFIX", "test")
+	t.Setenv("PG_SLOT", "b")
+
+	c := Load()
+	if c.MachineNameForSlot("b") != "test-b" {
+		t.Fatalf("machine name = %q", c.MachineNameForSlot("b"))
+	}
+	if c.Slot != "b" {
+		t.Fatalf("Slot = %q, want b (daemon-side)", c.Slot)
+	}
+}
+
 func TestContainerAndSlot(t *testing.T) {
 	c := Config{BackendPrefix: "pg-dev"}
 	if c.Container("a") != "pg-dev-a" {

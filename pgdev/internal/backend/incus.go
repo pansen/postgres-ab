@@ -364,6 +364,13 @@ func (i *Incus) State(ctx context.Context, c string) (string, error) {
 	return i.state(ctx, c)
 }
 
+// HasProxyDevice reports whether a proxy device by that name exists on the
+// container (used by /v1/status to show the eth0 forward is in place).
+func (i *Incus) HasProxyDevice(ctx context.Context, container, dev string) bool {
+	_, err := i.output(ctx, "config", "device", "get", container, dev, "connect")
+	return err == nil
+}
+
 // SetProxyDevice adds-or-re-points one proxy device on the proxy container,
 // porting the shell's _ensure_proxy_device. bind=host puts the listener on the
 // Apple machine's eth0. A device left over from the Colima layout (bind=instance)

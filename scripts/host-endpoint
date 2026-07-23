@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# host-endpoint — a stable macOS-side client endpoint for the Apple container
-# machine's PostgreSQL.
+# host-endpoint — a stable macOS-side client endpoint for the two Apple
+# container machines' PostgreSQL (spec 0002: one machine per slot, vpg-a /
+# vpg-b, each exposing its single backend on its own eth0:5432).
 #
-# The Apple machine's IP on macOS's internal virtualization bridge is a bootpd
-# DHCP lease that is NOT pinnable: it (and even its /24) drifts across macOS
-# reboots and machine recreation. Apple's `container machine` CLI exposes no way
-# to fix it (no --network / --publish / static IP), and the machine registers no
-# resolvable DNS name. So instead of chasing the address, we publish a permanent
-# endpoint on the Mac's loopback and relay it to whatever the machine's current
-# IP happens to be:
+# The Apple machines' IPs on macOS's internal virtualization bridge are bootpd
+# DHCP leases that are NOT pinnable: they (and even their /24) drift across
+# macOS reboots and machine recreation, independently per machine. Apple's
+# `container machine` CLI exposes no way to fix them (no --network / --publish
+# / static IP), and the machines register no resolvable DNS name. So instead of
+# chasing the addresses, we publish permanent endpoints on the Mac's loopback
+# and relay each to whichever machine currently holds the active/staging role:
 #
-#   client ── 127.0.0.1:5442/:5443 ──▶ socat ──▶ <machine-ip>:5432/:5433
+#   client ── 127.0.0.1:5442 (active)  ──▶ socat ──▶ <active-machine-ip>:5432
+#   client ── 127.0.0.1:5443 (staging) ──▶ socat ──▶ <staging-machine-ip>:5432
 #
-# A per-user launchd LaunchAgent keeps the socat forwarders alive across logins.
-# The relay target is re-resolved on every `make start` (the only lifecycle
-# event that changes the IP — the machine is down until then anyway).
+# "Active" vs "staging" is a HOST-side pointer (var/active-machine, "a" or
+# "b", default "a" — internal/activeslot on the Go side); `promote` flips it
+# and re-runs `refresh` here to re-point which machine backs which client
+# port. No data moves and no in-machine proxy is involved.
+#
+# A per-user launchd LaunchAgent keeps the socat forwarders alive across
+# logins. The relay targets are re-resolved on every `make start`/`pgdev
+# refresh`/`pgdev promote`.
 #
 # Unlike the in-machine scripts/pg-dev-local, THIS script runs on macOS.
 #
@@ -26,28 +33,59 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
 
-MACHINE_NAME="${MACHINE_NAME:-vpg}"
-# Machine-side proxy ports we relay TO.
-ACTIVE_PORT="${PG_ACTIVE_PORT:-5432}"
-STAGING_PORT="${PG_STAGING_PORT:-5433}"
+# MACHINE_PREFIX yields the per-slot machine names <prefix>-a / <prefix>-b.
+# MACHINE_NAME is kept as a fallback for anyone whose .env still only sets the
+# legacy single-machine variable.
+MACHINE_PREFIX="${MACHINE_PREFIX:-${MACHINE_NAME:-vpg}}"
+# Both machines expose their one backend on their own eth0 at this port (no
+# in-machine proxy, no separate active/staging port on the guest side).
+BACKEND_PORT="${PG_BACKEND_PORT:-5432}"
 # Host loopback ports we listen ON — offset from 5432/5433 so a local
 # PostgreSQL on the default port isn't shadowed on 127.0.0.1.
 CLIENT_ACTIVE_PORT="${PG_CLIENT_ACTIVE_PORT:-5442}"
 CLIENT_STAGING_PORT="${PG_CLIENT_STAGING_PORT:-5443}"
 
-LABEL="me.pansen.${MACHINE_NAME}-forward"
+LABEL="me.pansen.${MACHINE_PREFIX}-forward"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-IPFILE="$REPO_ROOT/var/machine-ip"
-LOGFILE="$REPO_ROOT/var/${MACHINE_NAME}-forward.log"
+ACTIVE_FILE="$REPO_ROOT/var/active-machine"
+IPFILE_A="$REPO_ROOT/var/machine-ip-a"
+IPFILE_B="$REPO_ROOT/var/machine-ip-b"
+LOGFILE="$REPO_ROOT/var/${MACHINE_PREFIX}-forward.log"
 DOMAIN="gui/$(id -u)"
 
-# The machine's current eth0 address, discovered live from inside the machine —
-# the same value scripts/pg-dev-local shows as the "machine IP". Empty if the
-# machine isn't running. Mirrors _proxy_ip's parsing in scripts/pg-dev-local.
+# _machine_name slot → the Apple machine name for that slot ("a"/"b").
+_machine_name() { echo "${MACHINE_PREFIX}-$1"; }
+
+# _machine_ip slot → that machine's current eth0 address, discovered live from
+# inside the machine. Empty if the machine isn't running. Mirrors
+# scripts/pg-dev-local's proxy-IP parsing, per-slot.
 _machine_ip() {
-    container machine run --name "$MACHINE_NAME" --root -- \
+    local slot="$1"
+    container machine run --name "$(_machine_name "$slot")" --root -- \
         ip -4 -o addr show dev eth0 2>/dev/null \
         | awk '{ split($4, a, "/"); print a[1]; exit }' || true
+}
+
+# _active_slot → "a" or "b" (default "a" if the pointer file is absent),
+# mirroring internal/activeslot.Pointer.Get on the Go side.
+_active_slot() {
+    local s
+    s="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
+    case "$s" in
+        a|b) echo "$s" ;;
+        *)   echo "a" ;;
+    esac
+}
+
+_staging_slot() {
+    if [[ "$(_active_slot)" == a ]]; then echo b; else echo a; fi
+}
+
+_ip_file() {
+    case "$1" in
+        a) echo "$IPFILE_A" ;;
+        b) echo "$IPFILE_B" ;;
+    esac
 }
 
 _agent_installed() { [[ -f "$PLIST" ]]; }
@@ -90,47 +128,82 @@ _write_plist() {
 EOF
 }
 
-# The long-running relay, launched by launchd (never by hand). Reads the cached
-# machine IP and runs one socat listener per role port, supervising both so a
-# crash of either takes the agent down for KeepAlive to restart cleanly.
+# The long-running relay, launched by launchd (never by hand). Reads the
+# active-machine pointer and both cached machine IPs, then runs one socat
+# listener per role port that is actually resolvable — a missing IP for one
+# role (e.g. that machine is down) does not stop the other role's forwarder.
 _serve() {
-    local ip
-    ip="$(cat "$IPFILE" 2>/dev/null || true)"
-    if [[ -z "$ip" ]]; then
-        echo "$(date '+%F %T') no machine IP cached ($IPFILE); run 'make start'." >&2
+    local active staging active_ip staging_ip
+    active="$(_active_slot)"
+    staging="$(_staging_slot)"
+    active_ip="$(cat "$(_ip_file "$active")" 2>/dev/null || true)"
+    staging_ip="$(cat "$(_ip_file "$staging")" 2>/dev/null || true)"
+
+    if [[ -z "$active_ip" && -z "$staging_ip" ]]; then
+        echo "$(date '+%F %T') no machine IPs cached; run 'make start'." >&2
         sleep 30   # throttle KeepAlive so we don't hot-loop before the first refresh
         exit 1
     fi
-    echo "$(date '+%F %T') forwarding 127.0.0.1:${CLIENT_ACTIVE_PORT}->${ip}:${ACTIVE_PORT}, 127.0.0.1:${CLIENT_STAGING_PORT}->${ip}:${STAGING_PORT}" >&2
 
-    socat "TCP-LISTEN:${CLIENT_ACTIVE_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${ip}:${ACTIVE_PORT}" &
-    local a=$!
-    socat "TCP-LISTEN:${CLIENT_STAGING_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${ip}:${STAGING_PORT}" &
-    local b=$!
+    local -a pids=()
+    if [[ -n "$active_ip" ]]; then
+        echo "$(date '+%F %T') forwarding 127.0.0.1:${CLIENT_ACTIVE_PORT} -> $(_machine_name "$active") ${active_ip}:${BACKEND_PORT} (active)" >&2
+        socat "TCP-LISTEN:${CLIENT_ACTIVE_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${active_ip}:${BACKEND_PORT}" &
+        pids+=("$!")
+    else
+        echo "$(date '+%F %T') no IP cached for active machine $(_machine_name "$active"); :${CLIENT_ACTIVE_PORT} not served." >&2
+    fi
+    if [[ -n "$staging_ip" ]]; then
+        echo "$(date '+%F %T') forwarding 127.0.0.1:${CLIENT_STAGING_PORT} -> $(_machine_name "$staging") ${staging_ip}:${BACKEND_PORT} (staging)" >&2
+        socat "TCP-LISTEN:${CLIENT_STAGING_PORT},bind=127.0.0.1,fork,reuseaddr" "TCP:${staging_ip}:${BACKEND_PORT}" &
+        pids+=("$!")
+    else
+        echo "$(date '+%F %T') no IP cached for staging machine $(_machine_name "$staging"); :${CLIENT_STAGING_PORT} not served." >&2
+    fi
 
-    trap 'kill "$a" "$b" 2>/dev/null || true' TERM INT
-    while kill -0 "$a" 2>/dev/null && kill -0 "$b" 2>/dev/null; do sleep 5; done
-    kill "$a" "$b" 2>/dev/null || true
-    exit 1
+    trap 'kill "${pids[@]}" 2>/dev/null || true' TERM INT
+    # Exit (letting KeepAlive restart us with a fresh mapping) once any started
+    # socat dies OR the active/staging pointer flips — either way the current
+    # targets are stale. `promote`/`refresh` also kickstart us; this poll is the
+    # backstop that re-points even if the pointer changes some other way.
+    while :; do
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null || { kill "${pids[@]}" 2>/dev/null || true; exit 1; }
+        done
+        if [[ "$(_active_slot)" != "$active" ]]; then
+            echo "$(date '+%F %T') active pointer flipped to $(_machine_name "$(_active_slot)"); restarting to re-point." >&2
+            kill "${pids[@]}" 2>/dev/null || true
+            exit 1
+        fi
+        sleep 5
+    done
 }
 
+# _refresh_ip_file slot → best-effort refresh of that slot's cached IP file. A
+# machine being down is tolerated (its file is just left stale/empty) so a
+# staging rebuild or a stopped sibling never blocks refreshing the other.
 _refresh_ip_file() {
-    local ip
-    ip="$(_machine_ip)"
+    local slot="$1" ip
+    ip="$(_machine_ip "$slot")"
     if [[ -z "$ip" ]]; then
-        echo "WARNING: could not read the machine IP (is '$MACHINE_NAME' running?)." >&2
+        echo "WARNING: could not read the IP for $(_machine_name "$slot") (is it running?)." >&2
         return 1
     fi
-    mkdir -p "$(dirname "$IPFILE")"
-    printf '%s\n' "$ip" >"$IPFILE"
+    mkdir -p "$(dirname "$(_ip_file "$slot")")"
+    printf '%s\n' "$ip" >"$(_ip_file "$slot")"
     echo "$ip"
+}
+
+_refresh_ip_files() {
+    _refresh_ip_file a || true
+    _refresh_ip_file b || true
 }
 
 _print_endpoints() {
     cat <<EOF
-Stable client endpoint (127.0.0.1 is permanent; the forwarder tracks the machine IP):
-  active   psql -h 127.0.0.1 -p ${CLIENT_ACTIVE_PORT}  -U ${PG_USER:-<user>} ${PG_DB:-<db>}
-  staging  psql -h 127.0.0.1 -p ${CLIENT_STAGING_PORT} -U ${PG_USER:-<user>} ${PG_DB:-<db>}
+Stable client endpoints (127.0.0.1 is permanent; the forwarder tracks each machine's IP and follows 'promote'):
+  active   ($(_machine_name "$(_active_slot)"))  psql -h 127.0.0.1 -p ${CLIENT_ACTIVE_PORT}  -U ${PG_USER:-<user>} ${PG_DB:-<db>}
+  staging  ($(_machine_name "$(_staging_slot)"))  psql -h 127.0.0.1 -p ${CLIENT_STAGING_PORT} -U ${PG_USER:-<user>} ${PG_DB:-<db>}
 
 .pgpass lines:
 127.0.0.1:${CLIENT_ACTIVE_PORT}:*:${PG_USER:-<user>}:${PG_PASSWORD:-<password>}
@@ -138,11 +211,10 @@ Stable client endpoint (127.0.0.1 is permanent; the forwarder tracks the machine
 EOF
 }
 
-cmd_ip() { _machine_ip; }
+cmd_ip() { _machine_ip a; echo; _machine_ip b; }
 
 cmd_install() {
-    local ip
-    ip="$(_refresh_ip_file)" || { echo "Start the machine first: make start" >&2; return 1; }
+    _refresh_ip_files
     _write_plist
     launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
     if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
@@ -150,14 +222,16 @@ cmd_install() {
         return 1
     fi
     launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null || true
-    echo "==> Forwarder '$LABEL' installed (machine IP ${ip})."
+    echo "==> Forwarder '$LABEL' installed."
     _print_endpoints
 }
 
 cmd_refresh() {
-    # Called from every `make start`. First time (no agent yet) it installs
-    # itself so the forwarder is fully hands-off; afterwards it just re-points.
-    # Opt out with PG_ENDPOINT_AUTOINSTALL=0 to keep a deliberate uninstall.
+    # Called from every `make start` and `pgdev promote`/`refresh`. First time
+    # (no agent yet) it installs itself so the forwarder is fully hands-off;
+    # afterwards it just re-points (re-reading the active pointer, so a
+    # promote is picked up here too). Opt out with PG_ENDPOINT_AUTOINSTALL=0
+    # to keep a deliberate uninstall.
     if ! _agent_installed; then
         if [[ "${PG_ENDPOINT_AUTOINSTALL:-1}" == 0 ]]; then
             echo "==> Endpoint forwarder not installed; skipping (PG_ENDPOINT_AUTOINSTALL=0)."
@@ -167,11 +241,10 @@ cmd_refresh() {
         cmd_install || echo "WARNING: auto-install failed; run 'make endpoint.install' manually." >&2
         return 0   # never fail 'make start' on the endpoint step
     fi
-    local ip
-    ip="$(_refresh_ip_file)" || return 0   # tolerate: don't fail 'make start'
+    _refresh_ip_files || true   # tolerate: don't fail 'make start' if a machine is down
     launchctl kickstart -k "$DOMAIN/$LABEL" 2>/dev/null \
         || { launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null || true; }
-    echo "==> Forwarder re-pointed at machine IP ${ip} (endpoint stays 127.0.0.1)."
+    echo "==> Forwarder re-pointed: active=$(_machine_name "$(_active_slot)") staging=$(_machine_name "$(_staging_slot)") (endpoints stay 127.0.0.1:${CLIENT_ACTIVE_PORT}/:${CLIENT_STAGING_PORT})."
 }
 
 cmd_uninstall() {
@@ -182,11 +255,14 @@ cmd_uninstall() {
 
 cmd_status() {
     if _agent_installed; then
-        echo "plist:      $PLIST"
-        echo "cached IP:  $(cat "$IPFILE" 2>/dev/null || echo '(none)')"
-        echo "live IP:    $(_machine_ip || true)"
+        echo "plist:          $PLIST"
+        echo "active machine: $(_machine_name "$(_active_slot)")"
+        echo "cached IP a:    $(cat "$IPFILE_A" 2>/dev/null || echo '(none)')"
+        echo "cached IP b:    $(cat "$IPFILE_B" 2>/dev/null || echo '(none)')"
+        echo "live IP a:      $(_machine_ip a || true)"
+        echo "live IP b:      $(_machine_ip b || true)"
         launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -E 'state =|pid =' || \
-            echo "launchd:    not loaded"
+            echo "launchd:        not loaded"
     else
         echo "Forwarder not installed. Run 'make endpoint.install'."
     fi

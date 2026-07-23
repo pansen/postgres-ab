@@ -22,9 +22,15 @@ func ReadToken(path string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+// FixedToken adapts a known token value to the provider shape the server wants.
+// The daemon takes the token from PG_AGENT_TOKEN (delivered machine-local by
+// `pgdev agent deploy`), never over the home mount.
+func FixedToken(token string) func() string { return func() string { return token } }
+
 // EnsureToken reads path, or generates a fresh 256-bit token (0600) when it is
-// absent or empty. The host calls this so both sides share one secret over the
-// home-mount; the daemon only ReadTokens.
+// absent or empty. It is the HOST's secret store: the host client reads it to
+// authenticate, and `pgdev agent deploy` bakes its value into the daemon's
+// machine-local env (PG_AGENT_TOKEN). The daemon never reads this file.
 func EnsureToken(path string) (string, error) {
 	if tok, err := ReadToken(path); err == nil && tok != "" {
 		return tok, nil

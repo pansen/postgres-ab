@@ -6,38 +6,32 @@ set -Eeuo pipefail
 #
 # Almost everything now lives in the Go tooling under ./pgdev (see issues/0001):
 # provisioning, status, promote, refresh, snapshots, snapshot/restore, endpoint,
-# staging start/stop and the machine bootstrap are the `pgdev` host CLI talking to
-# the in-machine `pgdevd` daemon. What remains here is the interactive per-slot
-# passthroughs that still ride `incus exec` — shell and logs (active + staging) —
-# which retire when this script is deleted (Slice 5), once they move to their real
-# transport (SSH/ssh2incus, §5.8).
+# staging start/stop/rebuild and the machine bootstrap are the `pgdev` host CLI
+# talking to the in-machine `pgdevd` daemon. What remains here is the interactive
+# passthroughs that still ride `incus exec` — shell and logs — which retire when
+# this script is deleted (Slice 5), once they move to their real transport
+# (SSH/ssh2incus, §5.8).
+#
+# Two-machine model (spec 0002): each Apple machine hosts exactly ONE backend,
+# so there is no active/staging distinction INSIDE a machine — the host picks
+# which machine (active vs staging) to exec into and passes PG_SLOT; this script
+# just operates on that machine's one backend, pg-dev-$PG_SLOT.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../.env
 [[ -f "$REPO_ROOT/.env" ]] && source "$REPO_ROOT/.env"
 
 BACKEND_PREFIX=pg-dev
-STATE_DIR="$REPO_ROOT/var"
-STATE_FILE="$STATE_DIR/active-slot"
+# The one backend on this machine. PG_SLOT is set by the host (make PG_DEV_IN);
+# default "a" so a bare invocation still resolves a container.
+_container() { echo "${BACKEND_PREFIX}-${PG_SLOT:-a}"; }
 
 # ---------------------------------------------------------------------------
-# State helpers
+# Commands (read-only interactive access; no state mutation)
 # ---------------------------------------------------------------------------
 
-_active()    { cat "$STATE_FILE" 2>/dev/null || echo a; }
-_staging()   { [[ "$(_active)" == a ]] && echo b || echo a; }
-_c_active()  { echo "${BACKEND_PREFIX}-$(_active)"; }
-_c_staging() { echo "${BACKEND_PREFIX}-$(_staging)"; }
-
-# ---------------------------------------------------------------------------
-# Per-slot commands (read-only interactive access; no state mutation)
-# ---------------------------------------------------------------------------
-
-cmd_shell()         { incus exec "$(_c_active)"  -- bash; }
-cmd_staging_shell() { incus exec "$(_c_staging)" -- bash; }
-
-cmd_logs()         { incus exec "$(_c_active)"  -- tail -f /var/log/postgresql/postgresql-17-main.log; }
-cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/postgresql-17-main.log; }
+cmd_shell() { incus exec "$(_container)" -- bash; }
+cmd_logs()  { incus exec "$(_container)" -- tail -f /var/log/postgresql/postgresql-17-main.log; }
 
 # ---------------------------------------------------------------------------
 # Dispatcher
@@ -45,31 +39,22 @@ cmd_staging_logs() { incus exec "$(_c_staging)" -- tail -f /var/log/postgresql/p
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <command> [args]
+Usage: $(basename "$0") <command>
 
 NOTE: lifecycle (up/down), status, promote, refresh, ip, endpoint, snapshots, the
-snapshot/restore commands and staging start/stop moved to the host 'pgdev' CLI
-(which talks HTTP to the in-machine pgdevd daemon). This script now covers only
-interactive access — the rest retires together with the script in a later slice
-(see issues/0001).
+snapshot/restore commands and staging start/stop/rebuild moved to the host 'pgdev'
+CLI (which talks HTTP to the in-machine pgdevd daemon). This script now covers only
+interactive access to THIS machine's one backend (pg-dev-\$PG_SLOT) — the rest
+retires together with the script in a later slice (see issues/0001).
 
-Active slot (whatever is currently active):
-  shell                           bash into active backend
-  logs                            tail postgres logs on active backend
-
-Staging slot (the other one):
-  staging.shell
-  staging.logs
+  shell    bash into this machine's backend
+  logs     tail postgres logs on this machine's backend
 EOF
 }
 
 case "${1:-}" in
     shell)          shift; cmd_shell "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
-
-    staging.shell)        shift; cmd_staging_shell "$@" ;;
-    staging.logs)         shift; cmd_staging_logs "$@" ;;
-
     ""|-h|--help)   usage ;;
     *)              usage; exit 1 ;;
 esac

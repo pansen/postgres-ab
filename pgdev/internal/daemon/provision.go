@@ -18,17 +18,16 @@ func reloadSystemd() error {
 	return exec.Command("systemctl", "daemon-reload").Run()
 }
 
-// Bootstrap ensures the machine is ready to host backends: the XFS reflink store
-// mounted, the Incus daemon topology configured, and the boot-ordering drop-in
-// for incusd installed. It ports scripts/apple-machine-init and is run as the
-// systemd unit's ExecStartPre (`pgdevd bootstrap`) so every daemon start
-// re-asserts it, idempotently.
+// Bootstrap ensures the machine is ready to host its one backend: the XFS reflink
+// store mounted, this slot's layout present, the Incus daemon topology configured,
+// and the boot-ordering drop-in for incusd installed. Runs as the systemd unit's
+// ExecStartPre (`pgdevd bootstrap`) so every daemon start re-asserts it.
 func (s *Service) Bootstrap(ctx context.Context) error {
 	s.Log("bootstrapping XFS data store at %s...", s.Cfg.DataRoot)
 	if err := store.Bootstrap(ctx, s.Cfg.DataImage, s.Cfg.DataRoot, s.Cfg.DataDiskSize, s.Log); err != nil {
 		return err
 	}
-	if err := s.Store.EnsureSlots(); err != nil {
+	if err := s.Store.EnsureLayout(s.slot()); err != nil {
 		return err
 	}
 	if err := s.ensureIncusOrdering(); err != nil {
@@ -44,7 +43,7 @@ func (s *Service) Bootstrap(ctx context.Context) error {
 
 // ensureIncusOrdering is boot-ordering hardening level 2: incus.service must not
 // start before the XFS loop mount exists, or a machine reboot could bring incusd
-// (and the backends whose disk sources live on that mount) up too early. Written
+// (and the backend whose disk source lives on that mount) up too early. Written
 // as a drop-in so systemd orders incusd after var-lib-pg\x2ddev\x2dlocal.mount.
 func (s *Service) ensureIncusOrdering() error {
 	dir := "/etc/systemd/system/incus.service.d"
@@ -65,9 +64,11 @@ func (s *Service) ensureIncusOrdering() error {
 	return nil
 }
 
-// Up provisions the full topology from an empty Incus host: golden image, both
-// backends, the proxy, then activate slot a and reconcile the forwards. It ports
-// cmd_up. Refuses if any container already exists (run Down first).
+// Up provisions this machine's one backend from an empty Incus host: golden
+// image, the backend + its XFS slot + cluster + role/db + `initial` snapshot,
+// then the eth0 forward device (via reconcile). Refuses if the backend already
+// exists (run Down first). There is no proxy container and no active pointer —
+// role is a host concern.
 func (s *Service) Up(ctx context.Context) (agentapi.StatusResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -75,36 +76,21 @@ func (s *Service) Up(ctx context.Context) (agentapi.StatusResponse, error) {
 	if err := s.Store.RequireMounted(); err != nil {
 		return agentapi.StatusResponse{}, err
 	}
-	for _, c := range []string{s.Cfg.Container("a"), s.Cfg.Container("b"), s.Cfg.ProxyName} {
-		if s.Incus.Exists(ctx, c) {
-			return agentapi.StatusResponse{}, fmt.Errorf("container %q already exists — run down first", c)
-		}
+	c := s.container()
+	if s.Incus.Exists(ctx, c) {
+		return agentapi.StatusResponse{}, fmt.Errorf("container %q already exists — run down first", c)
 	}
-	aIP, bIP, err := s.resolveBackendIPs(ctx)
-	if err != nil {
-		return agentapi.StatusResponse{}, err
-	}
-	s.Log("static backend IPs: %s=%s  %s=%s", s.Cfg.Container("a"), aIP, s.Cfg.Container("b"), bIP)
 
 	if err := s.ensureGolden(ctx); err != nil {
 		return agentapi.StatusResponse{}, fmt.Errorf("golden image: %w", err)
 	}
-	if err := s.provisionBackend(ctx, "a", aIP); err != nil {
-		return agentapi.StatusResponse{}, fmt.Errorf("provision %s: %w", s.Cfg.Container("a"), err)
+	if err := s.provisionBackend(ctx, s.slot()); err != nil {
+		return agentapi.StatusResponse{}, fmt.Errorf("provision %s: %w", c, err)
 	}
-	if err := s.provisionBackend(ctx, "b", bIP); err != nil {
-		return agentapi.StatusResponse{}, fmt.Errorf("provision %s: %w", s.Cfg.Container("b"), err)
-	}
-	if err := s.provisionProxy(ctx); err != nil {
-		return agentapi.StatusResponse{}, fmt.Errorf("provision %s: %w", s.Cfg.ProxyName, err)
-	}
-	if err := s.Active.Set("a"); err != nil {
+	if _, err := s.reconcile(ctx); err != nil {
 		return agentapi.StatusResponse{}, err
 	}
-	if _, err := s.reconcile(ctx, "a"); err != nil {
-		return agentapi.StatusResponse{}, err
-	}
-	s.Log("pg-dev ready.")
+	s.Log("pg-dev backend %s ready.", c)
 	return s.Status(ctx)
 }
 
@@ -136,10 +122,12 @@ func (s *Service) ensureGolden(ctx context.Context) error {
 	return s.Incus.Publish(ctx, build, s.Cfg.GoldenImage)
 }
 
-// provisionBackend launches a backend from the golden image, attaches its XFS
-// slot, pins its static IP, creates the slot's cluster + role/db, and snapshots
-// `initial`. Ports _provision_backend, minus the apt heredoc (now in the image).
-func (s *Service) provisionBackend(ctx context.Context, slot, ip string) error {
+// provisionBackend launches the backend from the golden image, attaches its XFS
+// slot, creates the cluster + role/db, and snapshots `initial`. No static-IP
+// pin: the backend is reached through the eth0 forward device (added by
+// reconcile), which connects to PostgreSQL on the container's loopback, so the
+// container's own bridge address is irrelevant and may drift freely.
+func (s *Service) provisionBackend(ctx context.Context, slot string) error {
 	c := s.Cfg.Container(slot)
 	if err := s.Store.EnsureLayout(slot); err != nil {
 		return err
@@ -155,16 +143,6 @@ func (s *Service) provisionBackend(ctx context.Context, slot, ip string) error {
 		return err
 	}
 	if err := s.Incus.WaitIPv4(ctx, c, "", time.Minute); err != nil {
-		return err
-	}
-	s.Log("pinning %s eth0 -> %s...", c, ip)
-	if err := s.Incus.SetEth0Static(ctx, c, ip); err != nil {
-		return err
-	}
-	if err := s.Incus.Restart(ctx, c); err != nil {
-		return err
-	}
-	if err := s.Incus.WaitIPv4(ctx, c, ip, time.Minute); err != nil {
 		return err
 	}
 	if err := s.Incus.WaitSystemd(ctx, c); err != nil {
@@ -190,37 +168,23 @@ func (s *Service) provisionBackend(ctx context.Context, slot, ip string) error {
 	return task.Run(ctx, s.Journal, t)
 }
 
-// provisionProxy launches the bare proxy container (no software; it only owns the
-// two proxy devices, added by reconcile). Ports _provision_proxy.
-func (s *Service) provisionProxy(ctx context.Context) error {
-	if err := s.Incus.Launch(ctx, s.Cfg.ProxyName, s.Cfg.BaseImage); err != nil {
-		return err
-	}
-	return s.Incus.WaitIPv4(ctx, s.Cfg.ProxyName, "", time.Minute)
-}
-
-// Down deletes the proxy and both backends, then removes both XFS data trees and
-// the active-slot pointer. Ports cmd_down's best-effort teardown with the same
-// guard: data is only removed once every container is gone and the store is
-// mounted from the expected image.
+// Down deletes this machine's backend, then removes its XFS data tree. Data is
+// only removed once the container is gone and the store is mounted from the
+// expected image (the cmd_down safety guard).
 func (s *Service) Down(ctx context.Context) (agentapi.OpResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, c := range []string{s.Cfg.ProxyName, s.Cfg.Container("a"), s.Cfg.Container("b")} {
-		if err := s.Incus.Delete(ctx, c); err != nil {
-			return agentapi.OpResponse{}, fmt.Errorf("delete %s: %w (refusing to remove data)", c, err)
-		}
+	c := s.container()
+	if err := s.Incus.Delete(ctx, c); err != nil {
+		return agentapi.OpResponse{}, fmt.Errorf("delete %s: %w (refusing to remove data)", c, err)
 	}
 	if s.Store.RequireMounted() == nil {
-		for _, slot := range []string{"a", "b"} {
-			if err := s.Store.RemoveSlotData(slot); err != nil {
-				return agentapi.OpResponse{}, err
-			}
+		if err := s.Store.RemoveSlotData(s.slot()); err != nil {
+			return agentapi.OpResponse{}, err
 		}
 	} else {
-		s.Log("WARNING: %s is not mounted from the XFS store; left the data trees alone", s.Cfg.DataRoot)
+		s.Log("WARNING: %s is not mounted from the XFS store; left the data tree alone", s.Cfg.DataRoot)
 	}
-	_ = os.Remove(s.Cfg.ActiveSlotPath())
-	return agentapi.OpResponse{Message: "containers deleted and data trees removed"}, nil
+	return agentapi.OpResponse{Message: fmt.Sprintf("%s deleted and its data tree removed", c)}, nil
 }

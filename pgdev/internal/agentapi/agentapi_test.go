@@ -27,13 +27,10 @@ func (f *fakeService) Status(context.Context) (StatusResponse, error) {
 	if f.failNext != nil {
 		return StatusResponse{}, f.failNext
 	}
-	return StatusResponse{Active: "a", ProxyName: "pg-proxy", ProxyState: "RUNNING"}, nil
+	return StatusResponse{Slot: "a", Container: "pg-dev-a", State: "RUNNING", BackendPort: 5432, ProxyDevice: true}, nil
 }
-func (f *fakeService) Snapshots(_ context.Context, slot string) ([]SnapshotInfo, error) {
+func (f *fakeService) Snapshots(context.Context) ([]SnapshotInfo, error) {
 	return []SnapshotInfo{{Name: "initial", CreatedUnix: 1}}, nil
-}
-func (f *fakeService) Promote(context.Context) (PromoteResponse, error) {
-	return PromoteResponse{From: "a", To: "b"}, nil
 }
 func (f *fakeService) Snapshot(_ context.Context, req SnapshotRequest) (OpResponse, error) {
 	f.lastSnap = SnapshotReqSeen{req: req, set: true}
@@ -43,25 +40,25 @@ func (f *fakeService) Restore(context.Context, RestoreRequest) (OpResponse, erro
 	return OpResponse{Message: "restored"}, nil
 }
 func (f *fakeService) Reconcile(context.Context) (ReconcileResponse, error) {
-	return ReconcileResponse{ProxyRunning: true, Actions: []string{"main → x"}}, nil
+	return ReconcileResponse{BackendRunning: true, Actions: []string{"pgforward → x"}}, nil
 }
 func (f *fakeService) Up(context.Context) (StatusResponse, error) {
-	return StatusResponse{Active: "a"}, nil
+	return StatusResponse{Slot: "a", Container: "pg-dev-a"}, nil
 }
 func (f *fakeService) Down(context.Context) (OpResponse, error) {
 	return OpResponse{Message: "down"}, nil
 }
-func (f *fakeService) StartStaging(context.Context) (OpResponse, error) {
-	return OpResponse{Message: "started pg-dev-b (PostgreSQL ready)"}, nil
+func (f *fakeService) Start(context.Context) (OpResponse, error) {
+	return OpResponse{Message: "started pg-dev-a (PostgreSQL ready)"}, nil
 }
-func (f *fakeService) StopStaging(context.Context) (OpResponse, error) {
-	return OpResponse{Message: "stopped pg-dev-b"}, nil
+func (f *fakeService) Stop(context.Context) (OpResponse, error) {
+	return OpResponse{Message: "stopped pg-dev-a"}, nil
 }
 
 func newTest(t *testing.T, token string) (*Client, *fakeService, func()) {
 	t.Helper()
 	fake := &fakeService{}
-	ts := httptest.NewServer(NewServer(fake, "secret"))
+	ts := httptest.NewServer(NewServer(fake, FixedToken("secret")))
 	return NewClient(ts.URL, token), fake, ts.Close
 }
 
@@ -93,28 +90,40 @@ func TestVersionHandshake(t *testing.T) {
 	}
 }
 
-func TestSnapshotRoundTrip(t *testing.T) {
-	cl, fake, done := newTest(t, "secret")
+func TestStatusRoundTrip(t *testing.T) {
+	cl, _, done := newTest(t, "secret")
 	defer done()
-	_, err := cl.Snapshot(context.Background(), SnapshotRequest{Slot: "b", Name: "x", Force: true})
+	st, err := cl.Status(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fake.lastSnap.set || fake.lastSnap.req.Slot != "b" || !fake.lastSnap.req.Force {
+	if st.Slot != "a" || st.Container != "pg-dev-a" || st.BackendPort != 5432 || !st.ProxyDevice {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+func TestSnapshotRoundTrip(t *testing.T) {
+	cl, fake, done := newTest(t, "secret")
+	defer done()
+	_, err := cl.Snapshot(context.Background(), SnapshotRequest{Name: "x", Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fake.lastSnap.set || fake.lastSnap.req.Name != "x" || !fake.lastSnap.req.Force {
 		t.Fatalf("server saw %+v", fake.lastSnap)
 	}
 }
 
-func TestStagingLifecycleRoundTrip(t *testing.T) {
+func TestBackendLifecycleRoundTrip(t *testing.T) {
 	cl, _, done := newTest(t, "secret")
 	defer done()
-	res, err := cl.StartStaging(context.Background())
+	res, err := cl.Start(context.Background())
 	if err != nil || res.Message == "" {
-		t.Fatalf("start staging: res=%+v err=%v", res, err)
+		t.Fatalf("start: res=%+v err=%v", res, err)
 	}
-	res, err = cl.StopStaging(context.Background())
+	res, err = cl.Stop(context.Background())
 	if err != nil || res.Message == "" {
-		t.Fatalf("stop staging: res=%+v err=%v", res, err)
+		t.Fatalf("stop: res=%+v err=%v", res, err)
 	}
 }
 
@@ -132,7 +141,7 @@ func TestUnknownFieldsRejected(t *testing.T) {
 	cl, _, done := newTest(t, "secret")
 	defer done()
 	// A raw POST with an unknown field should 400 (DisallowUnknownFields).
-	req, _ := http.NewRequest(http.MethodPost, cl.BaseURL+"/v1/snapshot", strings.NewReader(`{"slot":"a","bogus":1}`))
+	req, _ := http.NewRequest(http.MethodPost, cl.BaseURL+"/v1/snapshot", strings.NewReader(`{"name":"a","bogus":1}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
