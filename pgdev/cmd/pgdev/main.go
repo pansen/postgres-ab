@@ -4,9 +4,11 @@
 // machine's eth0. Since spec 0002 (two machines) there is one daemon PER machine
 // (vpg-a/vpg-b, one backend each) and active/staging is a HOST-side concept: a
 // pointer file (internal/activeslot, now pointed at the ACTIVE MACHINE) picks
-// which machine's client is "active" vs "staging", and the host forwarder
-// (scripts/host-endpoint) maps the stable 127.0.0.1:5442/:5443 client ports onto
-// whichever machine currently holds each role. The only `container` execs left
+// which machine's client is "active" vs "staging", and the in-process host
+// forwarder (internal/forward, run as `pgdev forward serve` under a LaunchAgent)
+// maps the stable 127.0.0.1:5442/:5443 client ports onto whichever machine
+// currently holds each role, re-pointing itself when the pointer flips. The only
+// `container` execs left
 // here are IP discovery (internal/applecli, a fallback) and `agent deploy`'s
 // one-shot install/restart, plus the hard-reset machine lifecycle used by
 // `staging rebuild`.
@@ -16,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"pansen.me/pgdev/internal/agentapi"
 	"pansen.me/pgdev/internal/applecli"
 	"pansen.me/pgdev/internal/config"
+	"pansen.me/pgdev/internal/forward"
 )
 
 // version is stamped at build time (see Makefile), matched against each
@@ -82,6 +84,7 @@ func rootCmd() *cobra.Command {
 		a.snapshotsCmd(),
 		a.ipCmd(),
 		a.endpointCmd(),
+		a.forwardCmd(),
 		a.snapshotCmd("active"),
 		a.restoreCmd("active"),
 		a.restoreLastCmd("active"),
@@ -170,13 +173,53 @@ func (a *app) longClientForRole(ctx context.Context, role string) (*agentapi.Cli
 	return a.longClientFor(ctx, a.roleSlot(role))
 }
 
-// refreshForwarder re-points the host socat forwarder at the current
-// active/staging machine IPs by shelling out to scripts/host-endpoint, which
-// remains the forwarder's owner (internal/forward does not exist — spec 0002
-// §0.1/§2 keeps routing in the existing shell-driven launchd agent).
-func (a *app) refreshForwarder() error {
-	cmd := exec.Command(filepath.Join(a.cfg.RepoRoot, "scripts", "host-endpoint"), "refresh")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+// ensureForwarder makes the client forwarder hands-off: on first `make start`
+// (no LaunchAgent yet) it installs internal/forward's agent so 127.0.0.1:5442/
+// :5443 come up automatically; afterwards it is a no-op because the resident
+// serve re-points itself from the pointer file — no kickstart, no launchd
+// round-trip on promote/refresh (spec 0003 §3). It NEVER fails the caller:
+// PG_ENDPOINT_AUTOINSTALL=0 opts out, and a sandbox that can't write
+// ~/Library/LaunchAgents just warns.
+func (a *app) ensureForwarder(ctx context.Context) {
+	if os.Getenv("PG_ENDPOINT_AUTOINSTALL") == "0" {
+		return
+	}
+	ld, err := a.launchd()
+	if err != nil {
+		// e.g. running via `go run` (temp binary) — can't self-install; leave the
+		// forwarder to an explicit `pgdev forward install` from a built binary.
+		fmt.Fprintf(os.Stderr, "WARNING: skipping forwarder auto-install: %v\n", err)
+		return
+	}
+	if ld.Installed() {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "==> Endpoint forwarder not installed; installing it now...")
+	if err := ld.Install(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: forwarder auto-install failed (run 'pgdev forward install'): %v\n", err)
+	}
+}
+
+// awaitForwarderRepoint gives the resident forwarder up to a couple of poll
+// intervals to re-point onto the newly-active slot after a promote, then reports
+// whether it confirmably did. It reads internal/forward's state file rather than
+// touching launchd, so promote stays a pure pointer write. A false return is a
+// warning, not a hard failure: the pointer IS the source of truth and the
+// forwarder converges once it is running — but we surface an unconfirmed
+// re-point so a following `pg_restore -p 5443` isn't silently misrouted.
+func (a *app) awaitForwarderRepoint(ctx context.Context, slot string) bool {
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		if st, ok := forward.ReadState(a.cfg.ForwardStatePath()); ok && st.ActiveSlot == slot && st.Fresh(10*time.Second) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }

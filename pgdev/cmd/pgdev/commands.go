@@ -45,9 +45,7 @@ func (a *app) upCmd() *cobra.Command {
 					return err
 				}
 			}
-			if err := a.refreshForwarder(); err != nil {
-				fmt.Fprintf(os.Stderr, "WARNING: forwarder refresh: %v\n", err)
-			}
+			a.ensureForwarder(ctx)
 			fmt.Println("==> pg-dev ready.")
 			fmt.Println()
 			a.renderStatus(ctx)
@@ -151,6 +149,8 @@ func (a *app) renderStatus(ctx context.Context) {
 			role, machine, orDash(ms.st.Container), orAbsent(ms.st.State), endpoint, len(ms.st.Snapshots), orDash(strings.Join(ms.st.IPs, ",")))
 	}
 	tw.Flush()
+	fmt.Println()
+	a.renderForwarder(ctx)
 	fmt.Println()
 	a.renderSnapshots(statuses, true)
 }
@@ -285,14 +285,18 @@ func (a *app) promoteCmd() *cobra.Command {
 				}
 			}
 
+			// Promote collapses to a pointer write: the resident forwarder
+			// re-points itself within its poll interval and drops the sessions
+			// that were on the demoted machine (spec 0003 §3). No launchd
+			// round-trip, so nothing to fail-and-roll-back here.
 			if err := a.active.Set(to); err != nil {
 				return err
 			}
-			if err := a.refreshForwarder(); err != nil {
-				if rerr := a.active.Set(from); rerr != nil {
-					return fmt.Errorf("forwarder refresh failed (%v) and rolling back the active pointer also failed (%v)", err, rerr)
-				}
-				return fmt.Errorf("forwarder refresh failed, rolled back active pointer to %s: %w", a.cfg.MachineNameForSlot(from), err)
+			if !a.awaitForwarderRepoint(ctx, to) {
+				fmt.Fprintf(os.Stderr,
+					"WARNING: the forwarder did not confirm re-pointing to %s. The active pointer IS set; verify with\n"+
+						"         'pgdev forward status' before using :%d — is the forwarder running ('pgdev forward install')?\n",
+					a.cfg.MachineNameForSlot(to), a.cfg.ClientActivePort)
 			}
 
 			fmt.Printf("Promoted. active=%s staging=%s\n\n",
@@ -333,10 +337,10 @@ func (a *app) refreshCmd() *cobra.Command {
 					fmt.Printf("    %s\n", act)
 				}
 			}
-			if err := a.refreshForwarder(); err != nil {
-				return fmt.Errorf("forwarder refresh: %w", err)
-			}
-			fmt.Printf("Re-pointed endpoints: active %s:%d → %s, staging %s:%d → %s\n",
+			// The forwarder re-reads the IP files we just rewrote on its next
+			// poll; refresh only needs to make sure the agent is installed.
+			a.ensureForwarder(ctx)
+			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s (forwarder tracks the IP files)\n",
 				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
 				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
 			return nil
@@ -572,9 +576,7 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 				return err
 			}
 
-			if err := a.refreshForwarder(); err != nil {
-				fmt.Fprintf(os.Stderr, "WARNING: forwarder refresh: %v\n", err)
-			}
+			a.ensureForwarder(ctx)
 
 			fmt.Printf("==> Reclaim done. %s is fresh; %s (active) was never touched.\n", machine, activeMachine)
 			return nil
