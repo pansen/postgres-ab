@@ -18,7 +18,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.ClientActivePort != 5442 || c.ClientStagingPort != 5443 {
 		t.Fatalf("client ports = %d/%d", c.ClientActivePort, c.ClientStagingPort)
 	}
-	if c.ClientHost != "127.0.0.1" || c.BackendPrefix != "pg-dev" || c.ProxyName != "pg-proxy" {
+	if c.ProxyHostname != "host.docker.internal" || c.BackendPrefix != "pg-dev" || c.ProxyName != "pg-proxy" {
 		t.Fatalf("defaults wrong: %+v", c)
 	}
 	if c.AgentPort != 5440 {

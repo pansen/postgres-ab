@@ -60,8 +60,11 @@ type Config struct {
 	// retired with the in-machine pg-proxy once routing moves host-side.
 	ActivePort, StagingPort int // 5432 / 5433
 	// Host loopback ports clients actually connect to.
-	ClientActivePort, ClientStagingPort int    // 5442 / 5443
-	ClientHost                          string // 127.0.0.1
+	ClientActivePort, ClientStagingPort int // 5442 / 5443
+	// ProxyHostname is the host printed in psql/.pgpass lines (PG_PROXY_HOSTNAME).
+	// Defaults to host.docker.internal so the endpoint is reachable both from the
+	// Mac and from sibling containers/k3d; 127.0.0.1 also works host-only.
+	ProxyHostname string
 
 	BackendPrefix string // pg-dev
 	ProxyName     string // pg-proxy — LEGACY (single-machine in-machine proxy)
@@ -125,7 +128,7 @@ func Load() Config {
 		StagingPort:       atoi(get("PG_STAGING_PORT", "5433")),
 		ClientActivePort:  atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
 		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
-		ClientHost:        get("PG_CLIENT_HOST", "127.0.0.1"),
+		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
 		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
 		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),
 		BackendAIP:        get("PG_BACKEND_A_IP", ""),

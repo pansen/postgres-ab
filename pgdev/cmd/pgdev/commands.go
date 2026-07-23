@@ -142,7 +142,7 @@ func (a *app) renderStatus(ctx context.Context) {
 		slot := a.roleSlot(role)
 		ms := statuses[slot]
 		machine := a.cfg.MachineNameForSlot(slot)
-		endpoint := fmt.Sprintf("%s:%d", a.cfg.ClientHost, a.cfg.ClientPort(role))
+		endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 		if ms.err != nil {
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", role, machine, "-", "UNREACHABLE", endpoint, "-", "-")
 			continue
@@ -207,7 +207,7 @@ func (a *app) endpointCmd() *cobra.Command {
 			if err := a.cfg.RequireCreds(); err != nil {
 				return err
 			}
-			h := a.cfg.ClientHost
+			h := a.cfg.ProxyHostname
 			fmt.Printf("active   host=%s port=%d dbname=%s   (current data, machine %s)\n",
 				h, a.cfg.ClientActivePort, a.cfg.PGDB, a.cfg.MachineNameForSlot(a.active.Get()))
 			fmt.Printf("staging  host=%s port=%d dbname=%s   (import target, machine %s)\n\n",
@@ -240,7 +240,7 @@ func (a *app) ipCmd() *cobra.Command {
 				slot := a.roleSlot(role)
 				ip := a.machineIP(ctx, slot)
 				a.writeMachineIPFile(slot, ip)
-				endpoint := fmt.Sprintf("%s:%d", a.cfg.ClientHost, a.cfg.ClientPort(role))
+				endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", role, a.cfg.MachineNameForSlot(slot), orQ(ip), endpoint)
 			}
 			tw.Flush()
@@ -337,8 +337,8 @@ func (a *app) refreshCmd() *cobra.Command {
 				return fmt.Errorf("forwarder refresh: %w", err)
 			}
 			fmt.Printf("Re-pointed endpoints: active %s:%d → %s, staging %s:%d → %s\n",
-				a.cfg.ClientHost, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
-				a.cfg.ClientHost, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
+				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
+				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
 			return nil
 		},
 	}
@@ -588,7 +588,7 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 
 func (a *app) psqlCmd(port int) string {
 	return fmt.Sprintf("psql --host=%s --port=%d --username=%s --dbname=%s",
-		a.cfg.ClientHost, port, a.cfg.PGUser, a.cfg.PGDB)
+		a.cfg.ProxyHostname, port, a.cfg.PGUser, a.cfg.PGDB)
 }
 
 // snapshotsAfter returns the names created strictly after `name` (the timeline a

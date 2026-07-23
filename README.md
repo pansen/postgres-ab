@@ -108,7 +108,9 @@ Hands-off: **`make start` installs the forwarder and re-points it; `pgdev
 promote`/`refresh` re-point it too** (that is what follows a promote to the new
 active machine). Needs `socat` (`brew install socat`). `make endpoint.status` /
 `endpoint.uninstall` manage it (`PG_ENDPOINT_AUTOINSTALL=0` opts out of
-auto-install). `PG_CLIENT_HOST` addresses a machine IP directly instead.
+auto-install). `PG_PROXY_HOSTNAME` sets the hostname printed in psql/.pgpass
+lines (default `host.docker.internal`, so the endpoint also resolves from sibling
+containers/k3d; use `127.0.0.1` for host-only).
 
 No connection pooler: each port is a per-connection TCP passthrough, so
 `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory locks
@@ -173,22 +175,19 @@ stable `127.0.0.1` endpoint (see [Networking](#networking)).
 Status prints endpoints similar to:
 
 ```text
-active   host=127.0.0.1 port=5442 dbname=<PG_DB>
-staging  host=127.0.0.1 port=5443 dbname=<PG_DB>
-
 .pgpass lines:
-127.0.0.1:5442:*:<PG_USER>:<PG_PASSWORD>
-127.0.0.1:5443:*:<PG_USER>:<PG_PASSWORD>
+host.docker.internal:5442:*:<PG_USER>:<PG_PASSWORD>
+host.docker.internal:5443:*:<PG_USER>:<PG_PASSWORD>
 
 psql commands:
-  active:  psql --host=127.0.0.1 --port=5442 --username=<PG_USER> --dbname=<PG_DB>
-  staging: psql --host=127.0.0.1 --port=5443 --username=<PG_USER> --dbname=<PG_DB>
+  active:  psql --host=host.docker.internal --port=5442 --username=<PG_USER> --dbname=<PG_DB>
+  staging: psql --host=host.docker.internal --port=5443 --username=<PG_USER> --dbname=<PG_DB>
 ```
 
-Put the printed lines in `~/.pgpass`. The `127.0.0.1` host is permanent — it does
+Put the printed lines in `~/.pgpass`. The endpoint host is permanent — it does
 not change across reboots or machine recreation, so saved connection strings keep
-working. Set `PG_CLIENT_HOST` to address the machine IP directly instead of the
-forwarder.
+working. `PG_PROXY_HOSTNAME` sets that host (default `host.docker.internal`; use
+`127.0.0.1` for host-only access).
 
 ## Day-to-day workflow
 
@@ -198,7 +197,7 @@ opposite staging dataset.
 ```shell
 make start
 make pg.status
-psql -h 127.0.0.1 -p 5442 -d "$PG_DB"
+psql -h host.docker.internal -p 5442 -d "$PG_DB"
 make pg.logs
 ```
 
@@ -211,11 +210,11 @@ make pg.staging.reset            # soft
 # make pg.staging.rebuild        # hard reset — reclaims disk; active untouched
 
 # 2. Import through the staging port on the stable endpoint.
-pg_restore --host=127.0.0.1 --port=5443 --dbname="$PG_DB" \
+pg_restore --host=host.docker.internal --port=5443 --dbname="$PG_DB" \
   --jobs=4 your-dump.pgdump
 
 # 3. Verify and checkpoint staging.
-psql -h 127.0.0.1 -p 5443 -d "$PG_DB" -c '\dt'
+psql -h host.docker.internal -p 5443 -d "$PG_DB" -c '\dt'
 make pg.staging.snapshot name="$(date +%Y-%m-%dT%H-%M-%S)_dump_import"
 
 # 4. Swap roles. Open connections reconnect; host and ports stay the same.
@@ -341,7 +340,8 @@ See `.env.example`. The main settings are:
 - `PG_BACKEND_PORT` — port each backend is exposed on (`5432`);
 - `PG_CLIENT_ACTIVE_PORT`, `PG_CLIENT_STAGING_PORT` — host loopback ports the
   forwarder listens on (`5442`/`5443`);
-- `PG_CLIENT_HOST` — client host printed for connections (default `127.0.0.1`).
+- `PG_PROXY_HOSTNAME` — hostname printed in psql/.pgpass lines (default
+  `host.docker.internal`; `127.0.0.1` for host-only).
 
 ## Why a Makefile if there is a script?
 
