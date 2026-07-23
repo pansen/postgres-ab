@@ -1,20 +1,31 @@
 # Snapshottable PostgreSQL on Apple container machine
 
-Working with PostgreSQL dumps is painful when `pg_restore` takes ~90 minutes
-and the development database is unreachable for the whole window. This repo runs
-two persistent Apple container machines, **`vpg-a`** and **`vpg-b`**, each
-hosting one PostgreSQL 17 backend (its own Incus + copy-on-write XFS snapshot
-store), and provides:
+Fast, snapshottable PostgreSQL for local development on Apple silicon — load a
+fresh dump into a spare instance and swap it in without downtime.
 
-- a stable client endpoint on `127.0.0.1` with fixed role ports: `:5442` is
-  active and `:5443` is staging, so a new dump loads without interrupting the
-  current dataset;
-- `make pg.promote` to swap the roles without copying data;
-- `make pg.staging.rebuild` to delete+recreate the staging machine — reclaiming
-  its grown macOS disk — while the active machine keeps serving.
+`pg_restore` of a large dump can take ~90 minutes, and the dev database is
+unreachable the whole time. This repo runs two persistent Apple `container`
+machines, **`vpg-a`** and **`vpg-b`**, each hosting one PostgreSQL 17 backend on
+its own Incus + copy-on-write XFS snapshot store. One machine is **active**
+(serving your app); the other is **staging** (where the next dump loads).
+`promote` swaps them.
 
-This requires Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or
-newer. Install the signed package from the
+## Benefits
+
+- **Snapshots in seconds** — XFS reflink (copy-on-write) checkpoints and
+  rollbacks, not multi-gigabyte directory copies.
+- **Zero-downtime dump loads** — import into staging while active keeps serving,
+  then `make pg.promote` swaps roles **without copying data**. Clients use a
+  stable endpoint with fixed role ports: `127.0.0.1:5442` (active) / `:5443`
+  (staging).
+- **On-demand disk reclaim** — `make pg.staging.rebuild` delete+recreates the
+  staging machine to free its grown macOS disk, while active keeps serving.
+- **Low power at runtime**, thanks to Apple `container`.
+
+## Requirements
+
+Apple silicon, macOS 26, and Apple's `container` CLI 1.1 or newer — install the
+signed package from the
 [Apple container releases](https://github.com/apple/container/releases).
 
 ## Design
