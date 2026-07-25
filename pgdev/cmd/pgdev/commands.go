@@ -100,6 +100,10 @@ func (a *app) statusCmd() *cobra.Command {
 type slotStatus struct {
 	st  agentapi.StatusResponse
 	err error
+	// absent is set when the machine itself is gone (never created, or deleted
+	// by `pg.staging.purge`). That is an expected steady state, not a fault, so
+	// status reports it as ABSENT rather than UNREACHABLE.
+	absent bool
 }
 
 // fetchStatuses queries both machines' status, tolerating per-machine errors.
@@ -107,12 +111,16 @@ func (a *app) fetchStatuses(ctx context.Context) map[string]slotStatus {
 	out := make(map[string]slotStatus, len(slotsAB))
 	for _, slot := range slotsAB {
 		cl, err := a.clientFor(ctx, slot)
-		if err != nil {
-			out[slot] = slotStatus{err: err}
-			continue
+		if err == nil {
+			var st agentapi.StatusResponse
+			if st, err = cl.Status(ctx); err == nil {
+				out[slot] = slotStatus{st: st}
+				continue
+			}
 		}
-		st, err := cl.Status(ctx)
-		out[slot] = slotStatus{st: st, err: err}
+		// Only ask the (slow) Apple CLI whether the machine exists once
+		// something already went wrong — the happy path stays exec-free.
+		out[slot] = slotStatus{err: err, absent: !a.apple(slot).Exists(ctx)}
 	}
 	return out
 }
@@ -142,11 +150,11 @@ func (a *app) renderStatus(ctx context.Context) {
 		machine := a.cfg.MachineNameForSlot(slot)
 		endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 		if ms.err != nil {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", role, machine, "-", "UNREACHABLE", endpoint, "-", "-")
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", role, machine, "-", statusState(ms), endpoint, "-", "-")
 			continue
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-			role, machine, orDash(ms.st.Container), orAbsent(ms.st.State), endpoint, len(ms.st.Snapshots), orDash(strings.Join(ms.st.IPs, ",")))
+			role, machine, orDash(ms.st.Container), statusState(ms), endpoint, len(ms.st.Snapshots), orDash(strings.Join(ms.st.IPs, ",")))
 	}
 	tw.Flush()
 	fmt.Println()
@@ -175,6 +183,10 @@ func (a *app) renderSnapshots(statuses map[string]slotStatus, withPsql bool) {
 		ms := statuses[slot]
 		machine := a.cfg.MachineNameForSlot(slot)
 		fmt.Printf("─── %-7s (%s) ───\n", role, machine)
+		if ms.absent {
+			fmt.Printf("(machine %s does not exist — run '%s' to bring it back)\n\n", machine, rebuildHint(role))
+			continue
+		}
 		if ms.err != nil {
 			fmt.Printf("(unreachable: %v)\n\n", ms.err)
 			continue
@@ -718,6 +730,31 @@ func orAbsent(s string) string {
 	}
 	return s
 }
+
+// statusState is the STATE column for one slot. A deleted machine (never
+// created, or purged) reads ABSENT — a legitimate steady state since
+// `pg.staging.purge` — and is kept distinct from UNREACHABLE, which means the
+// machine is there but its daemon did not answer.
+func statusState(ms slotStatus) string {
+	switch {
+	case ms.absent:
+		return "ABSENT"
+	case ms.err != nil:
+		return "UNREACHABLE"
+	}
+	return orAbsent(ms.st.State)
+}
+
+// rebuildHint names the command that recreates a deleted machine: staging has
+// its own cheap rebuild (the everyday reclaim tier after `pg.staging.purge`),
+// active only comes back through the full `make start` path.
+func rebuildHint(role string) string {
+	if role == "staging" {
+		return "make pg.staging.rebuild"
+	}
+	return "make start"
+}
+
 func orQ(s string) string {
 	if s == "" {
 		return "?"

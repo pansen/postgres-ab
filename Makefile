@@ -142,7 +142,10 @@ deploy: machine pgdevd
 
 # Cheap guard for targets that exec into already-running machines: fail fast
 # with a clear message instead of a raw Apple CLI 'notFound' error when a
-# machine has never been created.
+# machine has never been created. Deliberately NOT used by the read-only
+# status targets: since `pg.staging.purge` a deleted machine is an expected
+# steady state, so status must still report (it prints ABSENT for that slot)
+# instead of refusing to run.
 .PHONY: machine.exists
 machine.exists:
 	@for slot in a b; do \
@@ -227,11 +230,15 @@ start: deploy
 	$(MAKE) status
 
 .PHONY: status/incus
-status/incus: machine.exists
+status/incus:
 	@for slot in a b; do \
 		name="$(MACHINE_PREFIX)-$$slot"; \
 		echo "── $$name ──"; \
-		container machine run --name "$$name" --root -- incus list 2>/dev/null || echo "  (Incus not up)"; \
+		if container machine inspect "$$name" >/dev/null 2>&1; then \
+			container machine run --name "$$name" --root -- incus list 2>/dev/null || echo "  (Incus not up)"; \
+		else \
+			echo "  (machine does not exist)"; \
+		fi; \
 	done
 
 # The one status command: active/staging machine roles, per-machine
@@ -239,7 +246,7 @@ status/incus: machine.exists
 # (one per machine) over the HTTP API; the active/staging split is a host-side
 # pointer (var/active-machine), not part of the daemon contract.
 .PHONY: status
-status: machine.exists pgdevd
+status: pgdevd
 	@$(PGDEV) status
 
 # ----- stable macOS client endpoints --------------------------------------
@@ -337,7 +344,7 @@ pg.down: deploy
 	$(PGDEV) down
 
 .PHONY: pg.status
-pg.status: machine.exists pgdevd
+pg.status: pgdevd
 	$(PGDEV) status
 	@$(PGDEV) endpoint
 
@@ -356,7 +363,7 @@ pg.shell: machine.exists
 	@$(call PG_DEV_IN,$(ACTIVE_SLOT),shell)
 
 .PHONY: pg.ip
-pg.ip: machine.exists pgdevd
+pg.ip: pgdevd
 	@$(PGDEV) ip
 
 .PHONY: pg.logs
@@ -376,7 +383,7 @@ pg.restore-last: machine.exists pgdevd
 	$(PGDEV) restore-last $(if $(force),--force,)
 
 .PHONY: pg.snapshots
-pg.snapshots: machine.exists pgdevd
+pg.snapshots: pgdevd
 	$(PGDEV) snapshots
 
 # ----- staging backend ----------------------------------------------------
@@ -427,8 +434,12 @@ pg.staging.start: machine.exists pgdevd
 # no restore, so no headroom needed). Gating it on free space is self-defeating —
 # you run it precisely when you're low, and it is what disk.check itself points
 # you to. Do not re-add disk.check here.
+# No machine.exists guard: rebuild is a delete+create path (applecli.Recreate's
+# delete is a no-op when the machine is gone), and it is the documented way back
+# from `pg.staging.purge` — which leaves vpg-b deleted. Guarding it would block
+# exactly the recovery it advertises.
 .PHONY: pg.staging.rebuild
-pg.staging.rebuild: machine.exists pgdevd
+pg.staging.rebuild: pgdevd
 	$(PGDEV) staging rebuild $(if $(force),--force,)
 
 # Reclaim WITHOUT rebuild: delete the staging machine (freeing its whole sparse
@@ -436,8 +447,11 @@ pg.staging.rebuild: machine.exists pgdevd
 # space (or just shut staging down) when you don't want a fresh backend yet;
 # bring it back later with pg.staging.rebuild or start. Like rebuild, deliberately
 # NO disk.check (it frees space). The active machine is never touched.
+# No machine.exists guard either: purge is idempotent (the delete no-ops when
+# the machine is already gone) and re-running it still forgets a stale IP and
+# drops the socat listener, which is the useful self-heal.
 .PHONY: pg.staging.purge
-pg.staging.purge: machine.exists pgdevd
+pg.staging.purge: pgdevd
 	$(PGDEV) staging purge $(if $(force),--force,)
 
 # ----- destructive outer-machine lifecycle -------------------------------
