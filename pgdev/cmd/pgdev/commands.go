@@ -41,7 +41,7 @@ func (a *app) upCmd() *cobra.Command {
 			// Default to "a" active the first time the pointer file has never
 			// been written, so a fresh `pgdev up` has a well-defined role split.
 			if _, err := os.Stat(a.cfg.ActiveMachinePath()); os.IsNotExist(err) {
-				if err := a.active.Set("a"); err != nil {
+				if err := a.setActive(ctx, "a"); err != nil {
 					return err
 				}
 			}
@@ -239,7 +239,7 @@ func (a *app) ipCmd() *cobra.Command {
 			for _, role := range []string{"active", "staging"} {
 				slot := a.roleSlot(role)
 				ip := a.machineIP(ctx, slot)
-				a.writeMachineIPFile(slot, ip)
+				a.writeMachineIPFile(ctx, slot, ip)
 				endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", role, a.cfg.MachineNameForSlot(slot), orQ(ip), endpoint)
 			}
@@ -289,14 +289,19 @@ func (a *app) promoteCmd() *cobra.Command {
 			// re-points itself within its poll interval and drops the sessions
 			// that were on the demoted machine (spec 0003 §3). No launchd
 			// round-trip, so nothing to fail-and-roll-back here.
-			if err := a.active.Set(to); err != nil {
+			if err := a.setActive(ctx, to); err != nil {
 				return err
 			}
+			// socat now serves the CANONICAL client ports (5442/5443), so re-point
+			// it synchronously (DB-driven, flock-guarded, verified) if installed —
+			// this is the client-facing path now. The Go forwarder re-points itself
+			// from the mirrored pointer file on its own ports (5444/5445).
+			a.reconcileProxyIfInstalled(ctx, "promote")
 			if !a.awaitForwarderRepoint(ctx, to) {
 				fmt.Fprintf(os.Stderr,
-					"WARNING: the forwarder did not confirm re-pointing to %s. The active pointer IS set; verify with\n"+
+					"WARNING: the Go forwarder did not confirm re-pointing to %s. The active pointer IS set; verify with\n"+
 						"         'pgdev forward status' before using :%d — is the forwarder running ('pgdev forward install')?\n",
-					a.cfg.MachineNameForSlot(to), a.cfg.ClientActivePort)
+					a.cfg.MachineNameForSlot(to), a.cfg.ForwardActivePort)
 			}
 
 			fmt.Printf("Promoted. active=%s staging=%s\n\n",
@@ -317,7 +322,7 @@ func (a *app) refreshCmd() *cobra.Command {
 			for _, slot := range slotsAB {
 				machine := a.cfg.MachineNameForSlot(slot)
 				ip := a.machineIP(ctx, slot)
-				a.writeMachineIPFile(slot, ip)
+				a.writeMachineIPFile(ctx, slot, ip)
 				if ip == "" {
 					fmt.Printf("[%s] no IP (machine down?) — skipping reconcile\n", machine)
 					continue
@@ -340,6 +345,9 @@ func (a *app) refreshCmd() *cobra.Command {
 			// The forwarder re-reads the IP files we just rewrote on its next
 			// poll; refresh only needs to make sure the agent is installed.
 			a.ensureForwarder(ctx)
+			// Re-point the socat experiment at the freshly-discovered IPs too
+			// (only if it's installed; socat can't re-point itself).
+			a.reconcileProxyIfInstalled(ctx, "refresh")
 			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s (forwarder tracks the IP files)\n",
 				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
 				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
@@ -470,6 +478,7 @@ func (a *app) stagingCmd() *cobra.Command {
 		reset,
 		a.stagingStartCmd(),
 		a.stagingStopCmd(),
+		a.stagingPurgeCmd(),
 		a.stagingRebuildCmd(),
 	)
 	return c
@@ -520,6 +529,77 @@ func (a *app) stagingStopCmd() *cobra.Command {
 	}
 }
 
+// stagingForDestruction resolves the staging slot and machine names and asserts
+// staging is NOT the active machine — the load-bearing safety property shared by
+// both destructive staging tiers (rebuild, purge). Structurally Staging() is the
+// pointer's complement so they always differ, but this guards the one invariant
+// that, if ever violated, would nuke live data — so it is asserted explicitly.
+func (a *app) stagingForDestruction() (slot, machine, activeMachine string, err error) {
+	slot = a.active.Staging()
+	machine = a.cfg.MachineNameForSlot(slot)
+	activeMachine = a.cfg.MachineNameForSlot(a.active.Get())
+	if machine == activeMachine {
+		return "", "", "", fmt.Errorf("refusing to operate on %s — it is the active machine", machine)
+	}
+	return slot, machine, activeMachine, nil
+}
+
+// stagingPurgeCmd is the reclaim-WITHOUT-rebuild tier: delete ONLY the staging
+// machine — reclaiming its grown sparse macOS disk — and LEAVE IT DOWN. Unlike
+// rebuild it does not recreate/deploy/provision; staging stays gone until you
+// `rebuild` (or `make start`) it back. The active machine is never touched. It
+// also forgets staging's now-dead IP and drops its socat listener, so the
+// endpoint honestly reads "down" instead of dialing a corpse.
+func (a *app) stagingPurgeCmd() *cobra.Command {
+	var force bool
+	c := &cobra.Command{
+		Use:   "purge",
+		Short: "Delete the staging machine to reclaim its macOS disk and leave it DOWN (no rebuild)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			slot, machine, activeMachine, err := a.stagingForDestruction()
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n", machine)
+			fmt.Printf("    It will NOT be recreated — run 'make pg.staging.rebuild' or 'make start' to bring it back.\n")
+			fmt.Printf("    %s (active) is never touched.\n", activeMachine)
+			if !force {
+				ok, err := confirm()
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errors.New("aborted")
+				}
+			}
+
+			cli := a.apple(slot)
+			fmt.Printf("==> [%s] Stopping and deleting (this reclaims its macOS disk)...\n", machine)
+			if err := cli.Delete(ctx); err != nil {
+				return err
+			}
+
+			// Forget staging's now-invalid IP and drop its socat listener, so
+			// :5443 reads "down" rather than dialing the deleted machine. The Go
+			// forwarder likewise sees the mirror gone and marks staging unroutable.
+			if db, err := a.track(ctx); err == nil {
+				if err := db.ForgetMachine(ctx, slot); err != nil {
+					a.log.Warn("forgetting staging machine failed", "slot", slot, "err", err)
+				}
+			}
+			a.reconcileProxyIfInstalled(ctx, "staging purge")
+
+			fmt.Printf("==> Purged. %s is deleted and its macOS disk reclaimed; %s (active) was never touched.\n", machine, activeMachine)
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&force, "force", false, "skip the confirmation prompt")
+	return c
+}
+
 // stagingRebuildCmd is the hard-reset reclaim tier (spec 0002 §0.1/§2): delete
 // and recreate ONLY the staging machine — reclaiming its grown sparse macOS
 // disk — then re-provision a fresh backend on it. The active machine is never
@@ -532,15 +612,9 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			staging := a.active.Staging()
-			active := a.active.Get()
-			machine := a.cfg.MachineNameForSlot(staging)
-			activeMachine := a.cfg.MachineNameForSlot(active)
-			// Structurally staging != active (Staging() is the pointer's
-			// complement), but this is the load-bearing safety property of the
-			// whole command, so assert it explicitly rather than trust that.
-			if machine == activeMachine {
-				return fmt.Errorf("refusing to rebuild %s — it is the active machine", machine)
+			staging, machine, activeMachine, err := a.stagingForDestruction()
+			if err != nil {
+				return err
 			}
 
 			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n", machine)

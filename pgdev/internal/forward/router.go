@@ -1,7 +1,9 @@
 // Package forward is the host-side (macOS) client forwarder that replaces the
-// shell socat relay (scripts/host-endpoint, retired in spec 0003). It owns the
-// two stable loopback listeners — 127.0.0.1:5442 (active) and :5443 (staging) —
-// for their whole lifetime and re-points by swapping the dial target IN PLACE,
+// shell socat relay (scripts/host-endpoint, retired in spec 0003). It owns two
+// stable loopback listeners for their whole lifetime and re-points by swapping
+// the dial target IN PLACE. Since spec 0004 it listens on 127.0.0.1:5444
+// (active) / :5445 (staging) — MOVED off the canonical client ports, which the
+// socat proxy (internal/socatproxy) now serves; the forwarder runs alongside it,
 // never rebinding. That kills the socat/launchd process-lifecycle bugs: nothing
 // external to orphan, no "Address already in use" on re-point, no SIGKILL
 // trap-bypass. `promote` then collapses to a pointer write — the running

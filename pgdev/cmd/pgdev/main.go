@@ -17,9 +17,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +31,7 @@ import (
 	"pansen.me/pgdev/internal/applecli"
 	"pansen.me/pgdev/internal/config"
 	"pansen.me/pgdev/internal/forward"
+	"pansen.me/pgdev/internal/track"
 )
 
 // version is stamped at build time (see Makefile), matched against each
@@ -46,6 +47,12 @@ type app struct {
 	// active is the host-side pointer to which MACHINE is active (behind
 	// :5442); the other machine is staging (behind :5443). See spec 0002 §0.1.
 	active activeslot.Pointer
+	// log is the structured (slog) logger threaded into the tracking DB and the
+	// socat proxy. Text handler to stderr; debug when cfg.ProxyVerbose.
+	log *slog.Logger
+	// trackDB is the SQLite tracking store (internal/track), opened lazily and
+	// cached for the process. nil until first use; see app.track.
+	trackDB *track.DB
 }
 
 func main() {
@@ -62,6 +69,7 @@ func newApp() *app {
 	return &app{
 		cfg:    cfg,
 		active: activeslot.Pointer{Path: cfg.ActiveMachinePath(), UID: cfg.HostUID, GID: cfg.HostGID},
+		log:    newLogger(cfg.ProxyVerbose),
 	}
 }
 
@@ -85,6 +93,7 @@ func rootCmd() *cobra.Command {
 		a.ipCmd(),
 		a.endpointCmd(),
 		a.forwardCmd(),
+		a.proxyCmd(),
 		a.snapshotCmd("active"),
 		a.restoreCmd("active"),
 		a.restoreLastCmd("active"),
@@ -118,14 +127,42 @@ func (a *app) machineIP(ctx context.Context, slot string) string {
 }
 
 // writeMachineIPFile caches slot's discovered IP host-side so subsequent
-// commands (and the host forwarder) don't need a live `container` exec.
-func (a *app) writeMachineIPFile(slot, ip string) {
+// commands (and both forwarders) don't need a live `container` exec. The cache
+// lives in the SQLite tracking DB (the source of truth); track mirrors it back
+// to the legacy var/machine-ip-<slot> file the resident Go forwarder still
+// polls. There is deliberately NO file-only fallback when the DB is unavailable:
+// a file-only write would diverge the mirror from the (stale) DB, and socat —
+// the canonical client path — routes on the DB, so it would silently forward to
+// the wrong machine. A DB that won't open is a real fault to surface, not paper
+// over; IP caching is best-effort, so we log loudly and skip (next run retries).
+func (a *app) writeMachineIPFile(ctx context.Context, slot, ip string) {
 	if ip == "" {
 		return
 	}
-	path := a.cfg.MachineIPPath(slot)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, []byte(ip+"\n"), 0o644)
+	db, err := a.track(ctx)
+	if err != nil {
+		a.log.Error("cannot cache machine IP: tracking DB unavailable", "slot", slot, "ip", ip, "err", err)
+		return
+	}
+	if err := db.SetMachineIP(ctx, slot, ip); err != nil {
+		a.log.Warn("caching machine IP failed", "slot", slot, "err", err)
+	}
+}
+
+// setActive is the CHOKEPOINT for the active pointer: it writes the SQLite
+// tracking DB (source of truth), which mirrors the value back to the legacy
+// var/active-machine file the resident Go forwarder polls. If the DB can't be
+// opened this is a HARD error — unlike IP caching, a promote must not
+// half-succeed: writing only the legacy file would leave the DB (and therefore
+// socat, the canonical client path) pointing at the OLD active machine, so a
+// client would keep hitting the pre-promote DB. Fail loudly so the operator
+// knows the flip did not take, rather than silently splitting the two paths.
+func (a *app) setActive(ctx context.Context, slot string) error {
+	db, err := a.track(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot set active slot %q: tracking DB unavailable (%w)", slot, err)
+	}
+	return db.SetActive(ctx, slot)
 }
 
 // clientFor builds a typed daemon client against slot's machine. It ensures
@@ -206,6 +243,30 @@ func (a *app) ensureForwarder(ctx context.Context) {
 		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' installed (%s).\n", ld.Label, res.Reason)
 	case "reinstalled":
 		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' re-synced: %s.\n", ld.Label, res.Reason)
+	}
+}
+
+// reinstallForwarder force-(re)installs the Go forwarder LaunchAgent: a full
+// bootout + bootstrap, NOT the gentle Ensure. `proxy install` uses this (not
+// ensureForwarder) because of the port swap: a forwarder process that started
+// BEFORE socat took over 5442/5443 is still bound there, and Ensure would leave
+// it alone (its program args are unchanged, so it looks "healthy") — so socat
+// could never bind the canonical ports. Killing that forwarder's PID can't win
+// either: it has KeepAlive, so launchd resurrects it. Only booting out its JOB
+// frees the port, which bootout+bootstrap does — the bootout releases 5442/5443,
+// the bootstrap brings the forwarder back on its new 5444/5445. Best-effort:
+// honors PG_ENDPOINT_AUTOINSTALL=0 and warns rather than failing.
+func (a *app) reinstallForwarder(ctx context.Context) {
+	if os.Getenv("PG_ENDPOINT_AUTOINSTALL") == "0" {
+		return
+	}
+	ld, err := a.launchd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: skipping Go forwarder install: %v\n", err)
+		return
+	}
+	if err := ld.Install(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: Go forwarder install failed (run 'pgdev forward install'): %v\n", err)
 	}
 }
 

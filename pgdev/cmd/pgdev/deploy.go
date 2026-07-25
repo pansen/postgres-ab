@@ -170,7 +170,7 @@ func (a *app) deploy(ctx context.Context, slot string) error {
 	// before the handshake dials the daemon (this also re-points the endpoint
 	// forwarder at the new IP once refreshForwarder next runs).
 	if ip, err := cli.MachineIP(ctx); err == nil && ip != "" {
-		a.writeMachineIPFile(slot, ip)
+		a.writeMachineIPFile(ctx, slot, ip)
 	}
 
 	fmt.Printf("==> [%s] Installing pgdevd into the machine...\n", machine)
