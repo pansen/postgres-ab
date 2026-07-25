@@ -32,8 +32,8 @@ func (a *app) upCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("==> [%s] Provisioning (the first run builds the golden PostgreSQL image; this can take a few minutes)...\n",
-					a.cfg.MachineNameForSlot(slot))
+				a.log.Info("provisioning backend (the first run builds the golden PostgreSQL image; this can take a few minutes)",
+					"machine", a.cfg.MachineNameForSlot(slot))
 				if _, err := cl.Up(ctx); err != nil {
 					return fmt.Errorf("%s: %w", a.cfg.MachineNameForSlot(slot), err)
 				}
@@ -41,12 +41,12 @@ func (a *app) upCmd() *cobra.Command {
 			// Default to "a" active the first time the pointer file has never
 			// been written, so a fresh `pgdev up` has a well-defined role split.
 			if _, err := os.Stat(a.cfg.ActiveMachinePath()); os.IsNotExist(err) {
-				if err := a.active.Set("a"); err != nil {
+				if err := a.setActive(ctx, "a"); err != nil {
 					return err
 				}
 			}
-			a.ensureForwarder(ctx)
-			fmt.Println("==> pg-dev ready.")
+			a.reconcileProxyIfInstalled(ctx, "up")
+			a.log.Info("pg-dev ready")
 			fmt.Println()
 			a.renderStatus(ctx)
 			return nil
@@ -65,15 +65,15 @@ func (a *app) downCmd() *cobra.Command {
 				machine := a.cfg.MachineNameForSlot(slot)
 				cl, err := a.longClientFor(ctx, slot)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: %s: %v\n", machine, err)
+					a.log.Warn("skipping machine", "machine", machine, "err", err)
 					continue
 				}
 				res, err := cl.Down(ctx)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: %s: %v\n", machine, err)
+					a.log.Warn("down failed", "machine", machine, "err", err)
 					continue
 				}
-				fmt.Printf("[%s] %s\n", machine, res.Message)
+				a.log.Info(res.Message, "machine", machine)
 			}
 			return nil
 		},
@@ -100,6 +100,10 @@ func (a *app) statusCmd() *cobra.Command {
 type slotStatus struct {
 	st  agentapi.StatusResponse
 	err error
+	// absent is set when the machine itself is gone (never created, or deleted
+	// by `pg.staging.purge`). That is an expected steady state, not a fault, so
+	// status reports it as ABSENT rather than UNREACHABLE.
+	absent bool
 }
 
 // fetchStatuses queries both machines' status, tolerating per-machine errors.
@@ -107,12 +111,16 @@ func (a *app) fetchStatuses(ctx context.Context) map[string]slotStatus {
 	out := make(map[string]slotStatus, len(slotsAB))
 	for _, slot := range slotsAB {
 		cl, err := a.clientFor(ctx, slot)
-		if err != nil {
-			out[slot] = slotStatus{err: err}
-			continue
+		if err == nil {
+			var st agentapi.StatusResponse
+			if st, err = cl.Status(ctx); err == nil {
+				out[slot] = slotStatus{st: st}
+				continue
+			}
 		}
-		st, err := cl.Status(ctx)
-		out[slot] = slotStatus{st: st, err: err}
+		// Only ask the (slow) Apple CLI whether the machine exists once
+		// something already went wrong — the happy path stays exec-free.
+		out[slot] = slotStatus{err: err, absent: !a.apple(slot).Exists(ctx)}
 	}
 	return out
 }
@@ -142,15 +150,15 @@ func (a *app) renderStatus(ctx context.Context) {
 		machine := a.cfg.MachineNameForSlot(slot)
 		endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 		if ms.err != nil {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", role, machine, "-", "UNREACHABLE", endpoint, "-", "-")
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", role, machine, "-", statusState(ms), endpoint, "-", "-")
 			continue
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
-			role, machine, orDash(ms.st.Container), orAbsent(ms.st.State), endpoint, len(ms.st.Snapshots), orDash(strings.Join(ms.st.IPs, ",")))
+			role, machine, orDash(ms.st.Container), statusState(ms), endpoint, len(ms.st.Snapshots), orDash(strings.Join(ms.st.IPs, ",")))
 	}
 	tw.Flush()
 	fmt.Println()
-	a.renderForwarder(ctx)
+	a.renderProxy(ctx)
 	fmt.Println()
 	a.renderSnapshots(statuses, true)
 }
@@ -175,6 +183,10 @@ func (a *app) renderSnapshots(statuses map[string]slotStatus, withPsql bool) {
 		ms := statuses[slot]
 		machine := a.cfg.MachineNameForSlot(slot)
 		fmt.Printf("─── %-7s (%s) ───\n", role, machine)
+		if ms.absent {
+			fmt.Printf("(machine %s does not exist — run '%s' to bring it back)\n\n", machine, rebuildHint(role))
+			continue
+		}
 		if ms.err != nil {
 			fmt.Printf("(unreachable: %v)\n\n", ms.err)
 			continue
@@ -218,10 +230,8 @@ func (a *app) endpointCmd() *cobra.Command {
 			fmt.Println("psql commands:")
 			fmt.Printf("  active:  %s\n", a.psqlCmd(a.cfg.ClientActivePort))
 			fmt.Printf("  staging: %s\n", a.psqlCmd(a.cfg.ClientStagingPort))
-			if h == "127.0.0.1" {
-				fmt.Printf("\nnote: 127.0.0.1 needs the host forwarder ('make endpoint.install'); it\n")
-				fmt.Printf("      relays to each machine's IP, which may drift on reboot ('pgdev refresh' re-points it).\n")
-			}
+			fmt.Printf("\nnote: these ports are served by the socat client proxy ('make proxy.install'); it\n")
+			fmt.Printf("      relays to each machine's IP, which may drift on reboot ('pgdev refresh' re-points it).\n")
 			return nil
 		},
 	}
@@ -239,7 +249,7 @@ func (a *app) ipCmd() *cobra.Command {
 			for _, role := range []string{"active", "staging"} {
 				slot := a.roleSlot(role)
 				ip := a.machineIP(ctx, slot)
-				a.writeMachineIPFile(slot, ip)
+				a.writeMachineIPFile(ctx, slot, ip)
 				endpoint := fmt.Sprintf("%s:%d", a.cfg.ProxyHostname, a.cfg.ClientPort(role))
 				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", role, a.cfg.MachineNameForSlot(slot), orQ(ip), endpoint)
 			}
@@ -254,7 +264,7 @@ func (a *app) ipCmd() *cobra.Command {
 func (a *app) promoteCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "promote",
-		Short: "Flip active↔staging (re-point the host forwarder, no data moves)",
+		Short: "Flip active↔staging (re-point the client proxy, no data moves)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -285,22 +295,20 @@ func (a *app) promoteCmd() *cobra.Command {
 				}
 			}
 
-			// Promote collapses to a pointer write: the resident forwarder
-			// re-points itself within its poll interval and drops the sessions
-			// that were on the demoted machine (spec 0003 §3). No launchd
-			// round-trip, so nothing to fail-and-roll-back here.
-			if err := a.active.Set(to); err != nil {
+			// Promote is a pointer write plus a proxy reconcile: no data moves and
+			// no daemon call.
+			if err := a.setActive(ctx, to); err != nil {
 				return err
 			}
-			if !a.awaitForwarderRepoint(ctx, to) {
-				fmt.Fprintf(os.Stderr,
-					"WARNING: the forwarder did not confirm re-pointing to %s. The active pointer IS set; verify with\n"+
-						"         'pgdev forward status' before using :%d — is the forwarder running ('pgdev forward install')?\n",
-					a.cfg.MachineNameForSlot(to), a.cfg.ClientActivePort)
-			}
+			// socat serves the client ports (5442/5443) and cannot re-point itself,
+			// so re-point it synchronously (DB-driven, flock-guarded, verified) if
+			// installed. Sessions on the demoted machine are dropped; clients
+			// reconnect onto the new active.
+			a.reconcileProxyIfInstalled(ctx, "promote")
 
-			fmt.Printf("Promoted. active=%s staging=%s\n\n",
-				a.cfg.MachineNameForSlot(to), a.cfg.MachineNameForSlot(from))
+			a.log.Info("promoted",
+				"active", a.cfg.MachineNameForSlot(to), "staging", a.cfg.MachineNameForSlot(from))
+			fmt.Println()
 			a.renderStatus(ctx)
 			return nil
 		},
@@ -310,39 +318,39 @@ func (a *app) promoteCmd() *cobra.Command {
 func (a *app) refreshCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "refresh",
-		Short: "Re-discover both machine IPs and re-point the host forwarder",
+		Short: "Re-discover both machine IPs and re-point the client proxy",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			for _, slot := range slotsAB {
 				machine := a.cfg.MachineNameForSlot(slot)
 				ip := a.machineIP(ctx, slot)
-				a.writeMachineIPFile(slot, ip)
+				a.writeMachineIPFile(ctx, slot, ip)
 				if ip == "" {
-					fmt.Printf("[%s] no IP (machine down?) — skipping reconcile\n", machine)
+					a.log.Warn("no IP (machine down?) — skipping reconcile", "machine", machine)
 					continue
 				}
 				cl, err := a.clientFor(ctx, slot)
 				if err != nil {
-					fmt.Printf("[%s] %v\n", machine, err)
+					a.log.Warn("machine unreachable", "machine", machine, "err", err)
 					continue
 				}
 				res, err := cl.Reconcile(ctx)
 				if err != nil {
-					fmt.Printf("[%s] reconcile: %v\n", machine, err)
+					a.log.Error("backend reconcile failed", "machine", machine, "err", err)
 					continue
 				}
-				fmt.Printf("[%s] backend running=%v\n", machine, res.BackendRunning)
+				a.log.Info("backend reconciled", "machine", machine, "running", res.BackendRunning)
 				for _, act := range res.Actions {
-					fmt.Printf("    %s\n", act)
+					a.log.Info("backend action", "machine", machine, "action", act)
 				}
 			}
-			// The forwarder re-reads the IP files we just rewrote on its next
-			// poll; refresh only needs to make sure the agent is installed.
-			a.ensureForwarder(ctx)
-			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s (forwarder tracks the IP files)\n",
-				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
-				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
+			// Re-point the socat proxy at the freshly-discovered IPs (only if it's
+			// installed; socat can't re-point itself).
+			a.reconcileProxyIfInstalled(ctx, "refresh")
+			a.log.Info("endpoints re-pointed",
+				"active", fmt.Sprintf("%s:%d → %s", a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get())),
+				"staging", fmt.Sprintf("%s:%d → %s", a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging())))
 			return nil
 		},
 	}
@@ -366,7 +374,7 @@ func (a *app) snapshotCmd(role string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot(role)), "snapshot", args[0])
 			return nil
 		},
 	}
@@ -421,7 +429,7 @@ func (a *app) runRestore(ctx context.Context, role, name string, last, force boo
 			return fmt.Errorf("no snapshots on %s", machine)
 		}
 		target = snaps.Snapshots[len(snaps.Snapshots)-1].Name
-		fmt.Printf("==> Restoring %s to most recent snapshot: %s\n", machine, target)
+		a.log.Info("restoring to most recent snapshot", "machine", machine, "snapshot", target)
 	}
 
 	after := snapshotsAfter(snaps.Snapshots, target)
@@ -445,7 +453,7 @@ func (a *app) runRestore(ctx context.Context, role, name string, last, force boo
 	if err != nil {
 		return err
 	}
-	fmt.Println(res.Message)
+	a.log.Info(res.Message, "machine", machine)
 	return nil
 }
 
@@ -470,6 +478,7 @@ func (a *app) stagingCmd() *cobra.Command {
 		reset,
 		a.stagingStartCmd(),
 		a.stagingStopCmd(),
+		a.stagingPurgeCmd(),
 		a.stagingRebuildCmd(),
 	)
 	return c
@@ -493,7 +502,7 @@ func (a *app) stagingStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot("staging")))
 			return nil
 		},
 	}
@@ -514,10 +523,81 @@ func (a *app) stagingStopCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot("staging")))
 			return nil
 		},
 	}
+}
+
+// stagingForDestruction resolves the staging slot and machine names and asserts
+// staging is NOT the active machine — the load-bearing safety property shared by
+// both destructive staging tiers (rebuild, purge). Structurally Staging() is the
+// pointer's complement so they always differ, but this guards the one invariant
+// that, if ever violated, would nuke live data — so it is asserted explicitly.
+func (a *app) stagingForDestruction() (slot, machine, activeMachine string, err error) {
+	slot = a.active.Staging()
+	machine = a.cfg.MachineNameForSlot(slot)
+	activeMachine = a.cfg.MachineNameForSlot(a.active.Get())
+	if machine == activeMachine {
+		return "", "", "", fmt.Errorf("refusing to operate on %s — it is the active machine", machine)
+	}
+	return slot, machine, activeMachine, nil
+}
+
+// stagingPurgeCmd is the reclaim-WITHOUT-rebuild tier: delete ONLY the staging
+// machine — reclaiming its grown sparse macOS disk — and LEAVE IT DOWN. Unlike
+// rebuild it does not recreate/deploy/provision; staging stays gone until you
+// `rebuild` (or `make start`) it back. The active machine is never touched. It
+// also forgets staging's now-dead IP and drops its socat listener, so the
+// endpoint honestly reads "down" instead of dialing a corpse.
+func (a *app) stagingPurgeCmd() *cobra.Command {
+	var force bool
+	c := &cobra.Command{
+		Use:   "purge",
+		Short: "Delete the staging machine to reclaim its macOS disk and leave it DOWN (no rebuild)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx := cmd.Context()
+			slot, machine, activeMachine, err := a.stagingForDestruction()
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n", machine)
+			fmt.Printf("    It will NOT be recreated — run 'make pg.staging.rebuild' or 'make start' to bring it back.\n")
+			fmt.Printf("    %s (active) is never touched.\n", activeMachine)
+			if !force {
+				ok, err := confirm()
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errors.New("aborted")
+				}
+			}
+
+			cli := a.apple(slot)
+			a.log.Info("stopping and deleting the machine (this reclaims its macOS disk)", "machine", machine)
+			if err := cli.Delete(ctx); err != nil {
+				return err
+			}
+
+			// Forget staging's now-invalid IP and drop its socat listener, so
+			// :5443 reads "down" rather than dialing the deleted machine.
+			if db, err := a.track(ctx); err == nil {
+				if err := db.ForgetMachine(ctx, slot); err != nil {
+					a.log.Warn("forgetting staging machine failed", "slot", slot, "err", err)
+				}
+			}
+			a.reconcileProxyIfInstalled(ctx, "staging purge")
+
+			a.log.Info("purged — the machine is deleted and its macOS disk reclaimed; active was never touched",
+				"purged", machine, "active", activeMachine)
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&force, "force", false, "skip the confirmation prompt")
+	return c
 }
 
 // stagingRebuildCmd is the hard-reset reclaim tier (spec 0002 §0.1/§2): delete
@@ -532,15 +612,9 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			staging := a.active.Staging()
-			active := a.active.Get()
-			machine := a.cfg.MachineNameForSlot(staging)
-			activeMachine := a.cfg.MachineNameForSlot(active)
-			// Structurally staging != active (Staging() is the pointer's
-			// complement), but this is the load-bearing safety property of the
-			// whole command, so assert it explicitly rather than trust that.
-			if machine == activeMachine {
-				return fmt.Errorf("refusing to rebuild %s — it is the active machine", machine)
+			staging, machine, activeMachine, err := a.stagingForDestruction()
+			if err != nil {
+				return err
 			}
 
 			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n", machine)
@@ -556,18 +630,18 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 			}
 
 			cli := a.apple(staging)
-			fmt.Printf("==> [%s] Deleting and recreating (this reclaims its macOS disk)...\n", machine)
+			a.log.Info("deleting and recreating the machine (this reclaims its macOS disk)", "machine", machine)
 			opts := applecli.CreateOpts{CPUs: a.cfg.MachineCPUs, Memory: a.cfg.MachineMemory, Image: a.cfg.MachineImage}
 			if err := cli.Recreate(ctx, opts, 5*time.Minute); err != nil {
 				return err
 			}
 
-			fmt.Printf("==> [%s] Installing pgdevd...\n", machine)
+			a.log.Info("installing pgdevd", "machine", machine)
 			if err := a.deploy(ctx, staging); err != nil {
 				return err
 			}
 
-			fmt.Printf("==> [%s] Provisioning fresh backend...\n", machine)
+			a.log.Info("provisioning a fresh backend", "machine", machine)
 			cl, err := a.longClientFor(ctx, staging)
 			if err != nil {
 				return err
@@ -576,9 +650,11 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 				return err
 			}
 
-			a.ensureForwarder(ctx)
+			// The recreated machine has a fresh DHCP lease, so point the proxy at it.
+			a.reconcileProxyIfInstalled(ctx, "staging rebuild")
 
-			fmt.Printf("==> Reclaim done. %s is fresh; %s (active) was never touched.\n", machine, activeMachine)
+			a.log.Info("reclaim done — the machine is fresh; active was never touched",
+				"rebuilt", machine, "active", activeMachine)
 			return nil
 		},
 	}
@@ -644,9 +720,41 @@ func orAbsent(s string) string {
 	}
 	return s
 }
+
+// statusState is the STATE column for one slot. A deleted machine (never
+// created, or purged) reads ABSENT — a legitimate steady state since
+// `pg.staging.purge` — and is kept distinct from UNREACHABLE, which means the
+// machine is there but its daemon did not answer.
+func statusState(ms slotStatus) string {
+	switch {
+	case ms.absent:
+		return "ABSENT"
+	case ms.err != nil:
+		return "UNREACHABLE"
+	}
+	return orAbsent(ms.st.State)
+}
+
+// rebuildHint names the command that recreates a deleted machine: staging has
+// its own cheap rebuild (the everyday reclaim tier after `pg.staging.purge`),
+// active only comes back through the full `make start` path.
+func rebuildHint(role string) string {
+	if role == "staging" {
+		return "make pg.staging.rebuild"
+	}
+	return "make start"
+}
+
 func orQ(s string) string {
 	if s == "" {
 		return "?"
+	}
+	return s
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
 	}
 	return s
 }

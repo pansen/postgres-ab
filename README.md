@@ -42,7 +42,7 @@ its own Incus + copy-on-write XFS snapshot store. One machine is **active**
 macOS client
     │ 127.0.0.1:5442 (active) / :5443 (staging)   — stable, never changes
     ▼
-Go forwarder (host launchd agent, internal/forward) — re-points itself on promote
+socat client proxy (host launchd agents, internal/socatproxy) — re-pointed on promote
     │  maps each role port to whichever machine holds that role
     ├───────────────────────────────┬───────────────────────────────┐
     ▼                               ▼
@@ -74,8 +74,8 @@ pgdev (macOS) ── HTTP/JSON ──▶ pgdevd (vpg-a | vpg-b) ──▶ Incus 
 ```
 
 Each daemon serves exactly its one backend (slot-implicit API); active/staging
-is decided host-side. So `promote` is purely host: **flip `var/active-machine`,
-re-point the forwarder** — no data moves, no daemon call. `up` provisions each
+is decided host-side. So `promote` is purely host: **flip the active pointer,
+re-point the client proxy** — no data moves, no daemon call. `up` provisions each
 machine's backend from a golden `pg-dev-base` image (PostgreSQL installed once,
 then `incus publish`ed) and adds its `eth0` proxy device; `status`/`ip`/
 `refresh` fan out over both. Each daemon owns its own single-mutation lock,
@@ -99,31 +99,36 @@ static-IP pinning. Do not use a backend's 10.x address from macOS.
 
 Each machine's `eth0` IP is an unpinnable `bootpd` DHCP lease that can change
 (the whole `/24` too) after a macOS reboot or machine recreation, and the two
-leases drift independently. So the client endpoint is decoupled from them: a
-per-user `launchd` agent runs an in-process Go forwarder (`pgdev forward serve`,
-`internal/forward`) that owns `127.0.0.1:5442` (active) / `:5443` (staging) for
-its whole lifetime and relays each to whichever machine currently holds that
-role. It re-points **in place** by swapping the dial target — never rebinding —
-so promote can't orphan a listener or leave a stale mapping. The ports are offset
-from `5432` so a local PostgreSQL isn't shadowed. Clients always use
-**`127.0.0.1:5442`** / **`:5443`** — permanent, identical on every Mac.
+leases drift independently. So the client endpoint is decoupled from them: two
+per-user `launchd` agents run `socat` (`internal/socatproxy`), owning
+`127.0.0.1:5442` (active) / `:5443` (staging) and relaying each to whichever
+machine currently holds that role. The ports are offset from `5432` so a local
+PostgreSQL isn't shadowed. Clients always use **`127.0.0.1:5442`** / **`:5443`**
+— permanent, identical on every Mac.
 
-Hands-off: **`make start` installs the forwarder**; after that `pgdev promote` is
-just a pointer write — the resident forwarder notices within its poll interval,
-re-points, and drops the sessions that were on the demoted machine (reconnect to
-land on the new database). `make endpoint.status` / `endpoint.uninstall` manage
-the agent (`PG_ENDPOINT_AUTOINSTALL=0` opts out of auto-install).
+socat cannot re-point itself, so every `promote` and IP change **reconciles** the
+agents: rewrite the plist, `bootout`, wait for the port to actually free, load it
+again, then verify the live process really dials the intended target. That
+reconcile is driven from `var/pgdev.db` (SQLite) and serialized by a `flock`, so
+two concurrent commands can't leave a stale mapping behind. Sessions on the
+demoted machine are dropped by the reload — reconnect to land on the new
+database.
+
+Install it once with **`make proxy.install`** (`make proxy.status` /
+`proxy.uninstall` manage it); after that `promote`/`refresh` keep it in step
+automatically and never touch launchd if it isn't installed. The first run also
+needs a one-time macOS **Local Network** grant — see
+[macOS Security](#macos-security--grant-local-network-once).
 `PG_PROXY_HOSTNAME` sets the hostname printed in psql/.pgpass lines (default
 `host.docker.internal`, so the endpoint also resolves from sibling
-containers/k3d; use `127.0.0.1` for host-only). `PG_FORWARD_BIND` widens the
+containers/k3d; use `127.0.0.1` for host-only). `PG_CLIENT_BIND` widens the
 listener bind (default `127.0.0.1`; set `0.0.0.0` only if a sibling container
 can't reach the Mac's loopback — it exposes the dev backend on every interface).
 
 No connection pooler: each port is a per-connection TCP passthrough, so
 `CREATE`/`DROP DATABASE`, `LISTEN`/`NOTIFY`, prepared statements, advisory locks
-and parallel `pg_restore` behave like direct connections. Promoting re-points
-the forwarder, which may drop existing sessions (reconnect); the role ports
-don't change.
+and parallel `pg_restore` behave like direct connections. Promoting reloads the
+proxy, which drops existing sessions (reconnect); the role ports don't change.
 
 ### Snapshots on Apple's stock kernel
 
@@ -176,8 +181,10 @@ make pg.status
 The first `make start` builds an Ubuntu 26.04 machine image (systemd, Incus, jq,
 XFS tools) and creates both machines; later starts reuse them. `make pg.up`
 installs PostgreSQL 17 in each machine's nested Ubuntu 24.04 container (several
-minutes). `make start` also installs and re-points the host forwarder for the
-stable `127.0.0.1` endpoint (see [Networking](#networking)).
+minutes). Run `make proxy.install` once for the stable `127.0.0.1` endpoints
+(see [Networking](#networking)); `make start` keeps them re-pointed afterwards.
+The first connection also needs a one-time macOS **Local Network** grant — see
+[macOS Security](#macos-security--grant-local-network-once).
 
 Status prints endpoints similar to:
 
@@ -269,7 +276,7 @@ Snapshot names may contain letters, digits, dots, underscores, and hyphens.
 make status               # endpoints, roles, states, IPs, timelines
 make status/incus         # Incus versions/resources/list
 make pg.ip                # both machines' IPs and endpoints
-make pg.refresh           # re-discover both machine IPs, re-point the forwarder
+make pg.refresh           # re-discover both machine IPs, re-point the client proxy
 make machine.status       # Apple machine JSON (both)
 make machine.shell        # shell into the active machine (slot=a|b to pick)
 make pg.shell             # shell in the active backend; pg.staging.shell for staging
@@ -298,58 +305,32 @@ its sparse image) and never touches active. `make recreate` is the full nuke.
 
 ## Constraints & gotchas
 
-### macOS Security
+### macOS Security — grant Local Network once
 
 On macOS 15 Sequoia and later (incl. 26 Tahoe), **Local Network Privacy** gates
-the forwarder's connection to the machines' `192.168.64.0/24` subnet. Until it is
-granted, the forwarder accepts the client on `:5442`/`:5443` then can't reach the
-backend (`EHOSTUNREACH`), and `psql` reports _"server closed the connection
-unexpectedly."_ Grant it under **System Settings → Privacy & Security → Local
-Network** (enable `pgdev`), then apply the grant to the already-running agent:
+any connection to the machines' `192.168.64.0/24` subnet, so the client proxy
+needs that permission — **granted once, and only once**.
+
+Until it is granted, the proxy accepts your client on `:5442`/`:5443` but cannot
+reach the backend (`EHOSTUNREACH`), and `psql` reports _"server closed the
+connection unexpectedly."_ Grant it under **System Settings → Privacy & Security
+→ Local Network** (enable the `socat` entry), then restart the running agents so
+they re-evaluate it — macOS caches the decision at process start, so a proxy that
+was already running when you ticked the box stays blocked:
 
 ```sh
-make endpoint.restart
+make proxy.uninstall && make proxy.install
 ```
 
-(The grant is cached at process start, so a service that was already running when
-you ticked the box stays blocked until restarted.)
+The grant then **sticks across rebuilds**. It is keyed to the binary's
+code-signing identity, and the proxy runs Homebrew's `socat` — one stable,
+already-signed binary at a fixed path that this repo never rebuilds. (The
+removed Go forwarder was the opposite: `make` re-signed it on nearly every
+build, so each rebuild looked like a new program — a fresh prompt and another
+duplicate row in the _Local Network_ list.)
 
-![Local Network permission](doc/img/LocalNetworkpermission.png)
-
-#### Making the grant survive rebuilds
-
-The permission is keyed to the binary's **code-signing identity**. By default
-`make build` signs `bin/pgdev` **ad-hoc**, which has no stable identity — macOS
-falls back to the binary's content hash (cdhash), so **every rebuild looks like a
-new program**: it re-prompts and adds another duplicate row to the _Local
-Network_ list.
-
-To fix that permanently, sign with a stable **self-signed code-signing
-certificate** (local-dev only; no Apple account needed). One-time setup:
-
-```sh
-openssl req -x509 -newkey rsa:2048 -days 3650 -keyout etc/keys/dev.key -out etc/keys/dev.crt -nodes \
-  -subj "/CN=PGDev Signing" -addext "keyUsage=critical,digitalSignature" \
-  -addext "extendedKeyUsage=codeSigning"
-openssl pkcs12 -export -legacy -in etc/keys/dev.crt -inkey etc/keys/dev.key -out etc/keys/dev.p12 -password pass:dev
-security import etc/keys/dev.p12 -k ~/Library/Keychains/login.keychain-db -P dev -T /usr/bin/codesign
-# Keychain Access → "PGDev Signing" → Trust → Code Signing: Always Trust
-```
-
-Then build with that identity (put it in `.env` so it's automatic):
-
-```sh
-make build SIGN_CERT="PGDev Signing"     # or: echo 'SIGN_CERT=PGDev Signing' >> .env
-```
-
-Grant _Local Network_ once; because the signing identity is now stable, every
-later `make build` keeps the same grant — no re-prompt, no duplicate entries.
-
-> Alternative — skip the permission entirely: Local Network Privacy does **not**
-> apply to code running as **root**, so installing the forwarder as a
-> _LaunchDaemon_ (`/Library/LaunchDaemons`, system domain) instead of a per-user
-> _LaunchAgent_ sidesteps it — at the cost of running as root and needing `sudo`
-> to install. Not the default here.
+If a client hangs after the grant, check `make proxy.status` and the socat logs
+in `var/<prefix>-socat-<role>.log`.
 
 ### Disk Space
 
@@ -401,9 +382,14 @@ See `.env.example`. The main settings are:
 - `PG_DATA_DISK_SIZE` — first-creation XFS logical size (per machine);
 - `PG_BACKEND_PORT` — port each backend is exposed on (`5432`);
 - `PG_CLIENT_ACTIVE_PORT`, `PG_CLIENT_STAGING_PORT` — host loopback ports the
-  forwarder listens on (`5442`/`5443`);
+  client proxy listens on (`5442`/`5443`);
 - `PG_PROXY_HOSTNAME` — hostname printed in psql/.pgpass lines (default
-  `host.docker.internal`; `127.0.0.1` for host-only).
+  `host.docker.internal`; `127.0.0.1` for host-only);
+- `PG_PROXY_DEBUG` — debug-level structured logging for the tracking DB and the
+  proxy reconcile (on by default); `PG_LOG_COLOR` (`auto`/`always`/`never`) for
+  its coloring — `auto` colors only a terminal and honors `NO_COLOR`, so
+  redirected runs stay clean and fully dated — and `PG_LOG_FORMAT`
+  (`text`/`json`) to swap the colored rendering for machine-readable JSON.
 
 ## Why a Makefile if there is a script?
 

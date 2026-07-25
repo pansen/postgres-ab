@@ -70,15 +70,15 @@ func (a *app) agentVersionCmd() *cobra.Command {
 				name := a.cfg.MachineNameForSlot(slot)
 				cl, err := a.clientFor(ctx, slot)
 				if err != nil {
-					fmt.Printf("[%s] %v\n", name, err)
+					a.log.Error("version handshake failed", "machine", name, "err", err)
 					continue
 				}
 				v, err := cl.Version(ctx)
 				if err != nil {
-					fmt.Printf("[%s] %v\n", name, err)
+					a.log.Error("version handshake failed", "machine", name, "err", err)
 					continue
 				}
-				fmt.Printf("[%s] pgdevd %s (api v%d)\n", name, v.Version, v.APIVersion)
+				a.log.Info("pgdevd version", "machine", name, "pgdevd", v.Version, "api", v.APIVersion)
 			}
 			return nil
 		},
@@ -161,19 +161,19 @@ func (a *app) deploy(ctx context.Context, slot string) error {
 	// A freshly created machine may still be finishing its first boot; wait until
 	// systemd is up before installing/enabling, or Apple rejects the exec
 	// ("Operation not supported by device") or systemctl can't reach the bus.
-	fmt.Printf("==> [%s] Waiting for the machine to be ready...\n", machine)
+	a.log.Info("waiting for the machine to be ready", "machine", machine)
 	if err := cli.WaitReady(ctx, 120*time.Second); err != nil {
 		return err
 	}
 	// A (re)created machine gets a fresh DHCP lease, so the cached
 	// var/machine-ip-<slot> can be stale. Refresh it from the live address
-	// before the handshake dials the daemon (this also re-points the endpoint
-	// forwarder at the new IP once refreshForwarder next runs).
+	// before the handshake dials the daemon (the next proxy reconcile then picks
+	// the new IP up from the tracking DB).
 	if ip, err := cli.MachineIP(ctx); err == nil && ip != "" {
-		a.writeMachineIPFile(slot, ip)
+		a.writeMachineIPFile(ctx, slot, ip)
 	}
 
-	fmt.Printf("==> [%s] Installing pgdevd into the machine...\n", machine)
+	a.log.Info("installing pgdevd into the machine", "machine", machine)
 	steps := [][]string{
 		// Atomic install to the machine-local run path: stage then rename, never
 		// write-in-place → no ETXTBSY on the live binary.
@@ -194,7 +194,7 @@ func (a *app) deploy(ctx context.Context, slot string) error {
 		}
 	}
 
-	fmt.Printf("==> [%s] Restarting pgdevd...\n", machine)
+	a.log.Info("restarting pgdevd", "machine", machine)
 	if out, err := cli.Run(ctx, "systemctl", "restart", "pgdevd"); err != nil {
 		return fmt.Errorf("restarting daemon: %w\n%s", err, out)
 	}
@@ -222,7 +222,7 @@ func (a *app) awaitVersion(ctx context.Context, slot string) error {
 		if err == nil {
 			last = v.Version
 			if version == "dev" || v.Version == version {
-				fmt.Printf("==> [%s] Deployed. pgdevd %s (api v%d) is live.\n", machine, v.Version, v.APIVersion)
+				a.log.Info("deployed — pgdevd is live", "machine", machine, "pgdevd", v.Version, "api", v.APIVersion)
 				return nil
 			}
 		}

@@ -47,7 +47,7 @@ type Config struct {
 	MachinePrefix string // vpg
 	Slot          string // "" host-side; "a"/"b" inside a machine's pgdevd
 	// BackendPort is the single port each machine exposes its one backend on,
-	// over its own eth0 (no in-machine proxy). The host forwarder maps the
+	// over its own eth0 (no in-machine proxy). The host client proxy maps the
 	// client ports to <active-machine-ip>:BackendPort / <staging>:BackendPort.
 	BackendPort int // 5432
 	// Per-machine resources for host-orchestrated create/hard-reset. Two
@@ -59,18 +59,32 @@ type Config struct {
 	// Machine-side proxy ports (the Incus proxy devices' listeners). LEGACY —
 	// retired with the in-machine pg-proxy once routing moves host-side.
 	ActivePort, StagingPort int // 5432 / 5433
-	// Host loopback ports clients actually connect to.
+	// ClientActivePort/ClientStagingPort are the client-facing loopback ports —
+	// what psql/.pgpass/status print and what external configs point at. The
+	// socat proxy (internal/socatproxy) binds THESE.
 	ClientActivePort, ClientStagingPort int // 5442 / 5443
+	// ProxyVerbose makes the socat proxy + tracking DB log at debug level. On by
+	// default: this is an experiment we want to be chatty about (PG_PROXY_DEBUG=0
+	// quiets it to info).
+	ProxyVerbose bool
+	// LogColor selects ANSI coloring for the structured (slog) output
+	// (PG_LOG_COLOR): "auto" (default — color only on a terminal, honoring
+	// NO_COLOR/TERM), "always" to force it through a pipe, "never" to disable.
+	LogColor string
+	// LogFormat selects the structured sink (PG_LOG_FORMAT): "text" (default —
+	// colored, human-first) or "json" (stdlib slog.JSONHandler) for a captured
+	// run that gets machine-parsed instead of read.
+	LogFormat string
 	// ProxyHostname is the host printed in psql/.pgpass lines (PG_PROXY_HOSTNAME).
 	// Defaults to host.docker.internal so the endpoint is reachable both from the
 	// Mac and from sibling containers/k3d; 127.0.0.1 also works host-only.
 	ProxyHostname string
-	// ForwardBind is the address the host forwarder (internal/forward) binds its
-	// client listeners to (PG_FORWARD_BIND). Default 127.0.0.1 (loopback only, as
-	// socat did); set to 0.0.0.0 to reach the endpoints from sibling
-	// containers/k3d that can't hit the Mac's loopback — this exposes the
-	// dev-credentialed backend to every interface, so widen deliberately.
-	ForwardBind string
+	// ClientBind is the address the socat proxy binds its client listeners to
+	// (PG_CLIENT_BIND). Default 127.0.0.1 (loopback only); set to 0.0.0.0 to reach
+	// the endpoints from sibling containers/k3d that can't hit the Mac's loopback
+	// — this exposes the dev-credentialed backend to every interface, so widen
+	// deliberately.
+	ClientBind string
 
 	BackendPrefix string // pg-dev
 	ProxyName     string // pg-proxy — LEGACY (single-machine in-machine proxy)
@@ -134,8 +148,11 @@ func Load() Config {
 		StagingPort:       atoi(get("PG_STAGING_PORT", "5433")),
 		ClientActivePort:  atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
 		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
+		ProxyVerbose:      get("PG_PROXY_DEBUG", "1") != "0",
 		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
-		ForwardBind:       get("PG_FORWARD_BIND", "127.0.0.1"),
+		LogColor:          get("PG_LOG_COLOR", "auto"),
+		LogFormat:         get("PG_LOG_FORMAT", "text"),
+		ClientBind:        get("PG_CLIENT_BIND", "127.0.0.1"),
 		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
 		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),
 		BackendAIP:        get("PG_BACKEND_A_IP", ""),
@@ -214,20 +231,28 @@ func (c Config) ActiveMachinePath() string {
 
 // MachineIPPath is the host-side cache of a machine's drifting eth0 IP, one file
 // per machine (var/machine-ip-a, var/machine-ip-b), since the two leases drift
-// independently and the forwarder must track both.
+// independently. Mirrored from the tracking DB, which is the source of truth.
 func (c Config) MachineIPPath(slot string) string {
 	return filepath.Join(c.RepoRoot, "var", "machine-ip-"+slot)
 }
 
-// ForwardStatePath is where a running `pgdev forward serve` writes its live
-// mapping + heartbeat (internal/forward.State), read by promote/status.
-func (c Config) ForwardStatePath() string {
-	return filepath.Join(c.RepoRoot, "var", "forward-state.json")
+// ----- SQLite tracking + socat proxy (doc/issues/0004) ---------------------
+
+// TrackDBPath is the SQLite machine-tracking database (internal/track), the
+// host-side source of truth for the active pointer, machine IPs, and the socat
+// proxy's reconciled targets. Host-only: never open it from inside a guest over
+// virtiofs (SQLite over virtiofs corrupts).
+func (c Config) TrackDBPath() string { return filepath.Join(c.RepoRoot, "var", "pgdev.db") }
+
+// ReconcileLockPath is the flock the socat reconciler serializes on, held OUTSIDE
+// any SQLite transaction so a wedged launchctl can't brick the CLI.
+func (c Config) ReconcileLockPath() string {
+	return filepath.Join(c.RepoRoot, "var", "reconcile.flock")
 }
 
-// ForwardLogPath is the LaunchAgent's combined stdout/stderr log.
-func (c Config) ForwardLogPath() string {
-	return filepath.Join(c.RepoRoot, "var", c.MachinePrefix+"-forward.log")
+// SocatLogPath is one socat LaunchAgent's log (socat -d -d writes lifecycle here).
+func (c Config) SocatLogPath(role string) string {
+	return filepath.Join(c.RepoRoot, "var", c.MachinePrefix+"-socat-"+role+".log")
 }
 
 // ClientPort returns the host client port for a role ("active"/"staging").
