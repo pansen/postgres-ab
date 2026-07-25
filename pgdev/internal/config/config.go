@@ -59,8 +59,20 @@ type Config struct {
 	// Machine-side proxy ports (the Incus proxy devices' listeners). LEGACY —
 	// retired with the in-machine pg-proxy once routing moves host-side.
 	ActivePort, StagingPort int // 5432 / 5433
-	// Host loopback ports clients actually connect to.
+	// ClientActivePort/ClientStagingPort are the CANONICAL client-facing loopback
+	// ports — what psql/.pgpass/status print and what external configs point at.
+	// The socat proxy (internal/socatproxy) now binds THESE, so existing clients
+	// pick socat up transparently without reconfiguration.
 	ClientActivePort, ClientStagingPort int // 5442 / 5443
+	// ForwardActivePort/ForwardStagingPort are where the Go forwarder
+	// (internal/forward) now listens — MOVED off the canonical pair onto a second
+	// pair so it runs alongside socat during the integration phase, no longer on
+	// the ports clients use (doc/issues/0004).
+	ForwardActivePort, ForwardStagingPort int // 5444 / 5445
+	// ProxyVerbose makes the socat proxy + tracking DB log at debug level. On by
+	// default: this is an experiment we want to be chatty about (PG_PROXY_DEBUG=0
+	// quiets it to info).
+	ProxyVerbose bool
 	// ProxyHostname is the host printed in psql/.pgpass lines (PG_PROXY_HOSTNAME).
 	// Defaults to host.docker.internal so the endpoint is reachable both from the
 	// Mac and from sibling containers/k3d; 127.0.0.1 also works host-only.
@@ -125,38 +137,41 @@ func Load() Config {
 	}
 
 	c := Config{
-		PGUser:            get("PG_USER", ""),
-		PGDB:              get("PG_DB", ""),
-		PGPassword:        get("PG_PASSWORD", ""),
-		MachineName:       get("MACHINE_NAME", "vpg"),
-		MachinePrefix:     get("MACHINE_PREFIX", get("MACHINE_NAME", "vpg")),
-		Slot:              get("PG_SLOT", ""),
-		BackendPort:       atoi(get("PG_BACKEND_PORT", "5432")),
-		MachineCPUs:       atoi(get("MACHINE_CPUS", "4")),
-		MachineMemory:     get("MACHINE_MEMORY", "8G"),
-		MachineImage:      get("MACHINE_IMAGE", "local/pg-incus-machine:26.04"),
-		ActivePort:        atoi(get("PG_ACTIVE_PORT", "5432")),
-		StagingPort:       atoi(get("PG_STAGING_PORT", "5433")),
-		ClientActivePort:  atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
-		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
-		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
-		ForwardBind:       get("PG_FORWARD_BIND", "127.0.0.1"),
-		ForwardVerbose:    get("PG_FORWARD_DEBUG", "") == "1",
-		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
-		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),
-		BackendAIP:        get("PG_BACKEND_A_IP", ""),
-		BackendBIP:        get("PG_BACKEND_B_IP", ""),
-		DataRoot:          get("PG_DATA_ROOT", DefaultDataRoot),
-		DataDiskSize:      get("PG_DATA_DISK_SIZE", "140G"),
-		DataImage:         get("PG_DATA_IMAGE", DefaultDataRoot+".xfs"),
-		BaseImage:         get("PG_BASE_IMAGE", "images:ubuntu/24.04/cloud"),
-		GoldenImage:       get("PG_GOLDEN_IMAGE", "pg-dev-base"),
-		AgentPort:         atoi(get("PG_AGENT_PORT", "5440")),
-		AgentToken:        get("PG_AGENT_TOKEN", ""),
-		MachineIP:         get("PG_MACHINE_IP", ""),
-		RepoRoot:          repo,
-		HostUID:           get("HOST_UID", ""),
-		HostGID:           get("HOST_GID", ""),
+		PGUser:             get("PG_USER", ""),
+		PGDB:               get("PG_DB", ""),
+		PGPassword:         get("PG_PASSWORD", ""),
+		MachineName:        get("MACHINE_NAME", "vpg"),
+		MachinePrefix:      get("MACHINE_PREFIX", get("MACHINE_NAME", "vpg")),
+		Slot:               get("PG_SLOT", ""),
+		BackendPort:        atoi(get("PG_BACKEND_PORT", "5432")),
+		MachineCPUs:        atoi(get("MACHINE_CPUS", "4")),
+		MachineMemory:      get("MACHINE_MEMORY", "8G"),
+		MachineImage:       get("MACHINE_IMAGE", "local/pg-incus-machine:26.04"),
+		ActivePort:         atoi(get("PG_ACTIVE_PORT", "5432")),
+		StagingPort:        atoi(get("PG_STAGING_PORT", "5433")),
+		ClientActivePort:   atoi(get("PG_CLIENT_ACTIVE_PORT", "5442")),
+		ClientStagingPort:  atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
+		ForwardActivePort:  atoi(get("PG_FORWARD_ACTIVE_PORT", "5444")),
+		ForwardStagingPort: atoi(get("PG_FORWARD_STAGING_PORT", "5445")),
+		ProxyVerbose:       get("PG_PROXY_DEBUG", "1") != "0",
+		ProxyHostname:      get("PG_PROXY_HOSTNAME", "host.docker.internal"),
+		ForwardBind:        get("PG_FORWARD_BIND", "127.0.0.1"),
+		ForwardVerbose:     get("PG_FORWARD_DEBUG", "") == "1",
+		BackendPrefix:      get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
+		ProxyName:          get("PG_PROXY_NAME", DefaultProxyName),
+		BackendAIP:         get("PG_BACKEND_A_IP", ""),
+		BackendBIP:         get("PG_BACKEND_B_IP", ""),
+		DataRoot:           get("PG_DATA_ROOT", DefaultDataRoot),
+		DataDiskSize:       get("PG_DATA_DISK_SIZE", "140G"),
+		DataImage:          get("PG_DATA_IMAGE", DefaultDataRoot+".xfs"),
+		BaseImage:          get("PG_BASE_IMAGE", "images:ubuntu/24.04/cloud"),
+		GoldenImage:        get("PG_GOLDEN_IMAGE", "pg-dev-base"),
+		AgentPort:          atoi(get("PG_AGENT_PORT", "5440")),
+		AgentToken:         get("PG_AGENT_TOKEN", ""),
+		MachineIP:          get("PG_MACHINE_IP", ""),
+		RepoRoot:           repo,
+		HostUID:            get("HOST_UID", ""),
+		HostGID:            get("HOST_GID", ""),
 	}
 	c.AgentTokenPath = get("PG_AGENT_TOKEN_PATH", filepath.Join(repo, "var", "agent-token"))
 	return c
@@ -234,6 +249,35 @@ func (c Config) ForwardStatePath() string {
 // ForwardLogPath is the LaunchAgent's combined stdout/stderr log.
 func (c Config) ForwardLogPath() string {
 	return filepath.Join(c.RepoRoot, "var", c.MachinePrefix+"-forward.log")
+}
+
+// ----- SQLite tracking + socat proxy (doc/issues/0004) ---------------------
+
+// TrackDBPath is the SQLite machine-tracking database (internal/track), the
+// host-side source of truth for the active pointer, machine IPs, and the socat
+// proxy's reconciled targets. Host-only: never open it from inside a guest over
+// virtiofs (SQLite over virtiofs corrupts).
+func (c Config) TrackDBPath() string { return filepath.Join(c.RepoRoot, "var", "pgdev.db") }
+
+// ReconcileLockPath is the flock the socat reconciler serializes on, held OUTSIDE
+// any SQLite transaction so a wedged launchctl can't brick the CLI.
+func (c Config) ReconcileLockPath() string {
+	return filepath.Join(c.RepoRoot, "var", "reconcile.flock")
+}
+
+// SocatLogPath is one socat LaunchAgent's log (socat -d -d writes lifecycle here).
+func (c Config) SocatLogPath(role string) string {
+	return filepath.Join(c.RepoRoot, "var", c.MachinePrefix+"-socat-"+role+".log")
+}
+
+// ForwardPort returns the Go forwarder's loopback port for a role
+// ("active"/"staging") — the second pair (5444/5445) it moved to when socat took
+// over the canonical client ports.
+func (c Config) ForwardPort(role string) int {
+	if role == "staging" {
+		return c.ForwardStagingPort
+	}
+	return c.ForwardActivePort
 }
 
 // ClientPort returns the host client port for a role ("active"/"staging").

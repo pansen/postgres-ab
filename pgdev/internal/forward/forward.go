@@ -21,8 +21,8 @@ import (
 // track the drifting IPs and the active pointer without a live `container` exec.
 type Options struct {
 	Bind        string // listen address, default 127.0.0.1
-	ActivePort  int    // host client port for the active role (5442)
-	StagingPort int    // host client port for the staging role (5443)
+	ActivePort  int    // host port for the active role (5444; socat holds the canonical 5442)
+	StagingPort int    // host port for the staging role (5445; socat holds the canonical 5443)
 	BackendPort int    // port each machine serves its backend on (5432)
 
 	ActiveMachinePath string                   // var/active-machine

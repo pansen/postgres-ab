@@ -245,8 +245,10 @@ status: machine.exists pgdevd
 # ----- stable macOS client endpoints --------------------------------------
 # Each Apple machine's IP drifts and cannot be pinned, so a host-side in-process
 # Go forwarder (internal/forward, run by a per-user LaunchAgent) publishes
-# permanent 127.0.0.1:5442 (active) / :5443 (staging) endpoints and relays each
-# to whichever machine currently holds that role (on its own eth0:5432). It owns
+# permanent 127.0.0.1:5444 (active) / :5445 (staging) endpoints and relays each
+# to whichever machine currently holds that role (on its own eth0:5432). Since
+# spec 0004 it MOVED off the canonical 5442/5443 (now served by the socat proxy,
+# see proxy.* below) onto this second pair, and runs alongside it. It owns
 # the listeners for their whole lifetime and re-points itself from the pointer
 # file — `pgdev promote` is just a pointer write. `start` (via `pgdev refresh`)
 # validates the LaunchAgent every run and self-heals a missing, unloaded, stale
@@ -274,6 +276,42 @@ endpoint.uninstall:
 .PHONY: endpoint.status
 endpoint.status:
 	@$(PGDEV) forward status
+
+# ----- socat client proxy on the CANONICAL ports (doc/issues/0004) --------
+# A socat-based client proxy on 127.0.0.1:5442 (active) / :5443 (staging) — the
+# CANONICAL client ports, so existing external configs pick it up with no
+# change. It runs ALONGSIDE the Go forwarder (now moved to 5444/5445) during an
+# integration phase. Homebrew's socat does not trip macOS Local Network Privacy
+# the way the Go forwarder's own binary does (no codesign ceremony, no recurring
+# prompts), so this routes clients through it. All machine tracking (active
+# pointer, machine IPs, reconciled targets) lives in var/pgdev.db (SQLite) — each
+# reconcile is a flock-guarded, DB-driven rewrite+reload of the socat
+# LaunchAgents with an explicit port-free gate + post-verify. Opt-in: nothing
+# here runs, and promote/refresh stay hands-off, until `proxy.install`.
+#
+# `proxy.install` is the ONE reference command for "install anything proxy": it
+# brings up BOTH the socat proxy (canonical 5442/5443) and the Go forwarder
+# (5444/5445), so `endpoint.install` above is no longer a separate step to
+# remember (it still works for forwarder-only).
+
+# All four depend on `pgdevd` (the build target) so `make` rebuilds bin/pgdev
+# before invoking it — without this a stale CLI predating the `proxy` command
+# fails with `unknown command "proxy"`.
+.PHONY: proxy.install
+proxy.install: pgdevd machine.exists
+	@$(PGDEV) proxy install
+
+.PHONY: proxy.reconcile
+proxy.reconcile: pgdevd
+	@$(PGDEV) proxy reconcile
+
+.PHONY: proxy.status
+proxy.status: pgdevd
+	@$(PGDEV) proxy status
+
+.PHONY: proxy.uninstall
+proxy.uninstall: pgdevd
+	@$(PGDEV) proxy uninstall
 
 .PHONY: stop
 stop:
@@ -383,9 +421,24 @@ pg.staging.start: machine.exists pgdevd
 # fresh backend on it. The active machine — and its data — is never touched.
 # Unlike the soft resets above this is slow (machine boot + provision) but
 # actually returns space to macOS; see 'make disk'/§1 of issues/0002.
+#
+# Deliberately NO disk.check: this IS the reclaim command (it deletes the machine
+# first, freeing the whole sparse image, then provisions a fresh EMPTY backend —
+# no restore, so no headroom needed). Gating it on free space is self-defeating —
+# you run it precisely when you're low, and it is what disk.check itself points
+# you to. Do not re-add disk.check here.
 .PHONY: pg.staging.rebuild
-pg.staging.rebuild: disk.check machine.exists pgdevd
+pg.staging.rebuild: machine.exists pgdevd
 	$(PGDEV) staging rebuild $(if $(force),--force,)
+
+# Reclaim WITHOUT rebuild: delete the staging machine (freeing its whole sparse
+# macOS disk) and LEAVE IT DOWN — no recreate/provision. Use this to reclaim
+# space (or just shut staging down) when you don't want a fresh backend yet;
+# bring it back later with pg.staging.rebuild or start. Like rebuild, deliberately
+# NO disk.check (it frees space). The active machine is never touched.
+.PHONY: pg.staging.purge
+pg.staging.purge: machine.exists pgdevd
+	$(PGDEV) staging purge $(if $(force),--force,)
 
 # ----- destructive outer-machine lifecycle -------------------------------
 

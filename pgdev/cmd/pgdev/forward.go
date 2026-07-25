@@ -37,8 +37,8 @@ func (a *app) forwardCmd() *cobra.Command {
 func (a *app) forwardOptions() forward.Options {
 	return forward.Options{
 		Bind:              a.cfg.ForwardBind,
-		ActivePort:        a.cfg.ClientActivePort,
-		StagingPort:       a.cfg.ClientStagingPort,
+		ActivePort:        a.cfg.ForwardActivePort,
+		StagingPort:       a.cfg.ForwardStagingPort,
 		BackendPort:       a.cfg.BackendPort,
 		ActiveMachinePath: a.cfg.ActiveMachinePath(),
 		MachineIPPath:     a.cfg.MachineIPPath,
@@ -59,7 +59,7 @@ func (a *app) launchd() (*forward.Launchd, error) {
 	// Migration: on install, kill any orphaned socat still holding the client
 	// ports (done inside Install, AFTER bootout, so the retired KeepAlive agent
 	// can't respawn them). See Launchd.Install.
-	ld.ReapPorts = []int{a.cfg.ClientActivePort, a.cfg.ClientStagingPort}
+	ld.ReapPorts = []int{a.cfg.ForwardActivePort, a.cfg.ForwardStagingPort}
 	return ld, nil
 }
 
@@ -94,8 +94,8 @@ func (a *app) forwardInstallCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("==> Forwarder '%s' installed and started.\n", ld.Label)
-			fmt.Printf("    active  127.0.0.1:%d  staging  127.0.0.1:%d  (re-points itself on promote)\n",
-				a.cfg.ClientActivePort, a.cfg.ClientStagingPort)
+			fmt.Printf("    active  127.0.0.1:%d  staging  127.0.0.1:%d  (re-points itself on promote; socat now serves the canonical %d/%d)\n",
+				a.cfg.ForwardActivePort, a.cfg.ForwardStagingPort, a.cfg.ClientActivePort, a.cfg.ClientStagingPort)
 			return nil
 		},
 	}
