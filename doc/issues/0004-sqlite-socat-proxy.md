@@ -85,9 +85,12 @@ plist. The reload is the hardened sequence (this is the anti-orphan core):
 
 1. `launchctl bootout`, **poll until launchd reports it gone** (children exit).
 2. **Port-free gate**: attempt `net.Listen` on the port; poll. If still held,
-   `lsof` the LISTEN pid and kill it (an ERROR — launchd leaked), re-probe.
-   A port that never frees is a **hard failure** — refuse to bootstrap onto a
-   held port (which is exactly how the stale mapping used to persist).
+   `lsof` the LISTEN pid and kill it **only if it is one of our own socat
+   children** (argv[0] is `socat` and it listens on exactly this port — an
+   ERROR, launchd leaked); a foreign holder is reported and the reconcile fails
+   rather than killing an unrelated process. A port that never frees is a **hard
+   failure** — refuse to bootstrap onto a held port (which is exactly how the
+   stale mapping used to persist).
 3. Write plist (atomic), `launchctl bootstrap` (retry transient EIO).
 4. **Post-verify**: poll until the port is LISTENing AND the live socat's argv
    contains the intended target (`lsof` → pid → `ps`). Because socat's parent
