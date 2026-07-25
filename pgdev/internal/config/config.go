@@ -67,6 +67,14 @@ type Config struct {
 	// default: this is an experiment we want to be chatty about (PG_PROXY_DEBUG=0
 	// quiets it to info).
 	ProxyVerbose bool
+	// LogColor selects ANSI coloring for the structured (slog) output
+	// (PG_LOG_COLOR): "auto" (default — color only on a terminal, honoring
+	// NO_COLOR/TERM), "always" to force it through a pipe, "never" to disable.
+	LogColor string
+	// LogFormat selects the structured sink (PG_LOG_FORMAT): "text" (default —
+	// colored, human-first) or "json" (stdlib slog.JSONHandler) for a captured
+	// run that gets machine-parsed instead of read.
+	LogFormat string
 	// ProxyHostname is the host printed in psql/.pgpass lines (PG_PROXY_HOSTNAME).
 	// Defaults to host.docker.internal so the endpoint is reachable both from the
 	// Mac and from sibling containers/k3d; 127.0.0.1 also works host-only.
@@ -142,6 +150,8 @@ func Load() Config {
 		ClientStagingPort: atoi(get("PG_CLIENT_STAGING_PORT", "5443")),
 		ProxyVerbose:      get("PG_PROXY_DEBUG", "1") != "0",
 		ProxyHostname:     get("PG_PROXY_HOSTNAME", "host.docker.internal"),
+		LogColor:          get("PG_LOG_COLOR", "auto"),
+		LogFormat:         get("PG_LOG_FORMAT", "text"),
 		ClientBind:        get("PG_CLIENT_BIND", "127.0.0.1"),
 		BackendPrefix:     get("PG_BACKEND_PREFIX", DefaultBackendPrefix),
 		ProxyName:         get("PG_PROXY_NAME", DefaultProxyName),

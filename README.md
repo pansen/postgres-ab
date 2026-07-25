@@ -384,7 +384,12 @@ See `.env.example`. The main settings are:
 - `PG_CLIENT_ACTIVE_PORT`, `PG_CLIENT_STAGING_PORT` — host loopback ports the
   client proxy listens on (`5442`/`5443`);
 - `PG_PROXY_HOSTNAME` — hostname printed in psql/.pgpass lines (default
-  `host.docker.internal`; `127.0.0.1` for host-only).
+  `host.docker.internal`; `127.0.0.1` for host-only);
+- `PG_PROXY_DEBUG` — debug-level structured logging for the tracking DB and the
+  proxy reconcile (on by default); `PG_LOG_COLOR` (`auto`/`always`/`never`) for
+  its coloring — `auto` colors only a terminal and honors `NO_COLOR`, so
+  redirected runs stay clean and fully dated — and `PG_LOG_FORMAT`
+  (`text`/`json`) to swap the colored rendering for machine-readable JSON.
 
 ## Why a Makefile if there is a script?
 
