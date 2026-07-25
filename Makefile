@@ -249,57 +249,23 @@ status/incus:
 status: pgdevd
 	@$(PGDEV) status
 
-# ----- stable macOS client endpoints --------------------------------------
-# Each Apple machine's IP drifts and cannot be pinned, so a host-side in-process
-# Go forwarder (internal/forward, run by a per-user LaunchAgent) publishes
-# permanent 127.0.0.1:5444 (active) / :5445 (staging) endpoints and relays each
-# to whichever machine currently holds that role (on its own eth0:5432). Since
-# spec 0004 it MOVED off the canonical 5442/5443 (now served by the socat proxy,
-# see proxy.* below) onto this second pair, and runs alongside it. It owns
-# the listeners for their whole lifetime and re-points itself from the pointer
-# file — `pgdev promote` is just a pointer write. `start` (via `pgdev refresh`)
-# validates the LaunchAgent every run and self-heals a missing, unloaded, stale
-# (e.g. a plist left pointing at a deleted binary after the repo moved), or
-# crashed agent (PG_ENDPOINT_AUTOINSTALL=0 opts out).
-
-.PHONY: endpoint.install
-endpoint.install: machine.exists
-	@$(PGDEV) forward install
-
-# Restart the running forwarder so a macOS Local Network permission granted
-# AFTER it started actually takes effect. TCC caches its allow/deny decision at
-# process start, so ticking the Local Network box (System Settings → Privacy &
-# Security → Local Network) does nothing for an already-running agent — it keeps
-# failing to reach the VM subnet with EHOSTUNREACH ("server closed the
-# connection unexpectedly") until it is restarted. Run this once after granting.
-.PHONY: endpoint.restart
-endpoint.restart:
-	@$(PGDEV) forward restart
-
-.PHONY: endpoint.uninstall
-endpoint.uninstall:
-	@$(PGDEV) forward uninstall
-
-.PHONY: endpoint.status
-endpoint.status:
-	@$(PGDEV) forward status
-
-# ----- socat client proxy on the CANONICAL ports (doc/issues/0004) --------
-# A socat-based client proxy on 127.0.0.1:5442 (active) / :5443 (staging) — the
-# CANONICAL client ports, so existing external configs pick it up with no
-# change. It runs ALONGSIDE the Go forwarder (now moved to 5444/5445) during an
-# integration phase. Homebrew's socat does not trip macOS Local Network Privacy
-# the way the Go forwarder's own binary does (no codesign ceremony, no recurring
-# prompts), so this routes clients through it. All machine tracking (active
-# pointer, machine IPs, reconciled targets) lives in var/pgdev.db (SQLite) — each
-# reconcile is a flock-guarded, DB-driven rewrite+reload of the socat
-# LaunchAgents with an explicit port-free gate + post-verify. Opt-in: nothing
-# here runs, and promote/refresh stay hands-off, until `proxy.install`.
+# ----- stable macOS client endpoints (doc/issues/0004) ---------------------
+# Each Apple machine's IP drifts and cannot be pinned, so clients never talk to
+# a machine IP: a socat-based client proxy under per-user LaunchAgents publishes
+# permanent 127.0.0.1:5442 (active) / :5443 (staging) endpoints and relays each
+# to whichever machine currently holds that role (on its own eth0:5432).
+# macOS Local Network Privacy still has to be granted ONCE (System Settings →
+# Privacy & Security → Local Network, entry `socat`; restart the agents after
+# granting — proxy.uninstall + proxy.install — since the decision is cached at
+# process start). But only once: the grant is keyed to the signing identity, and
+# socat is one stable Homebrew binary we never rebuild. The removed Go forwarder
+# was re-signed on nearly every `make`, so it re-prompted per build.
 #
-# `proxy.install` is the ONE reference command for "install anything proxy": it
-# brings up BOTH the socat proxy (canonical 5442/5443) and the Go forwarder
-# (5444/5445), so `endpoint.install` above is no longer a separate step to
-# remember (it still works for forwarder-only).
+# All machine tracking (active pointer, machine IPs,
+# reconciled targets) lives in var/pgdev.db (SQLite) — each reconcile is a
+# flock-guarded, DB-driven rewrite+reload of the socat LaunchAgents with an
+# explicit port-free gate + post-verify. Install is explicit: nothing here runs,
+# and promote/refresh stay hands-off, until `proxy.install`.
 
 # All four depend on `pgdevd` (the build target) so `make` rebuilds bin/pgdev
 # before invoking it — without this a stale CLI predating the `proxy` command

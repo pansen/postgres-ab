@@ -1,25 +1,22 @@
 // Package track is the host-side (macOS) source of truth for the small set of
-// "machine tracking" facts the client forwarders route on: which machine is
-// active, each machine's drifting eth0 IP, and the reconciled upstream targets
-// the socat proxy points at. It replaces the loose flat files
-// (var/active-machine, var/machine-ip-{a,b}) and JSON (var/forward-state.json)
-// with a single SQLite database (var/pgdev.db) so a reconcile is one atomic,
-// transactional decision instead of a scatter of racing os.WriteFile calls.
+// "machine tracking" facts the client proxy routes on: which machine is active,
+// each machine's drifting eth0 IP, and the reconciled upstream targets the socat
+// proxy points at. It replaces the loose flat files (var/active-machine,
+// var/machine-ip-{a,b}) with a single SQLite database (var/pgdev.db) so a
+// reconcile is one atomic, transactional decision instead of a scatter of racing
+// os.WriteFile calls.
 //
-// Why SQLite and not files: the new socat proxy (internal/socatproxy) cannot
-// re-point itself the way the resident Go forwarder does — every promote/IP
-// drift must rewrite+reload a launchd job — so two concurrent `pgdev` commands
-// reconciling at once is a real race with a real hazard (a stale mapping →
-// pg_restore hitting the wrong DB). A transaction gives that reconcile exactly
-// one clear outcome.
+// Why SQLite and not files: the socat proxy (internal/socatproxy) cannot
+// re-point itself — every promote/IP drift must rewrite+reload a launchd job —
+// so two concurrent `pgdev` commands reconciling at once is a real race with a
+// real hazard (a stale mapping → pg_restore hitting the wrong DB). A transaction
+// gives that reconcile exactly one clear outcome.
 //
-// Integration phase (see doc/issues/0004): the resident Go forwarder
-// (internal/forward) is still running and still POLLS the flat files, and we
-// deliberately do NOT rebuild it (that would re-trigger the macOS
-// codesign/Local-Network-Privacy ceremony this whole change exists to sidestep).
-// So every state write here is a CHOKEPOINT that writes the DB first and then
-// mirrors the legacy flat file, keeping the untouched forwarder correct. The
-// mirror files die with the Go forwarder; the DB is the end state.
+// Flat-file mirrors (see doc/issues/0004 §5.2): every state write here is a
+// CHOKEPOINT that writes the DB first and then mirrors the flat file. The
+// mirrors outlived the Go forwarder they were introduced for because `pgdev`
+// itself (internal/activeslot, machineIP) and the Makefile's ACTIVE_SLOT still
+// READ them; moving those readers onto the DB is what retires the files.
 package track
 
 import (
@@ -68,13 +65,13 @@ CREATE TABLE IF NOT EXISTS proxy_target (
 );
 `
 
-// Options configures Open. The mirror paths keep the still-running Go forwarder
-// (which reads flat files, not the DB) correct during the integration phase;
-// leave them empty to disable mirroring (post-forwarder end state, or tests).
+// Options configures Open. The mirror paths keep the flat files the CLI and the
+// Makefile still read in step with the DB; leave them empty to disable mirroring
+// (the DB-only end state, or tests).
 type Options struct {
 	Path         string                   // var/pgdev.db
 	Logger       *slog.Logger             // structured sink; nil = slog.Default()
-	ActiveMirror string                   // var/active-machine legacy file ("" disables)
+	ActiveMirror string                   // var/active-machine flat file ("" disables)
 	IPMirror     func(slot string) string // slot -> var/machine-ip-<slot> ("" disables)
 	MirrorUID    string                   // decimal HOST_UID to chown mirrors back to ("" = skip)
 	MirrorGID    string                   // decimal HOST_GID
@@ -195,8 +192,8 @@ func (d *DB) migrate(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("track: commit migrate: %w", err)
 	}
 
-	// Keep the legacy mirror consistent with the carried value so the resident
-	// forwarder agrees with the freshly-reset DB.
+	// Keep the mirror consistent with the carried value so the flat-file readers
+	// agree with the freshly-reset DB.
 	d.mirrorActive(carried)
 	reset := have != 0
 	return reset, nil

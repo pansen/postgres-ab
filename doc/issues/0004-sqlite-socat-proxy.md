@@ -1,13 +1,12 @@
 # Spec 0004 — SQLite machine tracking + socat client proxy (retire the Go forwarder)
 
-Status: **in progress** (2026-07-24) · Owner: andi · Relates to:
-`0002-two-machine-disk-reclaim.md` (two-machine model),
-`0003-internal-forward.md` (the Go forwarder this proposes to retire). Memory:
-`forwarder-local-network-privacy`, `pgdevd-token-home-mount-cold-cache`,
-`apple-apiserver-wedged-recovery`.
+Status: **done** (2026-07-25) · Owner: andi · Relates to:
+`0002-two-machine-disk-reclaim.md` (two-machine model) and spec 0003, the Go
+forwarder this retired (its file was deleted with the code; see git history).
+Memory: `pgdevd-token-home-mount-cold-cache`, `apple-apiserver-wedged-recovery`.
 
-This is a **living document**: it records the design as it is built and tracks
-the eventual removal of the Go forwarder. Keep it current as the trial proceeds.
+This is a **living document**: it records the design as it was built and what
+remains. The Go forwarder and its codesign ceremony are now **removed** (§5).
 
 ---
 
@@ -17,9 +16,10 @@ Spec 0003 replaced the shell `socat` relay with an in-process Go forwarder
 (`internal/forward`, on 127.0.0.1:5442/:5443) to kill socat's process-lifecycle
 bugs. It works — but its **own binary** trips macOS Local Network Privacy: it
 needs a stable codesign identity plus a manual Local Network grant, and STILL
-throws occasional permission prompts (`make build` strips the identifier; see
-memory `forwarder-local-network-privacy`). Homebrew's `socat` — an already-known,
-already-trusted binary — does **not** hit this.
+throws permission prompts on rebuilds (`make` re-signs the running agent's
+executable). Homebrew's `socat` needs the Local Network grant too — TCC gates the
+subnet, not the program — but it is ONE stable, already-signed binary at a fixed
+path that we never rebuild, so the grant is asked **once** and then sticks.
 
 So we re-introduce a socat path **as an experiment**, but tame the lifecycle
 races that got it retired, using:
@@ -31,10 +31,10 @@ races that got it retired, using:
   actual fix for the orphan-listener → EADDRINUSE → silent-stale-mapping bug
   (SQLite alone does NOT fix that; it only serializes reconcilers).
 
-The socat proxy takes over the **canonical client ports** (5442 active / 5443
-staging), so existing external configs pick it up with no change; the Go
-forwarder is **moved to a second pair** (5444 / 5445) and runs alongside it, so
-the two can be compared before the forwarder is removed.
+The socat proxy took over the **client ports** (5442 active / 5443 staging), so
+existing external configs picked it up with no change. The Go forwarder ran
+alongside on a second pair (5444 / 5445) for one integration phase and is now
+deleted — socat is the only host-side client path.
 
 ## 2. What shipped in this change
 
@@ -58,11 +58,10 @@ legacy `var/active-machine` file → `"a"`, and only the last is loud). `Open`
 never touches launchd; it returns a `reset` bool and the caller reconciles.
 
 **Chokepoint + dual-write.** Every state write goes through `track`, which writes
-the DB first and then **mirrors the legacy flat file** the still-running Go
-forwarder polls. This is deliberate: rebuilding the Go forwarder to read SQLite
-would re-trigger the exact codesign/TCC ceremony we are trying to escape, so we
-keep its binary byte-identical during the trial. The mirrors die with the
-forwarder (§5).
+the DB first and then **mirrors the flat file**. The mirrors were introduced to
+keep the untouched Go forwarder correct; they outlived it because `pgdev` itself
+(`internal/activeslot`, `machineIP`) and the Makefile's `ACTIVE_SLOT` still READ
+those files. Retiring them means moving those readers onto the DB (§5.2).
 
 Structured logging throughout via stdlib **`log/slog`** (text handler → stderr,
 `component=track`). `PG_PROXY_DEBUG=1` (the default) makes it chatty.
@@ -70,7 +69,7 @@ Structured logging throughout via stdlib **`log/slog`** (text handler → stderr
 ### 2.2 `internal/socatproxy` — the socat LaunchAgents
 
 Two per-user LaunchAgents, `me.pansen.<prefix>-socat-active` (:5442) and
-`-socat-staging` (:5443) — the **canonical client ports**. Each runs:
+`-socat-staging` (:5443) — the **client ports**. Each runs:
 
 ```
 socat -d -d \
@@ -118,58 +117,52 @@ proxy is already installed) after `promote` and `refresh`.
 - `pgdev proxy install | reconcile | status | uninstall`
 - `make proxy.install | proxy.reconcile | proxy.status | proxy.uninstall`
 
-`proxy install` is the **single reference command for "install anything proxy"**:
-it brings up BOTH the socat proxy (canonical 5442/5443) and the Go forwarder
-(5444/5445, best-effort, honoring `PG_ENDPOINT_AUTOINSTALL=0`), so there is no
-separate `endpoint.install` to remember.
+`proxy install` is the single command that brings the client path up. Installing
+is also what opts in: `promote`/`refresh` stay hands-off (never touch launchd)
+until a plist exists (`Reconciler.AnyInstalled`).
 
-It also **frees the canonical ports as part of install**: step 1 does a FULL
-(re)install of the Go forwarder (bootout + bootstrap), which boots any pre-swap
-forwarder off 5442/5443 (where a process that started before the swap is still
-bound, and which a gentle `Ensure` would leave alone since its argv is unchanged)
-and brings it back on 5444/5445 — so socat can bind the canonical ports in step
-2. Killing that forwarder's PID would not suffice: it has `KeepAlive`, so launchd
-resurrects it; only booting out the *job* frees the port. (A genuinely foreign
-holder still hard-fails the gate loudly — we do not kill arbitrary processes.)
-
-Opt-in: `promote`/`refresh` stay hands-off (never touch launchd) until
-`proxy install` has created a plist (`Reconciler.AnyInstalled`).
+A port held by a foreign process hard-fails the gate loudly — we do not kill
+arbitrary processes.
 
 ## 3. Deliberate decisions / non-goals
 
 - **`proxy_target` is observability, not authority.** The durable record of what
   socat runs is the plist; decisions compare against it.
-- **`status` does not surface socat** (per the brief — still an experiment).
+- **`status` surfaces socat** — one line per role (launchd state + the DB's
+  last-applied target), which replaced the old forwarder section.
+- **The Local Network grant is a one-time manual step**, not something the CLI
+  tries to automate: TCC cannot be granted programmatically. After granting,
+  the agents must be restarted (`proxy.uninstall` + `proxy.install`) because the
+  decision is cached at process start — a plain `proxy reconcile` is a no-op
+  when the mapping is already healthy, so it will NOT pick the grant up.
 - **Data loss on schema change is accepted** (IPs re-discover; active carried).
 - **Host-only DB.** Never open `var/pgdev.db` from inside a guest over virtiofs
   — SQLite over virtiofs corrupts (cf. the token cold-cache burn in 0002).
 
-## 4. Open questions / to validate during the trial
+## 4. Open questions
 
-- [ ] Does socat under a LaunchAgent avoid the Local Network prompt in practice,
-      or does TCC attribute the connection to the launchd job's binary anyway?
-      **This is the whole hypothesis — validate first.** Because socat now holds
-      the canonical 5442/5443, `make proxy.install` puts it on the client path
-      directly — running any existing client against 5442/5443 exercises it.
-- [ ] Since socat serves the canonical ports, `make endpoint.install` (the Go
-      forwarder, now 5444/5445) and `make proxy.install` (socat, 5442/5443) can
-      both run; make sure they never both try to bind the same port.
 - [ ] Behaviour of an in-flight `pg_restore` when a reload kills the socat
       children mid-transfer (expected: dropped; client reconnects). Acceptable
       for dev; confirm.
 
-## 5. Removal plan for the Go forwarder (the end state)
+## 5. Removal of the Go forwarder
 
-Socat already holds the canonical client ports, so removal is now purely a
-deletion — no client repoint needed:
+1. **Done** — `internal/forward`, `pgdev forward *`, the `endpoint.*` make
+   targets, `PG_FORWARD_*`, and the `codesign` step in `pgdev/Makefile` (plus
+   `etc/keys`, spec 0003 and the Local-Network screenshot) are deleted.
+   `PG_FORWARD_BIND` became `PG_CLIENT_BIND` (it configures socat now).
+2. **Open** — the **flat-file mirrors** in `internal/track` (`ActiveMirror`,
+   `IPMirror`) and the `activeslot` file reads. These are NOT dead: `pgdev`
+   resolves the active slot and machine IPs from `var/active-machine` /
+   `var/machine-ip-{a,b}`, and the Makefile reads `ACTIVE_SLOT` from the same
+   file at parse time. Retiring them means moving both readers onto the DB —
+   including a Makefile that can't shell out to a not-yet-built binary — after
+   which "no plain-text tracking" is fully realized.
+3. **Done** — `pgdev status` shows the socat proxy where the forwarder section
+   used to be.
+4. **Done** — README + `.env.example` updated.
 
-1. Delete `internal/forward` and `pgdev forward *` + the `endpoint.*` make
-   targets that wrap it (and free `PG_FORWARD_ACTIVE_PORT`/`STAGING_PORT`).
-2. Delete the **legacy flat-file mirrors** in `internal/track` (`ActiveMirror`,
-   `IPMirror`) and `activeslot` file reads — the DB becomes the sole store, so
-   "no plain text/JSON tracking anymore" is fully realized (`var/active-machine`,
-   `var/machine-ip-{a,b}`, `var/forward-state.json` all deleted).
-3. Move `pgdev status`'s forwarder section onto the socat proxy.
-4. Update README + `.env.example` (drop `PG_FORWARD_*`, keep `PG_PROXY_*`).
-
-Until then, both paths coexist and the mirrors keep the Go forwarder correct.
+Stale runtime leftovers from the forwarder (`var/forward-state.json`,
+`var/<prefix>-forward.log`) and its LaunchAgent
+(`~/Library/LaunchAgents/me.pansen.<prefix>-forward.plist`) must be booted out
+and deleted once on each machine that ran it.

@@ -167,8 +167,8 @@ func (a *app) deploy(ctx context.Context, slot string) error {
 	}
 	// A (re)created machine gets a fresh DHCP lease, so the cached
 	// var/machine-ip-<slot> can be stale. Refresh it from the live address
-	// before the handshake dials the daemon (this also re-points the endpoint
-	// forwarder at the new IP once refreshForwarder next runs).
+	// before the handshake dials the daemon (the next proxy reconcile then picks
+	// the new IP up from the tracking DB).
 	if ip, err := cli.MachineIP(ctx); err == nil && ip != "" {
 		a.writeMachineIPFile(ctx, slot, ip)
 	}

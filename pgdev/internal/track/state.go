@@ -37,8 +37,8 @@ func (d *DB) StagingSlot(ctx context.Context) string {
 }
 
 // SetActive is the CHOKEPOINT for the active pointer: it writes the DB (source
-// of truth) and then mirrors the legacy var/active-machine file the resident Go
-// forwarder still polls. Rejects anything but a/b.
+// of truth) and then mirrors the var/active-machine flat file the CLI and the
+// Makefile still read. Rejects anything but a/b.
 func (d *DB) SetActive(ctx context.Context, slot string) error {
 	if slot != "a" && slot != "b" {
 		return fmt.Errorf("track: active slot must be a or b (got %q)", slot)
@@ -59,7 +59,7 @@ func (d *DB) SetActive(ctx context.Context, slot string) error {
 // install/reconcile right after a fresh init, a schema reset, or (for an
 // already-created empty DB) any open has targets immediately, without waiting
 // for the next `refresh` to re-discover IPs. IPs are a cache; the mirror files
-// are the last-known-good the Go forwarder already routes on. A no-op once any
+// hold the last-known-good the CLI already routes on. A no-op once any
 // IP exists (refresh then overwrites with live values). Best-effort: a failure
 // here never blocks Open.
 func (d *DB) seedMachineIPsIfEmpty(ctx context.Context) {
@@ -126,9 +126,9 @@ func (d *DB) SetMachineIP(ctx context.Context, slot, ip string) error {
 	return nil
 }
 
-// ForgetMachine clears a slot's tracked IP — the DB row AND the legacy mirror
-// file — used when the machine is deleted (staging purge) so neither forwarder
-// keeps routing at its now-dead address. The DB delete is authoritative; the
+// ForgetMachine clears a slot's tracked IP — the DB row AND the mirror file —
+// used when the machine is deleted (staging purge) so nothing keeps routing at
+// its now-dead address. The DB delete is authoritative; the
 // mirror removal is best-effort. After this, DesiredTargets yields an empty
 // target for the slot, so a reconcile tears the socat listener down (endpoint
 // honestly "down" rather than dialing a corpse).
@@ -153,7 +153,7 @@ func (d *DB) ForgetMachine(ctx context.Context, slot string) error {
 // and the "ip:port" it forwards to ("" = unroutable, machine down).
 type Target struct {
 	Role   string // "active" | "staging"
-	Port   int    // host client port (5444 / 5445)
+	Port   int    // host client port (5442 / 5443)
 	Target string // "ip:port" or ""
 }
 
@@ -248,13 +248,13 @@ func (d *DB) AppliedTargets(ctx context.Context) (map[string]Target, error) {
 	return out, rows.Err()
 }
 
-// ----- legacy flat-file mirrors ----------------------------------------------
+// ----- flat-file mirrors -----------------------------------------------------
 //
-// These keep the still-running Go forwarder (which reads files, not the DB)
-// consistent with the authoritative DB during the integration phase. They are
-// best-effort: a mirror failure is logged but never fails the DB write, because
-// the DB is the source of truth and the mirror is a courtesy to a component we
-// are removing. All of this deletes with the Go forwarder (doc/issues/0004).
+// These keep the flat files that `pgdev` (internal/activeslot, machineIP) and
+// the Makefile's ACTIVE_SLOT still READ consistent with the authoritative DB.
+// They are best-effort: a mirror failure is logged but never fails the DB write,
+// because the DB is the source of truth. Moving those readers onto the DB is
+// what finally deletes the files (doc/issues/0004 §5.2).
 
 func (d *DB) mirrorActive(slot string) {
 	if d.opts.ActiveMirror == "" {
@@ -303,9 +303,9 @@ func (d *DB) writeMirror(path, content string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	// CreateTemp makes 0600; the forwarder polls these from the user session, so
-	// a root-run pgdev must leave them world-readable or the forwarder can no
-	// longer read the pointer/IP and silently keeps routing on stale values.
+	// CreateTemp makes 0600; these are read from the user session, so a root-run
+	// pgdev must leave them world-readable or the next command can no longer read
+	// the pointer/IP and silently keeps routing on stale values.
 	if err := os.Chmod(name, 0o644); err != nil {
 		return err
 	}

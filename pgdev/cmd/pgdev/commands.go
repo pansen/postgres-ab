@@ -45,7 +45,7 @@ func (a *app) upCmd() *cobra.Command {
 					return err
 				}
 			}
-			a.ensureForwarder(ctx)
+			a.reconcileProxyIfInstalled(ctx, "up")
 			fmt.Println("==> pg-dev ready.")
 			fmt.Println()
 			a.renderStatus(ctx)
@@ -158,7 +158,7 @@ func (a *app) renderStatus(ctx context.Context) {
 	}
 	tw.Flush()
 	fmt.Println()
-	a.renderForwarder(ctx)
+	a.renderProxy(ctx)
 	fmt.Println()
 	a.renderSnapshots(statuses, true)
 }
@@ -230,10 +230,8 @@ func (a *app) endpointCmd() *cobra.Command {
 			fmt.Println("psql commands:")
 			fmt.Printf("  active:  %s\n", a.psqlCmd(a.cfg.ClientActivePort))
 			fmt.Printf("  staging: %s\n", a.psqlCmd(a.cfg.ClientStagingPort))
-			if h == "127.0.0.1" {
-				fmt.Printf("\nnote: 127.0.0.1 needs the host forwarder ('make endpoint.install'); it\n")
-				fmt.Printf("      relays to each machine's IP, which may drift on reboot ('pgdev refresh' re-points it).\n")
-			}
+			fmt.Printf("\nnote: these ports are served by the socat client proxy ('make proxy.install'); it\n")
+			fmt.Printf("      relays to each machine's IP, which may drift on reboot ('pgdev refresh' re-points it).\n")
 			return nil
 		},
 	}
@@ -266,7 +264,7 @@ func (a *app) ipCmd() *cobra.Command {
 func (a *app) promoteCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "promote",
-		Short: "Flip active↔staging (re-point the host forwarder, no data moves)",
+		Short: "Flip active↔staging (re-point the client proxy, no data moves)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -297,24 +295,16 @@ func (a *app) promoteCmd() *cobra.Command {
 				}
 			}
 
-			// Promote collapses to a pointer write: the resident forwarder
-			// re-points itself within its poll interval and drops the sessions
-			// that were on the demoted machine (spec 0003 §3). No launchd
-			// round-trip, so nothing to fail-and-roll-back here.
+			// Promote is a pointer write plus a proxy reconcile: no data moves and
+			// no daemon call.
 			if err := a.setActive(ctx, to); err != nil {
 				return err
 			}
-			// socat now serves the CANONICAL client ports (5442/5443), so re-point
-			// it synchronously (DB-driven, flock-guarded, verified) if installed —
-			// this is the client-facing path now. The Go forwarder re-points itself
-			// from the mirrored pointer file on its own ports (5444/5445).
+			// socat serves the client ports (5442/5443) and cannot re-point itself,
+			// so re-point it synchronously (DB-driven, flock-guarded, verified) if
+			// installed. Sessions on the demoted machine are dropped; clients
+			// reconnect onto the new active.
 			a.reconcileProxyIfInstalled(ctx, "promote")
-			if !a.awaitForwarderRepoint(ctx, to) {
-				fmt.Fprintf(os.Stderr,
-					"WARNING: the Go forwarder did not confirm re-pointing to %s. The active pointer IS set; verify with\n"+
-						"         'pgdev forward status' before using :%d — is the forwarder running ('pgdev forward install')?\n",
-					a.cfg.MachineNameForSlot(to), a.cfg.ForwardActivePort)
-			}
 
 			fmt.Printf("Promoted. active=%s staging=%s\n\n",
 				a.cfg.MachineNameForSlot(to), a.cfg.MachineNameForSlot(from))
@@ -327,7 +317,7 @@ func (a *app) promoteCmd() *cobra.Command {
 func (a *app) refreshCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "refresh",
-		Short: "Re-discover both machine IPs and re-point the host forwarder",
+		Short: "Re-discover both machine IPs and re-point the client proxy",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
@@ -354,13 +344,10 @@ func (a *app) refreshCmd() *cobra.Command {
 					fmt.Printf("    %s\n", act)
 				}
 			}
-			// The forwarder re-reads the IP files we just rewrote on its next
-			// poll; refresh only needs to make sure the agent is installed.
-			a.ensureForwarder(ctx)
-			// Re-point the socat experiment at the freshly-discovered IPs too
-			// (only if it's installed; socat can't re-point itself).
+			// Re-point the socat proxy at the freshly-discovered IPs (only if it's
+			// installed; socat can't re-point itself).
 			a.reconcileProxyIfInstalled(ctx, "refresh")
-			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s (forwarder tracks the IP files)\n",
+			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s\n",
 				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
 				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
 			return nil
@@ -595,8 +582,7 @@ func (a *app) stagingPurgeCmd() *cobra.Command {
 			}
 
 			// Forget staging's now-invalid IP and drop its socat listener, so
-			// :5443 reads "down" rather than dialing the deleted machine. The Go
-			// forwarder likewise sees the mirror gone and marks staging unroutable.
+			// :5443 reads "down" rather than dialing the deleted machine.
 			if db, err := a.track(ctx); err == nil {
 				if err := db.ForgetMachine(ctx, slot); err != nil {
 					a.log.Warn("forgetting staging machine failed", "slot", slot, "err", err)
@@ -662,7 +648,8 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 				return err
 			}
 
-			a.ensureForwarder(ctx)
+			// The recreated machine has a fresh DHCP lease, so point the proxy at it.
+			a.reconcileProxyIfInstalled(ctx, "staging rebuild")
 
 			fmt.Printf("==> Reclaim done. %s is fresh; %s (active) was never touched.\n", machine, activeMachine)
 			return nil
@@ -758,6 +745,13 @@ func rebuildHint(role string) string {
 func orQ(s string) string {
 	if s == "" {
 		return "?"
+	}
+	return s
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
 	}
 	return s
 }

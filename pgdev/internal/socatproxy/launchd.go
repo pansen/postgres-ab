@@ -1,14 +1,13 @@
-// Package socatproxy is the EXPERIMENTAL socat-based host client proxy that runs
-// ALONGSIDE the resident Go forwarder (internal/forward) during an integration
-// phase (see doc/issues/0004). It exists because the Go forwarder's own binary
-// trips macOS Local Network Privacy — needing a codesign ceremony and still
-// throwing occasional prompts — whereas Homebrew's socat does not. So we trial
-// routing through socat under launchd on a SECOND pair of ports (5444 active /
-// 5445 staging), leaving 5442/5443 untouched.
+// Package socatproxy is the socat-based host client proxy: the only host-side
+// path from the client ports (5442 active / 5443 staging) to whichever machine
+// holds each role (see doc/issues/0004). It replaced an in-process Go forwarder
+// whose own binary tripped macOS Local Network Privacy — needing a codesign
+// ceremony and still throwing occasional prompts — whereas Homebrew's socat, an
+// already-trusted binary, does not.
 //
-// socat cannot re-point itself the way the Go forwarder does: each promote / IP
-// drift must rewrite and reload a launchd job. That reload is exactly the
-// process-lifecycle race that got socat retired in spec 0003 — an orphaned
+// socat cannot re-point itself: each promote / IP drift must rewrite and reload
+// a launchd job. That reload is exactly the process-lifecycle race that got
+// socat retired in spec 0003 — an orphaned
 // listener still holding the port makes the reloaded socat fail to bind, and the
 // stale mapping silently persists (pg_restore → wrong DB). This package tames it
 // NOT with the SQLite transaction (that only serializes reconcilers) but with an
@@ -65,8 +64,8 @@ func (j *job) dialArg() string {
 }
 
 // program is the full socat argv baked into the plist. `-d -d` makes socat log
-// connection lifecycle to stderr (→ the log file) so the proxy is as forensically
-// chatty as the Go forwarder it shadows.
+// connection lifecycle to stderr (→ the log file), so the proxy leaves a
+// forensic trail of every connection.
 func (j *job) program() []string {
 	return []string{j.socat, "-d", "-d", j.listenArg(), j.dialArg()}
 }
@@ -217,7 +216,7 @@ func (j *job) probeFree() bool {
 }
 
 // bootstrap loads the plist, retrying the transient EIO launchd throws for a beat
-// after a bootout (same fragility the Go forwarder's launchd code guards against).
+// after a bootout.
 func (j *job) bootstrap(ctx context.Context) error {
 	var last error
 	for i := 0; i < 4; i++ {
