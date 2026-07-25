@@ -179,3 +179,30 @@ func TestListenArgUsesPort(t *testing.T) {
 		t.Fatalf("listenArg = %q", j.listenArg())
 	}
 }
+
+// gatePortFree may kill ONLY our own leaked socat: a foreign holder of the
+// client port must fail the reconcile loudly instead (spec 0004 §2.4).
+func TestKillableOrphan(t *testing.T) {
+	j := testJob(t, "10.0.0.5:5432")
+	ours := strings.Join(j.program(), " ")
+
+	for _, tc := range []struct {
+		name string
+		cmd  string
+		port int
+		want bool
+	}{
+		{"our own socat job", ours, 5444, true},
+		{"socat from another prefix", "/usr/local/bin/socat -d -d TCP-LISTEN:5444,bind=127.0.0.1,fork TCP:10.0.0.9:5432", 5444, true},
+		{"bare listen token", "socat TCP-LISTEN:5444 TCP:10.0.0.9:5432", 5444, true},
+		{"socat on a different port", ours, 5445, false},
+		{"port is a prefix of the listener's", "socat TCP-LISTEN:5444,bind=127.0.0.1 TCP:10.0.0.9:5432", 544, false},
+		{"foreign service", "/opt/homebrew/opt/postgresql@17/bin/postgres -D /opt/homebrew/var/postgresql@17", 5444, false},
+		{"foreign relay that merely mentions socat", "/usr/bin/my-socat-wrapper TCP-LISTEN:5444", 5444, false},
+		{"unidentifiable", "", 5444, false},
+	} {
+		if got := killableOrphan(tc.cmd, tc.port); got != tc.want {
+			t.Errorf("%s: killableOrphan(%q, %d) = %v, want %v", tc.name, tc.cmd, tc.port, got, tc.want)
+		}
+	}
+}

@@ -111,7 +111,7 @@ func (j *job) loaded(ctx context.Context) bool {
 func (j *job) reload(ctx context.Context) error {
 	j.log.Info("reloading socat job", "label", j.label, "addr", j.addr(), "target", j.backend)
 
-	if err := j.boototAndWait(ctx); err != nil {
+	if err := j.bootoutAndWait(ctx); err != nil {
 		return err
 	}
 	if err := j.gatePortFree(ctx); err != nil {
@@ -132,7 +132,7 @@ func (j *job) reload(ctx context.Context) error {
 // clean connection-refused rather than a hang against a dead backend.
 func (j *job) stop(ctx context.Context) error {
 	j.log.Info("stopping socat job (no routable target)", "label", j.label, "addr", j.addr())
-	if err := j.boototAndWait(ctx); err != nil {
+	if err := j.bootoutAndWait(ctx); err != nil {
 		return err
 	}
 	if err := j.gatePortFree(ctx); err != nil {
@@ -144,14 +144,14 @@ func (j *job) stop(ctx context.Context) error {
 	return nil
 }
 
-// boototAndWait boots the job out and polls until launchd reports it gone, so a
+// bootoutAndWait boots the job out and polls until launchd reports it gone, so a
 // subsequent bootstrap can't race a still-loaded label and so the forked socat
 // children have actually exited before we probe the port. A job that will NOT
 // unload is a HARD error, not a warning: the job has KeepAlive, so killing its
 // port holder in the gate would just have launchd resurrect it — reporting
 // success there would silently pin the old mapping. Better to fail the reconcile
 // loudly and let the operator see it.
-func (j *job) boototAndWait(ctx context.Context) error {
+func (j *job) bootoutAndWait(ctx context.Context) error {
 	_ = j.launchctl(ctx, 10*time.Second, "bootout", j.domainTarget()) // tolerate "not loaded"
 	deadline := time.Now().Add(8 * time.Second)
 	for {
@@ -168,10 +168,15 @@ func (j *job) boototAndWait(ctx context.Context) error {
 }
 
 // gatePortFree is the orphan-listener defense: it confirms bind:port is actually
-// bindable before we lay down a new listener. If launchd leaked a socat child
-// that still holds the port, it kills that child (by port, verified LISTEN) and
-// re-probes — logging an ERROR because a leak means launchd teardown misbehaved.
-// A port that never frees is a hard failure: better to abort the reconcile than
+// bindable before we lay down a new listener. If launchd leaked one of OUR socat
+// children that still holds the port, it kills that child and re-probes —
+// logging an ERROR because a leak means launchd teardown misbehaved.
+//
+// It kills ONLY our own leaked socat (see killableOrphan). A foreign holder —
+// someone else's service on the configured client port — is never killed: that
+// fails the reconcile loudly instead, because silently killing an unrelated
+// process is a far worse outcome than a refused reconcile (spec 0004 §2.4).
+// A port that never frees is likewise a hard failure: better to abort than
 // bootstrap a socat that will crash-loop on EADDRINUSE and silently keep the old
 // mapping (the spec-0003 failure).
 func (j *job) gatePortFree(ctx context.Context) error {
@@ -187,13 +192,28 @@ func (j *job) gatePortFree(ctx context.Context) error {
 			return err
 		}
 	}
-	// Still held — reap the orphan and try once more.
-	if pids := listenerPIDs(ctx, j.port); len(pids) > 0 {
-		j.log.Error("port still held after bootout — reaping orphaned listener(s) (launchd teardown leaked)",
-			"addr", j.addr(), "pids", pids)
-		for _, pid := range pids {
+	// Still held — reap our own orphan (and only ours), then try once more.
+	reaped := false
+	for _, pid := range listenerPIDs(ctx, j.port) {
+		cmd := processArgs(ctx, pid)
+		switch {
+		case cmd == "":
+			// The holder vanished between lsof and ps, or we can't inspect it.
+			// Either way it is not identifiably ours, so leave it alone: if it
+			// really is gone the re-probe below succeeds; otherwise we fail with
+			// the "never freed" error rather than killing something unknown.
+			j.log.Warn("port holder could not be identified — not killing it", "addr", j.addr(), "pid", pid)
+		case !killableOrphan(cmd, j.port):
+			return fmt.Errorf("socatproxy: %s: port %s is held by a foreign process (pid %d: %s) — refusing to kill it; stop that process or point the client port elsewhere",
+				j.label, j.addr(), pid, cmd)
+		default:
+			j.log.Error("port still held after bootout — reaping our orphaned socat (launchd teardown leaked)",
+				"addr", j.addr(), "pid", pid, "cmd", cmd)
 			_ = killPID(pid)
+			reaped = true
 		}
+	}
+	if reaped {
 		if err := sleep(ctx, 300*time.Millisecond); err != nil {
 			return err
 		}
@@ -202,6 +222,29 @@ func (j *job) gatePortFree(ctx context.Context) error {
 		return nil
 	}
 	return fmt.Errorf("socatproxy: %s: port %s never freed — refusing to bootstrap onto a held port", j.label, j.addr())
+}
+
+// killableOrphan reports whether a listener's full argv is one of our own leaked
+// socat children — the ONLY thing gatePortFree is allowed to kill. The test is
+// deliberately narrow: argv[0]'s basename must be socat AND the argv must carry
+// a TCP-LISTEN on exactly this port. Anything else (a local PostgreSQL, another
+// tool, an unrelated socat) is foreign and must be reported, not killed. The
+// binary path is NOT compared, so a socat orphan left by an earlier install from
+// a different prefix is still reapable.
+func killableOrphan(cmd string, port int) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 || filepath.Base(fields[0]) != "socat" {
+		return false
+	}
+	want := "TCP-LISTEN:" + strconv.Itoa(port)
+	for _, f := range fields {
+		// Exact match on the address token's port: "TCP-LISTEN:5442,bind=..."
+		// must not satisfy a job on port 544.
+		if f == want || strings.HasPrefix(f, want+",") {
+			return true
+		}
+	}
+	return false
 }
 
 // probeFree returns true if we can bind bind:port right now (immediately closed).
