@@ -32,8 +32,8 @@ func (a *app) upCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("==> [%s] Provisioning (the first run builds the golden PostgreSQL image; this can take a few minutes)...\n",
-					a.cfg.MachineNameForSlot(slot))
+				a.log.Info("provisioning backend (the first run builds the golden PostgreSQL image; this can take a few minutes)",
+					"machine", a.cfg.MachineNameForSlot(slot))
 				if _, err := cl.Up(ctx); err != nil {
 					return fmt.Errorf("%s: %w", a.cfg.MachineNameForSlot(slot), err)
 				}
@@ -46,7 +46,7 @@ func (a *app) upCmd() *cobra.Command {
 				}
 			}
 			a.reconcileProxyIfInstalled(ctx, "up")
-			fmt.Println("==> pg-dev ready.")
+			a.log.Info("pg-dev ready")
 			fmt.Println()
 			a.renderStatus(ctx)
 			return nil
@@ -65,15 +65,15 @@ func (a *app) downCmd() *cobra.Command {
 				machine := a.cfg.MachineNameForSlot(slot)
 				cl, err := a.longClientFor(ctx, slot)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: %s: %v\n", machine, err)
+					a.log.Warn("skipping machine", "machine", machine, "err", err)
 					continue
 				}
 				res, err := cl.Down(ctx)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: %s: %v\n", machine, err)
+					a.log.Warn("down failed", "machine", machine, "err", err)
 					continue
 				}
-				fmt.Printf("[%s] %s\n", machine, res.Message)
+				a.log.Info(res.Message, "machine", machine)
 			}
 			return nil
 		},
@@ -306,8 +306,9 @@ func (a *app) promoteCmd() *cobra.Command {
 			// reconnect onto the new active.
 			a.reconcileProxyIfInstalled(ctx, "promote")
 
-			fmt.Printf("Promoted. active=%s staging=%s\n\n",
-				a.cfg.MachineNameForSlot(to), a.cfg.MachineNameForSlot(from))
+			a.log.Info("promoted",
+				"active", a.cfg.MachineNameForSlot(to), "staging", a.cfg.MachineNameForSlot(from))
+			fmt.Println()
 			a.renderStatus(ctx)
 			return nil
 		},
@@ -326,30 +327,30 @@ func (a *app) refreshCmd() *cobra.Command {
 				ip := a.machineIP(ctx, slot)
 				a.writeMachineIPFile(ctx, slot, ip)
 				if ip == "" {
-					fmt.Printf("[%s] no IP (machine down?) — skipping reconcile\n", machine)
+					a.log.Warn("no IP (machine down?) — skipping reconcile", "machine", machine)
 					continue
 				}
 				cl, err := a.clientFor(ctx, slot)
 				if err != nil {
-					fmt.Printf("[%s] %v\n", machine, err)
+					a.log.Warn("machine unreachable", "machine", machine, "err", err)
 					continue
 				}
 				res, err := cl.Reconcile(ctx)
 				if err != nil {
-					fmt.Printf("[%s] reconcile: %v\n", machine, err)
+					a.log.Error("backend reconcile failed", "machine", machine, "err", err)
 					continue
 				}
-				fmt.Printf("[%s] backend running=%v\n", machine, res.BackendRunning)
+				a.log.Info("backend reconciled", "machine", machine, "running", res.BackendRunning)
 				for _, act := range res.Actions {
-					fmt.Printf("    %s\n", act)
+					a.log.Info("backend action", "machine", machine, "action", act)
 				}
 			}
 			// Re-point the socat proxy at the freshly-discovered IPs (only if it's
 			// installed; socat can't re-point itself).
 			a.reconcileProxyIfInstalled(ctx, "refresh")
-			fmt.Printf("Endpoints: active %s:%d → %s, staging %s:%d → %s\n",
-				a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get()),
-				a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging()))
+			a.log.Info("endpoints re-pointed",
+				"active", fmt.Sprintf("%s:%d → %s", a.cfg.ProxyHostname, a.cfg.ClientActivePort, a.cfg.MachineNameForSlot(a.active.Get())),
+				"staging", fmt.Sprintf("%s:%d → %s", a.cfg.ProxyHostname, a.cfg.ClientStagingPort, a.cfg.MachineNameForSlot(a.active.Staging())))
 			return nil
 		},
 	}
@@ -373,7 +374,7 @@ func (a *app) snapshotCmd(role string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot(role)), "snapshot", args[0])
 			return nil
 		},
 	}
@@ -428,7 +429,7 @@ func (a *app) runRestore(ctx context.Context, role, name string, last, force boo
 			return fmt.Errorf("no snapshots on %s", machine)
 		}
 		target = snaps.Snapshots[len(snaps.Snapshots)-1].Name
-		fmt.Printf("==> Restoring %s to most recent snapshot: %s\n", machine, target)
+		a.log.Info("restoring to most recent snapshot", "machine", machine, "snapshot", target)
 	}
 
 	after := snapshotsAfter(snaps.Snapshots, target)
@@ -452,7 +453,7 @@ func (a *app) runRestore(ctx context.Context, role, name string, last, force boo
 	if err != nil {
 		return err
 	}
-	fmt.Println(res.Message)
+	a.log.Info(res.Message, "machine", machine)
 	return nil
 }
 
@@ -501,7 +502,7 @@ func (a *app) stagingStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot("staging")))
 			return nil
 		},
 	}
@@ -522,7 +523,7 @@ func (a *app) stagingStopCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Println(res.Message)
+			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot("staging")))
 			return nil
 		},
 	}
@@ -576,7 +577,7 @@ func (a *app) stagingPurgeCmd() *cobra.Command {
 			}
 
 			cli := a.apple(slot)
-			fmt.Printf("==> [%s] Stopping and deleting (this reclaims its macOS disk)...\n", machine)
+			a.log.Info("stopping and deleting the machine (this reclaims its macOS disk)", "machine", machine)
 			if err := cli.Delete(ctx); err != nil {
 				return err
 			}
@@ -590,7 +591,8 @@ func (a *app) stagingPurgeCmd() *cobra.Command {
 			}
 			a.reconcileProxyIfInstalled(ctx, "staging purge")
 
-			fmt.Printf("==> Purged. %s is deleted and its macOS disk reclaimed; %s (active) was never touched.\n", machine, activeMachine)
+			a.log.Info("purged — the machine is deleted and its macOS disk reclaimed; active was never touched",
+				"purged", machine, "active", activeMachine)
 			return nil
 		},
 	}
@@ -628,18 +630,18 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 			}
 
 			cli := a.apple(staging)
-			fmt.Printf("==> [%s] Deleting and recreating (this reclaims its macOS disk)...\n", machine)
+			a.log.Info("deleting and recreating the machine (this reclaims its macOS disk)", "machine", machine)
 			opts := applecli.CreateOpts{CPUs: a.cfg.MachineCPUs, Memory: a.cfg.MachineMemory, Image: a.cfg.MachineImage}
 			if err := cli.Recreate(ctx, opts, 5*time.Minute); err != nil {
 				return err
 			}
 
-			fmt.Printf("==> [%s] Installing pgdevd...\n", machine)
+			a.log.Info("installing pgdevd", "machine", machine)
 			if err := a.deploy(ctx, staging); err != nil {
 				return err
 			}
 
-			fmt.Printf("==> [%s] Provisioning fresh backend...\n", machine)
+			a.log.Info("provisioning a fresh backend", "machine", machine)
 			cl, err := a.longClientFor(ctx, staging)
 			if err != nil {
 				return err
@@ -651,7 +653,8 @@ func (a *app) stagingRebuildCmd() *cobra.Command {
 			// The recreated machine has a fresh DHCP lease, so point the proxy at it.
 			a.reconcileProxyIfInstalled(ctx, "staging rebuild")
 
-			fmt.Printf("==> Reclaim done. %s is fresh; %s (active) was never touched.\n", machine, activeMachine)
+			a.log.Info("reclaim done — the machine is fresh; active was never touched",
+				"rebuilt", machine, "active", activeMachine)
 			return nil
 		},
 	}

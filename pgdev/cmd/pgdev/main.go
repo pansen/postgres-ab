@@ -68,7 +68,7 @@ func newApp() *app {
 	return &app{
 		cfg:    cfg,
 		active: activeslot.Pointer{Path: cfg.ActiveMachinePath(), UID: cfg.HostUID, GID: cfg.HostGID},
-		log:    newLogger(cfg.ProxyVerbose),
+		log:    newLogger(cfg.ProxyVerbose, cfg.LogColor, cfg.LogFormat),
 	}
 }
 

@@ -8,25 +8,77 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/lmittmann/tint"
 	"github.com/spf13/cobra"
 
+	"pansen.me/pgdev/internal/logx"
 	"pansen.me/pgdev/internal/socatproxy"
 	"pansen.me/pgdev/internal/track"
 )
 
-// newLogger builds the process's structured logger. Text handler to stderr so
-// the lines interleave readably with the existing "==> " progress output;
-// verbose flips the level to Debug, which the tracking + socat paths use to be
-// deliberately chatty (the experiment wants a fat forensic trail). Format is
-// key=value slog text, timestamped, so a promote/reconcile can be reconstructed
-// entirely from stderr.
-func newLogger(verbose bool) *slog.Logger {
+// newLogger builds the process's structured logger. The default sink is
+// lmittmann/tint — a drop-in slog.Handler that renders slog's own key=value
+// shape with the level and keys colored. EVERY progress line goes through it
+// (the old bare "==> " Printf lines included), so a run reads as one colored,
+// timestamped stream on stderr, while stdout keeps only the reports you copy
+// from: status tables, endpoints, .pgpass/psql lines, snapshot timelines — and
+// the destructive confirm banners, which must render verbatim next to their
+// prompt. verbose flips the level to Debug, which the tracking + socat paths use
+// to be deliberately chatty (we want a fat forensic trail).
+//
+// Two knobs, resolved from .env like the rest of the config:
+//
+//   - PG_LOG_COLOR=auto|always|never — auto (the default) colors only a real
+//     terminal and honors NO_COLOR/TERM (logx.UseColor; tint does no detection
+//     of its own). always forces escapes through a pipe (`… |& less -R`).
+//   - PG_LOG_FORMAT=text|json — json swaps in the stdlib JSON handler, for a run
+//     that is captured and machine-parsed rather than watched.
+//
+// On a terminal the stamp is a bare clock; anywhere else it carries the date
+// too, so a redirected promote/reconcile trail stays self-dating.
+func newLogger(verbose bool, colorMode, format string) *slog.Logger {
 	level := slog.LevelInfo
 	if verbose {
 		level = slog.LevelDebug
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	return slog.New(h)
+	if strings.EqualFold(strings.TrimSpace(format), "json") {
+		return slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	}
+	color := logx.UseColor(colorMode, os.Stderr)
+	timeFormat := "2006-01-02 15:04:05.000"
+	if color {
+		timeFormat = "15:04:05.000"
+	}
+	// Only tint the level when we are actually coloring: with NoColor a tinted
+	// value takes a different render path in tint for no gain.
+	var replace func([]string, slog.Attr) slog.Attr
+	if color {
+		replace = greyDebugLevel
+	}
+	return slog.New(tint.NewTextHandler(os.Stderr, &tint.Options{
+		Level:       level,
+		TimeFormat:  timeFormat,
+		NoColor:     !color,
+		ReplaceAttr: replace,
+	}))
+}
+
+// ansiGrey is tint's palette index for bright black (rendered as \033[90m) —
+// the same grey it already uses for timestamps and keys.
+const ansiGrey = 8
+
+// greyDebugLevel paints the DBG label grey. tint colors INF green, WRN yellow
+// and ERR red but leaves DBG in the default foreground, so with PG_PROXY_DEBUG
+// on (the default) the chatty debug stream reads just as loud as the lines that
+// matter. Grey lets it recede without losing it.
+func greyDebugLevel(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) != 0 || a.Key != slog.LevelKey {
+		return a
+	}
+	if lvl, ok := a.Value.Any().(slog.Level); ok && lvl < slog.LevelInfo {
+		return tint.Attr(ansiGrey, a)
+	}
+	return a
 }
 
 // track lazily opens (and caches) the SQLite tracking DB. First open brings the
@@ -220,7 +272,7 @@ func (a *app) proxyReconcileCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			printApplied(applied)
+			a.logApplied(applied)
 			return appliedErr(applied)
 		},
 	}
@@ -237,18 +289,17 @@ func (a *app) proxyInstallCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			if !isLoopback(a.cfg.ClientBind) {
-				fmt.Fprintf(os.Stderr,
-					"WARNING: binding %s exposes the dev-credentialed PostgreSQL backend on every interface (LAN/Wi-Fi).\n",
-					a.cfg.ClientBind)
+				a.log.Warn("this bind exposes the dev-credentialed PostgreSQL backend on every interface (LAN/Wi-Fi)",
+					"bind", a.cfg.ClientBind)
 			}
 			applied, err := a.reconcileProxy(ctx, "install")
 			if err != nil {
 				return err
 			}
-			fmt.Printf("==> socat proxy:  active %s:%d  staging %s:%d  (the client ports)\n",
-				a.cfg.ClientBind, a.cfg.ClientActivePort, a.cfg.ClientBind, a.cfg.ClientStagingPort)
-			printApplied(applied)
-			fmt.Println("    (promote/refresh now keep it in step automatically)")
+			a.log.Info("socat proxy installed on the client ports — promote/refresh now keep it in step automatically",
+				"active", fmt.Sprintf("%s:%d", a.cfg.ClientBind, a.cfg.ClientActivePort),
+				"staging", fmt.Sprintf("%s:%d", a.cfg.ClientBind, a.cfg.ClientStagingPort))
+			a.logApplied(applied)
 			return appliedErr(applied)
 		},
 	}
@@ -267,7 +318,7 @@ func (a *app) proxyUninstallCmd() *cobra.Command {
 			if err := rec.Uninstall(cmd.Context(), a.proxyPorts()); err != nil {
 				return err
 			}
-			fmt.Println("==> socat proxy removed.")
+			a.log.Info("socat proxy removed")
 			return nil
 		},
 	}
@@ -285,13 +336,16 @@ func (a *app) proxyStatusCmd() *cobra.Command {
 	}
 }
 
-func printApplied(applied []socatproxy.Applied) {
+// logApplied reports the per-role outcome of a reconcile. A role that did not
+// converge is an ERROR, not a printed line the eye slides over — the reconcile
+// as a whole then fails via appliedErr.
+func (a *app) logApplied(applied []socatproxy.Applied) {
 	for _, ap := range applied {
 		if ap.Err != nil {
-			fmt.Printf("    %-8s :%d  FAILED: %v\n", ap.Role, ap.Port, ap.Err)
+			a.log.Error("proxy role did not converge", "role", ap.Role, "port", ap.Port, "err", ap.Err)
 			continue
 		}
-		fmt.Printf("    %-8s :%d  %s -> %s\n", ap.Role, ap.Port, ap.Action, orNone(ap.Target))
+		a.log.Info("proxy role applied", "role", ap.Role, "port", ap.Port, "action", ap.Action, "target", orNone(ap.Target))
 	}
 }
 
