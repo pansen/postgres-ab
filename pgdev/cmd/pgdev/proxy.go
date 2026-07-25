@@ -66,7 +66,7 @@ func (a *app) reconciler() (*socatproxy.Reconciler, error) {
 	}
 	return &socatproxy.Reconciler{
 		Prefix:   a.cfg.MachinePrefix,
-		Bind:     a.cfg.ForwardBind,
+		Bind:     a.cfg.ClientBind,
 		Socat:    socat,
 		LockPath: a.cfg.ReconcileLockPath(),
 		LogPath:  a.cfg.SocatLogPath,
@@ -163,16 +163,43 @@ func (a *app) reconcileProxyIfInstalled(ctx context.Context, reason string) {
 	}
 }
 
+// renderProxy prints the client proxy's live state — one line per role: the
+// LaunchAgent's launchd state and the target the DB last recorded as applied.
+// Shared by `proxy status` and the main `status` command so both agree. Never
+// fails: with no socat (or nothing installed) it says so and moves on, because
+// status must keep rendering.
+func (a *app) renderProxy(ctx context.Context) {
+	rec, err := a.reconciler()
+	if err != nil {
+		fmt.Printf("client proxy: %v\n", err)
+		return
+	}
+	live := rec.Status(ctx, a.proxyPorts())
+	applied := map[string]track.Target{}
+	if db, err := a.track(ctx); err == nil {
+		if t, err := db.AppliedTargets(ctx); err == nil {
+			applied = t
+		}
+	}
+	for _, role := range []string{"active", "staging"} {
+		fmt.Printf("proxy %-8s :%d  %s", role, a.cfg.ClientPort(role), live[role])
+		if t, ok := applied[role]; ok {
+			fmt.Printf("  (db target: %s)", orNone(t.Target))
+		}
+		fmt.Println()
+	}
+}
+
 // ----- `pgdev proxy` command -------------------------------------------------
 
-// proxyCmd groups the socat proxy (internal/socatproxy) that serves the
-// canonical client ports (5442/5443), alongside the Go forwarder now on
-// 5444/5445. It is opt-in: nothing here runs unless you `proxy
-// install`/`reconcile`. See doc/issues/0004.
+// proxyCmd groups the socat proxy (internal/socatproxy) that serves the client
+// ports (5442/5443) — the only host-side client path since the Go forwarder was
+// removed. Installing it is explicit (`proxy install`); promote/refresh only
+// reconcile an ALREADY-installed proxy. See doc/issues/0004.
 func (a *app) proxyCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "proxy",
-		Short: "socat client proxy on the canonical 5442/5443 (Go forwarder moved to 5444/5445)",
+		Short: "socat client proxy on the client ports (5442/5443)",
 	}
 	c.AddCommand(
 		a.proxyReconcileCmd(),
@@ -199,39 +226,29 @@ func (a *app) proxyReconcileCmd() *cobra.Command {
 	}
 }
 
-// proxyInstallCmd is the ONE reference command for "install anything proxy": it
-// brings up BOTH client paths — the client-facing socat proxy on the canonical
-// 5442/5443 AND the Go forwarder on 5444/5445 — so there is no separate
-// endpoint.install step to remember. The Go forwarder install is best-effort
-// (it self-heals and warns rather than failing, and honors
-// PG_ENDPOINT_AUTOINSTALL=0), because socat is the canonical path whose outcome
-// must be surfaced; the forwarder is the secondary integration path.
+// proxyInstallCmd brings up the client path: the socat LaunchAgents on the
+// client ports. Installing is what opts promote/refresh into reconciling, so
+// this is the one command to run after a fresh checkout or a `proxy uninstall`.
 func (a *app) proxyInstallCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "install",
-		Short: "Install everything: the socat proxy (canonical 5442/5443) AND the Go forwarder (5444/5445)",
+		Short: "Install the socat client proxy on the client ports (5442/5443)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-
-			// 1. Go forwarder on 5444/5445. A FULL (re)install, not a gentle
-			//    ensure: this boots any pre-swap forwarder off the canonical
-			//    5442/5443 (which it would otherwise still hold, blocking socat)
-			//    and brings it back on 5444/5445 — freeing the ports BEFORE socat
-			//    binds them in step 2. best-effort; honors PG_ENDPOINT_AUTOINSTALL=0.
-			a.reinstallForwarder(ctx)
-			fmt.Printf("==> Go forwarder: active 127.0.0.1:%d  staging 127.0.0.1:%d\n",
-				a.cfg.ForwardActivePort, a.cfg.ForwardStagingPort)
-
-			// 2. socat proxy on the canonical client ports (the client-facing path).
+			if !isLoopback(a.cfg.ClientBind) {
+				fmt.Fprintf(os.Stderr,
+					"WARNING: binding %s exposes the dev-credentialed PostgreSQL backend on every interface (LAN/Wi-Fi).\n",
+					a.cfg.ClientBind)
+			}
 			applied, err := a.reconcileProxy(ctx, "install")
 			if err != nil {
 				return err
 			}
-			fmt.Printf("==> socat proxy:  active 127.0.0.1:%d  staging 127.0.0.1:%d  (the canonical client ports)\n",
-				a.cfg.ClientActivePort, a.cfg.ClientStagingPort)
+			fmt.Printf("==> socat proxy:  active %s:%d  staging %s:%d  (the client ports)\n",
+				a.cfg.ClientBind, a.cfg.ClientActivePort, a.cfg.ClientBind, a.cfg.ClientStagingPort)
 			printApplied(applied)
-			fmt.Println("    (promote/refresh now keep both in step automatically)")
+			fmt.Println("    (promote/refresh now keep it in step automatically)")
 			return appliedErr(applied)
 		},
 	}
@@ -262,27 +279,7 @@ func (a *app) proxyStatusCmd() *cobra.Command {
 		Short: "socat LaunchAgent state and last-applied targets",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
-			rec, err := a.reconciler()
-			if err != nil {
-				return err
-			}
-			live := rec.Status(ctx, a.proxyPorts())
-			db, err := a.track(ctx)
-			if err != nil {
-				return err
-			}
-			applied, err := db.AppliedTargets(ctx)
-			if err != nil {
-				return err
-			}
-			for _, role := range []string{"active", "staging"} {
-				fmt.Printf("%-8s :%d  %s", role, a.cfg.ClientPort(role), live[role])
-				if t, ok := applied[role]; ok {
-					fmt.Printf("  (db target: %s)", orNone(t.Target))
-				}
-				fmt.Println()
-			}
+			a.renderProxy(cmd.Context())
 			return nil
 		},
 	}
@@ -296,4 +293,11 @@ func printApplied(applied []socatproxy.Applied) {
 		}
 		fmt.Printf("    %-8s :%d  %s -> %s\n", ap.Role, ap.Port, ap.Action, orNone(ap.Target))
 	}
+}
+
+// isLoopback reports whether the client listeners stay on the loopback — the
+// safe default. Anything else publishes the dev-credentialed backend to the
+// network, so `proxy install` says so out loud.
+func isLoopback(bind string) bool {
+	return bind == "" || bind == "127.0.0.1" || bind == "::1" || bind == "localhost"
 }

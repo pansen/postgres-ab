@@ -17,7 +17,7 @@ import (
 // track's output into Reconcile).
 type Target struct {
 	Role   string // active | staging
-	Port   int    // 5444 | 5445
+	Port   int    // 5442 | 5443
 	Target string // "ip:port" or "" (unroutable)
 }
 

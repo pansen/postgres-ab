@@ -3,11 +3,11 @@
 // pgdev talks HTTP/JSON to the resident pgdevd daemon (internal/agentapi) at each
 // machine's eth0. Since spec 0002 (two machines) there is one daemon PER machine
 // (vpg-a/vpg-b, one backend each) and active/staging is a HOST-side concept: a
-// pointer file (internal/activeslot, now pointed at the ACTIVE MACHINE) picks
-// which machine's client is "active" vs "staging", and the in-process host
-// forwarder (internal/forward, run as `pgdev forward serve` under a LaunchAgent)
-// maps the stable 127.0.0.1:5442/:5443 client ports onto whichever machine
-// currently holds each role, re-pointing itself when the pointer flips. The only
+// pointer (internal/activeslot, now pointed at the ACTIVE MACHINE) picks which
+// machine's client is "active" vs "staging", and the socat client proxy
+// (internal/socatproxy, per-user LaunchAgents driven by internal/track) maps the
+// stable 127.0.0.1:5442/:5443 client ports onto whichever machine currently holds
+// each role, re-pointed by a reconcile when the pointer flips. The only
 // `container` execs left
 // here are IP discovery (internal/applecli, a fallback) and `agent deploy`'s
 // one-shot install/restart, plus the hard-reset machine lifecycle used by
@@ -30,7 +30,6 @@ import (
 	"pansen.me/pgdev/internal/agentapi"
 	"pansen.me/pgdev/internal/applecli"
 	"pansen.me/pgdev/internal/config"
-	"pansen.me/pgdev/internal/forward"
 	"pansen.me/pgdev/internal/track"
 )
 
@@ -92,7 +91,6 @@ func rootCmd() *cobra.Command {
 		a.snapshotsCmd(),
 		a.ipCmd(),
 		a.endpointCmd(),
-		a.forwardCmd(),
 		a.proxyCmd(),
 		a.snapshotCmd("active"),
 		a.restoreCmd("active"),
@@ -127,10 +125,11 @@ func (a *app) machineIP(ctx context.Context, slot string) string {
 }
 
 // writeMachineIPFile caches slot's discovered IP host-side so subsequent
-// commands (and both forwarders) don't need a live `container` exec. The cache
-// lives in the SQLite tracking DB (the source of truth); track mirrors it back
-// to the legacy var/machine-ip-<slot> file the resident Go forwarder still
-// polls. There is deliberately NO file-only fallback when the DB is unavailable:
+// commands don't need a live `container` exec. The cache lives in the SQLite
+// tracking DB (the source of truth); track mirrors it back to the flat
+// var/machine-ip-<slot> file this CLI still reads in machineIP (see
+// doc/issues/0004 §5.2 — retiring the mirrors is the remaining step).
+// There is deliberately NO file-only fallback when the DB is unavailable:
 // a file-only write would diverge the mirror from the (stale) DB, and socat —
 // the canonical client path — routes on the DB, so it would silently forward to
 // the wrong machine. A DB that won't open is a real fault to surface, not paper
@@ -150,13 +149,14 @@ func (a *app) writeMachineIPFile(ctx context.Context, slot, ip string) {
 }
 
 // setActive is the CHOKEPOINT for the active pointer: it writes the SQLite
-// tracking DB (source of truth), which mirrors the value back to the legacy
-// var/active-machine file the resident Go forwarder polls. If the DB can't be
-// opened this is a HARD error — unlike IP caching, a promote must not
-// half-succeed: writing only the legacy file would leave the DB (and therefore
-// socat, the canonical client path) pointing at the OLD active machine, so a
-// client would keep hitting the pre-promote DB. Fail loudly so the operator
-// knows the flip did not take, rather than silently splitting the two paths.
+// tracking DB (source of truth), which mirrors the value back to the flat
+// var/active-machine file that this CLI (activeslot) and the Makefile's
+// ACTIVE_SLOT still read. If the DB can't be opened this is a HARD error —
+// unlike IP caching, a promote must not half-succeed: writing only the flat file
+// would leave the DB (and therefore socat, the client path) pointing at the OLD
+// active machine, so a client would keep hitting the pre-promote database. Fail
+// loudly so the operator knows the flip did not take, rather than silently
+// splitting the two paths.
 func (a *app) setActive(ctx context.Context, slot string) error {
 	db, err := a.track(ctx)
 	if err != nil {
@@ -208,88 +208,4 @@ func (a *app) clientForRole(ctx context.Context, role string) (*agentapi.Client,
 
 func (a *app) longClientForRole(ctx context.Context, role string) (*agentapi.Client, error) {
 	return a.longClientFor(ctx, a.roleSlot(role))
-}
-
-// ensureForwarder makes the client forwarder hands-off: on `make start` it
-// validates the LaunchAgent against the current build and self-heals a missing,
-// unloaded, stale, or crashed one, so 127.0.0.1:5442/:5443 come up (and stay
-// correct) automatically. This is deliberately stronger than the old bare
-// "is a plist on disk?" check: after the repo moves or is renamed, a plist is
-// still on disk but points at a deleted binary — it loads, exits EX_CONFIG, and
-// leaves the ports dead. Ensure catches that program drift. On the healthy
-// common path it is a single `launchctl print` + compare, no launchd writes, so
-// the resident serve keeps re-pointing itself from the pointer file untouched
-// (no kickstart on promote/refresh; spec 0003 §3). It NEVER fails the caller:
-// PG_ENDPOINT_AUTOINSTALL=0 opts out, and a sandbox that can't write
-// ~/Library/LaunchAgents just warns.
-func (a *app) ensureForwarder(ctx context.Context) {
-	if os.Getenv("PG_ENDPOINT_AUTOINSTALL") == "0" {
-		return
-	}
-	ld, err := a.launchd()
-	if err != nil {
-		// e.g. running via `go run` (temp binary) — can't self-install; leave the
-		// forwarder to an explicit `pgdev forward install` from a built binary.
-		fmt.Fprintf(os.Stderr, "WARNING: skipping forwarder auto-install: %v\n", err)
-		return
-	}
-	res, err := ld.Ensure(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: forwarder auto-install failed (run 'pgdev forward install'): %v\n", err)
-		return
-	}
-	switch res.Action {
-	case "installed":
-		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' installed (%s).\n", ld.Label, res.Reason)
-	case "reinstalled":
-		fmt.Fprintf(os.Stderr, "==> Endpoint forwarder '%s' re-synced: %s.\n", ld.Label, res.Reason)
-	}
-}
-
-// reinstallForwarder force-(re)installs the Go forwarder LaunchAgent: a full
-// bootout + bootstrap, NOT the gentle Ensure. `proxy install` uses this (not
-// ensureForwarder) because of the port swap: a forwarder process that started
-// BEFORE socat took over 5442/5443 is still bound there, and Ensure would leave
-// it alone (its program args are unchanged, so it looks "healthy") — so socat
-// could never bind the canonical ports. Killing that forwarder's PID can't win
-// either: it has KeepAlive, so launchd resurrects it. Only booting out its JOB
-// frees the port, which bootout+bootstrap does — the bootout releases 5442/5443,
-// the bootstrap brings the forwarder back on its new 5444/5445. Best-effort:
-// honors PG_ENDPOINT_AUTOINSTALL=0 and warns rather than failing.
-func (a *app) reinstallForwarder(ctx context.Context) {
-	if os.Getenv("PG_ENDPOINT_AUTOINSTALL") == "0" {
-		return
-	}
-	ld, err := a.launchd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: skipping Go forwarder install: %v\n", err)
-		return
-	}
-	if err := ld.Install(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: Go forwarder install failed (run 'pgdev forward install'): %v\n", err)
-	}
-}
-
-// awaitForwarderRepoint gives the resident forwarder up to a couple of poll
-// intervals to re-point onto the newly-active slot after a promote, then reports
-// whether it confirmably did. It reads internal/forward's state file rather than
-// touching launchd, so promote stays a pure pointer write. A false return is a
-// warning, not a hard failure: the pointer IS the source of truth and the
-// forwarder converges once it is running — but we surface an unconfirmed
-// re-point so a following `pg_restore -p 5443` isn't silently misrouted.
-func (a *app) awaitForwarderRepoint(ctx context.Context, slot string) bool {
-	deadline := time.Now().Add(4 * time.Second)
-	for {
-		if st, ok := forward.ReadState(a.cfg.ForwardStatePath()); ok && st.ActiveSlot == slot && st.Fresh(10*time.Second) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
 }

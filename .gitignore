@@ -1,5 +1,8 @@
 /.zed
 .env
+# Leftover local code-signing material from the removed forwarder/codesign flow.
+# Nothing builds or reads it any more — kept ignored so a stray private key can
+# never be committed; delete etc/keys yourself when you're done with it.
 /etc/keys/*
 
 # Everything under var/ is machine-local runtime or generated state — nothing
