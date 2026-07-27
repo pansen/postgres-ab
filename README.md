@@ -173,15 +173,17 @@ physical disk, not backups.
 ```shell
 make deps      # also auto-creates .env from .env.example (defaults work; edit if you like)
 
-make start     # first run builds the image and creates both machines (vpg-a, vpg-b)
-make pg.up     # provisions each machine's PostgreSQL backend
+make start     # builds the image, creates both machines (vpg-a, vpg-b) and provisions their backends
 make pg.status
 ```
 
 The first `make start` builds an Ubuntu 26.04 machine image (systemd, Incus, jq,
-XFS tools) and creates both machines; later starts reuse them. `make pg.up`
-installs PostgreSQL 17 in each machine's nested Ubuntu 24.04 container (several
-minutes). Run `make proxy.install` once for the stable `127.0.0.1` endpoints
+XFS tools) and creates both machines; later starts reuse them. It then installs
+PostgreSQL 17 in each machine's nested Ubuntu 24.04 container (several minutes)
+for any slot that has no backend yet — so `make start` is also the way back from
+`make pg.staging.purge`. A slot that already has a backend is left untouched.
+`make pg.up` is the same provisioning step on its own. Run `make proxy.install`
+once for the stable `127.0.0.1` endpoints
 (see [Networking](#networking)); `make start` keeps them re-pointed afterwards.
 The first connection also needs a one-time macOS **Local Network** grant — see
 [macOS Security](#macos-security--grant-local-network-once).

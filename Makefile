@@ -224,8 +224,17 @@ machine.status: system.start
 		container machine inspect "$(MACHINE_PREFIX)-$$slot" || true; \
 	done
 
+# The everyday bring-up, and the documented way back from `pg.staging.purge`:
+# machines created+booted and pgdevd deployed (`deploy`), then `pgdev up` fills
+# in any MISSING backend. That last step is load-bearing — `deploy`'s bootstrap
+# only lays down the XFS store and the Incus topology, so a machine recreated
+# after a purge has no pg-dev-<slot> container and every staging target fails
+# with Incus's `Instance not found` until something provisions one. `pgdev up`
+# is idempotent (it skips slots that already have a backend), so re-running
+# start on a healthy pair stays cheap and never touches existing data.
 .PHONY: start
 start: deploy
+	$(PGDEV) up
 	$(PGDEV) refresh
 	$(MAKE) status
 

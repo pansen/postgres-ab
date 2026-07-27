@@ -17,26 +17,52 @@ import (
 
 // ----- lifecycle (up / down) -----------------------------------------------
 
+// upCmd provisions the backends that are MISSING, per machine — it is
+// idempotent, not all-or-nothing. `make start` runs it after `deploy` so the
+// state left by `pg.staging.purge` (machine recreated by `make machine`,
+// pgdevd deployed, but no Incus backend on it) heals itself: without this,
+// start left the slot at ABSENT and every staging target failed with Incus's
+// raw `Instance not found`. A slot that already has a container is left
+// strictly alone — the daemon's Up still refuses to touch one (`run down
+// first`), so no existing data can be provisioned over.
 func (a *app) upCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "up",
-		Short: "Provision both machines' backends (vpg-a, vpg-b) from empty Incus hosts",
+		Short: "Provision any missing machine backend (vpg-a, vpg-b); existing ones are left alone",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			if err := a.cfg.RequireCreds(); err != nil {
 				return err
 			}
+			provisioned := 0
 			for _, slot := range slotsAB {
+				machine := a.cfg.MachineNameForSlot(slot)
+				// Probe with the short-timeout client: an unreachable machine
+				// must fail fast here rather than hang on the 30-minute Up.
+				probe, err := a.clientFor(ctx, slot)
+				if err != nil {
+					return err
+				}
+				st, err := probe.Status(ctx)
+				if err != nil {
+					return fmt.Errorf("%s: %w", machine, err)
+				}
+				if st.State != "" {
+					a.log.Info("backend already provisioned — skipping",
+						"machine", machine, "container", st.Container, "state", st.State)
+					continue
+				}
 				cl, err := a.longClientFor(ctx, slot)
 				if err != nil {
 					return err
 				}
 				a.log.Info("provisioning backend (the first run builds the golden PostgreSQL image; this can take a few minutes)",
-					"machine", a.cfg.MachineNameForSlot(slot))
+					"machine", machine)
 				if _, err := cl.Up(ctx); err != nil {
-					return fmt.Errorf("%s: %w", a.cfg.MachineNameForSlot(slot), err)
+					return fmt.Errorf("%s: %w", machine, err)
 				}
+				provisioned++
 			}
 			// Default to "a" active the first time the pointer file has never
 			// been written, so a fresh `pgdev up` has a well-defined role split.
@@ -44,6 +70,10 @@ func (a *app) upCmd() *cobra.Command {
 				if err := a.setActive(ctx, "a"); err != nil {
 					return err
 				}
+			}
+			if provisioned == 0 {
+				a.log.Info("both backends already provisioned — nothing to do")
+				return nil
 			}
 			a.reconcileProxyIfInstalled(ctx, "up")
 			a.log.Info("pg-dev ready")
@@ -494,6 +524,19 @@ func (a *app) stagingStartCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
+			machine := a.cfg.MachineNameForSlot(a.roleSlot("staging"))
+			// A machine can exist with no backend on it (e.g. after
+			// `pg.staging.purge` when `make start` was interrupted before
+			// provisioning). Say so, instead of letting Incus answer with a
+			// bare `Failed to fetch instance … Instance not found`.
+			probe, err := a.clientForRole(ctx, "staging")
+			if err != nil {
+				return err
+			}
+			if st, err := probe.Status(ctx); err == nil && st.State == "" {
+				return fmt.Errorf("staging backend %s on %s is not provisioned — run 'make start' (or 'make pg.staging.rebuild' for a fresh machine)",
+					st.Container, machine)
+			}
 			cl, err := a.longClientForRole(ctx, "staging")
 			if err != nil {
 				return err
@@ -502,7 +545,7 @@ func (a *app) stagingStartCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			a.log.Info(res.Message, "machine", a.cfg.MachineNameForSlot(a.roleSlot("staging")))
+			a.log.Info(res.Message, "machine", machine)
 			return nil
 		},
 	}
