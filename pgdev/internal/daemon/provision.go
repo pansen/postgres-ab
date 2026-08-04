@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
+	"strings"
 	"time"
 
 	"pansen.me/pgdev/internal/agentapi"
@@ -18,11 +20,41 @@ func reloadSystemd() error {
 	return exec.Command("systemctl", "daemon-reload").Run()
 }
 
+// Apple's container runtime hardens the machine's kernel filesystems, and both
+// halves of that hardening break Incus (see ensureKernelMounts):
+//
+//   - procSys is mounted READ-ONLY, so bringing a managed bridge up fails on
+//     "open /proc/sys/net/ipv6/conf/incusbr0/disable_ipv6: read-only file system".
+//   - /proc and /sys carry masking overmounts (/proc/keys, /proc/timer_list,
+//     /sys/firmware), which makes the kernel refuse a fresh proc/sysfs mount
+//     inside a user namespace — every nested container then dies in LXC's
+//     first automatic mounts. visibleProc/visibleSysfs are the unmasked mounts
+//     that give the kernel's visibility check something to say yes to.
+const (
+	procSys      = "/proc/sys"
+	visibleProc  = "/run/pgdev/proc"
+	visibleSysfs = "/run/pgdev/sys"
+)
+
+// bootstrapStatePath records the last bootstrap outcome (empty file = success).
+// The daemon's unit runs bootstrap as `ExecStartPre=-`, deliberately tolerating
+// failure so `pgdev status` stays usable; without this file that failure would
+// be invisible and resurface minutes later as a confusing downstream error (a
+// half-configured Incus reports "No root device could be found" on launch).
+// /run is tmpfs, so the record is per-boot, which is the right lifetime.
+const bootstrapStatePath = "/run/pgdevd-bootstrap.err"
+
 // Bootstrap ensures the machine is ready to host its one backend: the XFS reflink
 // store mounted, this slot's layout present, the Incus daemon topology configured,
 // and the boot-ordering drop-in for incusd installed. Runs as the systemd unit's
 // ExecStartPre (`pgdevd bootstrap`) so every daemon start re-asserts it.
 func (s *Service) Bootstrap(ctx context.Context) error {
+	err := s.bootstrap(ctx)
+	recordBootstrap(err)
+	return err
+}
+
+func (s *Service) bootstrap(ctx context.Context) error {
 	s.Log("bootstrapping XFS data store at %s...", s.Cfg.DataRoot)
 	if err := store.Bootstrap(ctx, s.Cfg.DataImage, s.Cfg.DataRoot, s.Cfg.DataDiskSize, s.Log); err != nil {
 		return err
@@ -33,12 +65,136 @@ func (s *Service) Bootstrap(ctx context.Context) error {
 	if err := s.ensureIncusOrdering(); err != nil {
 		return err
 	}
+	remounted, err := s.ensureKernelMounts(ctx)
+	if err != nil {
+		return err
+	}
 	s.Log("waiting for the Incus daemon...")
 	if err := s.Incus.WaitReady(ctx, 90*time.Second); err != nil {
 		return err
 	}
+	if remounted {
+		// incusd has been running against a read-only /proc/sys, so any bridge it
+		// tried to bring up is defined but absent. Now that the tunables are
+		// writable, get it to re-create them.
+		if err := s.Incus.RepairNetworks(ctx, 90*time.Second); err != nil {
+			return err
+		}
+	}
 	s.Log("configuring Incus storage, network and profile...")
 	return s.Incus.EnsureTopology(ctx, s.Cfg)
+}
+
+// ensureKernelMounts repairs the two ways Apple's container runtime makes the
+// machine's /proc and /sys unusable for Incus: a read-only /proc/sys (no managed
+// bridge can be brought up) and masked /proc + /sys (no nested container can
+// start, because the kernel only permits a fresh proc/sysfs mount inside a user
+// namespace when an unmasked mount of that filesystem already exists).
+//
+// Applied twice over: as an incus.service drop-in, so every future boot has them
+// in place before incusd starts (and before it autostarts instances), and right
+// now, for the current boot where incusd is already running. It reports whether
+// /proc/sys had to be remounted — the signal that incusd has been running
+// against a read-only one and its networks may need repairing.
+func (s *Service) ensureKernelMounts(ctx context.Context) (bool, error) {
+	if err := s.ensureIncusDropIn("20-kernel-mounts.conf", kernelMountsDropIn,
+		"installed incus.service drop-in (writable "+procSys+", unmasked proc/sysfs)"); err != nil {
+		return false, err
+	}
+	if err := s.ensureVisibleMount(ctx, "proc", visibleProc); err != nil {
+		return false, err
+	}
+	if err := s.ensureVisibleMount(ctx, "sysfs", visibleSysfs); err != nil {
+		return false, err
+	}
+	if procSysWritable() {
+		return false, nil
+	}
+	s.Log("%s is mounted read-only (Apple container runtime); remounting read-write for Incus...", procSys)
+	if out, err := exec.CommandContext(ctx, "mount", "-o", "remount,rw", procSys).CombinedOutput(); err != nil {
+		return false, fmt.Errorf("remount %s read-write: %w: %s", procSys, err, strings.TrimSpace(string(out)))
+	}
+	if !procSysWritable() {
+		return false, fmt.Errorf("%s is still read-only after remounting it read-write", procSys)
+	}
+	return true, nil
+}
+
+// kernelMountsDropIn is the incus.service half of ensureKernelMounts. Every line
+// is tolerant (`-`) and guarded, so a boot where one of them is already in place
+// — or where a future runtime stops needing them — still starts incusd.
+const kernelMountsDropIn = "[Service]\n" +
+	"ExecStartPre=-/bin/mount -o remount,rw " + procSys + "\n" +
+	"ExecStartPre=-/bin/sh -c 'mountpoint -q " + visibleProc + " || { mkdir -p " + visibleProc + " && mount -t proc proc " + visibleProc + "; }'\n" +
+	"ExecStartPre=-/bin/sh -c 'mountpoint -q " + visibleSysfs + " || { mkdir -p " + visibleSysfs + " && mount -t sysfs sysfs " + visibleSysfs + "; }'\n"
+
+// ensureVisibleMount parks one pristine mount of fstype at target, where the
+// kernel's "fully visible" check can find it. Idempotent: mounting again would
+// stack a second mount on every daemon restart, so an existing one is left be.
+func (s *Service) ensureVisibleMount(ctx context.Context, fstype, target string) error {
+	if mountedAs(readMounts(), target, fstype) {
+		return nil
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return err
+	}
+	s.Log("mounting an unmasked %s at %s (nested containers cannot mount their own otherwise)...", fstype, target)
+	if out, err := exec.CommandContext(ctx, "mount", "-t", fstype, fstype, target).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount %s at %s: %w: %s", fstype, target, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// readMounts returns /proc/mounts, or "" when it cannot be read.
+func readMounts() string {
+	b, _ := os.ReadFile("/proc/mounts")
+	return string(b)
+}
+
+// procSysWritable reports whether /proc/sys is currently mounted read-write. An
+// unreadable /proc/mounts counts as not-writable: attempting the remount is
+// harmless, and skipping it would leave Incus broken.
+func procSysWritable() bool {
+	mounts := readMounts()
+	if mounts == "" {
+		return false
+	}
+	return mountedWritable(mounts, procSys)
+}
+
+// mountedWritable parses /proc/mounts for target's mount options. Later entries
+// shadow earlier ones (a mount stacked on the same path wins), so the last match
+// decides; a target that is not a mount point of its own is writable exactly
+// when nothing says otherwise.
+func mountedWritable(mounts, target string) bool {
+	writable := true
+	for _, f := range mountFields(mounts, target) {
+		writable = slices.Contains(strings.Split(f[3], ","), "rw")
+	}
+	return writable
+}
+
+// mountedAs reports whether target is currently mounted with the given fstype.
+func mountedAs(mounts, target, fstype string) bool {
+	for _, f := range mountFields(mounts, target) {
+		if f[2] == fstype {
+			return true
+		}
+	}
+	return false
+}
+
+// mountFields yields the /proc/mounts entries whose mount point is target, in
+// file order (device, mount point, fstype, options, …).
+func mountFields(mounts, target string) [][]string {
+	var out [][]string
+	for _, line := range strings.Split(mounts, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 4 && f[1] == target {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // ensureIncusOrdering is boot-ordering hardening level 2: incus.service must not
@@ -46,9 +202,16 @@ func (s *Service) Bootstrap(ctx context.Context) error {
 // (and the backend whose disk source lives on that mount) up too early. Written
 // as a drop-in so systemd orders incusd after var-lib-pg\x2ddev\x2dlocal.mount.
 func (s *Service) ensureIncusOrdering() error {
+	return s.ensureIncusDropIn("10-after-pgstore.conf",
+		"[Unit]\nRequiresMountsFor="+s.Cfg.DataRoot+"\n",
+		"installed incus.service ordering drop-in (After "+s.Cfg.DataRoot+" mount)")
+}
+
+// ensureIncusDropIn writes one incus.service drop-in idempotently, reloading
+// systemd only when the content actually changed.
+func (s *Service) ensureIncusDropIn(name, content, logLine string) error {
 	dir := "/etc/systemd/system/incus.service.d"
-	path := dir + "/10-after-pgstore.conf"
-	content := "[Unit]\nRequiresMountsFor=" + s.Cfg.DataRoot + "\n"
+	path := dir + "/" + name
 	if b, err := os.ReadFile(path); err == nil && string(b) == content {
 		return nil // already in place; skip the daemon-reload
 	}
@@ -58,10 +221,31 @@ func (s *Service) ensureIncusOrdering() error {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}
-	s.Log("installed incus.service ordering drop-in (After %s mount)", s.Cfg.DataRoot)
+	s.Log("%s", logLine)
 	// Best-effort: a reload lets it take effect without waiting for the next boot.
 	_ = reloadSystemd()
 	return nil
+}
+
+// recordBootstrap persists the bootstrap outcome for Status to report. Failing
+// to write it is not itself an error: the record is a diagnostic, and losing it
+// must not turn a healthy bootstrap into a failed one.
+func recordBootstrap(err error) {
+	if err == nil {
+		_ = os.Remove(bootstrapStatePath)
+		return
+	}
+	_ = os.WriteFile(bootstrapStatePath, []byte(err.Error()), 0o644)
+}
+
+// LastBootstrapError returns the error the most recent bootstrap failed with, or
+// "" if it succeeded (or never ran this boot).
+func LastBootstrapError() string {
+	b, err := os.ReadFile(bootstrapStatePath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // Up provisions this machine's one backend from an empty Incus host: golden
@@ -81,6 +265,13 @@ func (s *Service) Up(ctx context.Context) (agentapi.StatusResponse, error) {
 		return agentapi.StatusResponse{}, fmt.Errorf("container %q already exists — run down first", c)
 	}
 
+	// Re-assert the Incus topology instead of trusting bootstrap: its failures are
+	// tolerated by the unit (ExecStartPre=-), and a half-configured daemon fails
+	// here with a symptom that names none of the cause ("No root device could be
+	// found"). Idempotent, so on a healthy machine this is four no-op queries.
+	if err := s.Incus.EnsureTopology(ctx, s.Cfg); err != nil {
+		return agentapi.StatusResponse{}, fmt.Errorf("incus topology (bootstrap left it incomplete): %w", err)
+	}
 	if err := s.ensureGolden(ctx); err != nil {
 		return agentapi.StatusResponse{}, fmt.Errorf("golden image: %w", err)
 	}

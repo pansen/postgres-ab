@@ -334,6 +334,30 @@ duplicate row in the _Local Network_ list.)
 If a client hangs after the grant, check `make proxy.status` and the socat logs
 in `var/<prefix>-socat-<role>.log`.
 
+### Apple `container` 1.2 hardens the machine's `/proc` and `/sys`
+
+`container` 1.2 mounts `/proc/sys` **read-only** inside the machine and
+overmounts parts of `/proc` and `/sys` (`/proc/keys`, `/proc/timer_list`,
+`/sys/firmware`). Incus needs both undone, and fails in two unrelated-looking
+ways when they are not:
+
+- `incus network create incusbr0` dies with _"open
+  /proc/sys/net/ipv6/conf/incusbr0/disable_ipv6: read-only file system"_. After
+  an upgrade-and-reboot the bridge is already defined, so it comes back
+  `UNAVAILABLE` instead and every backend fails to start.
+- Nested containers cannot start at all — the kernel only allows a fresh
+  `proc`/`sysfs` mount inside a user namespace when an *unmasked* mount of that
+  filesystem already exists, so LXC aborts in its first automatic mounts and
+  Incus reports only `forkstart … exit status 1`.
+
+`pgdevd bootstrap` repairs both on every daemon start (remounting `/proc/sys`
+read-write, parking unmasked mounts under `/run/pgdev`, and restarting incusd
+if it has been running against a read-only `/proc/sys`), and installs them as an
+`incus.service` drop-in so later boots have them before incusd starts. Nothing
+to do by hand — but if a machine ever misbehaves right after a `brew upgrade
+container`, `make status` now names the failing bootstrap step instead of
+leaving it to surface later as an Incus error.
+
 ### Disk Space
 
 **Disk space — the sparse-VM-disk trap (important):** the Apple container

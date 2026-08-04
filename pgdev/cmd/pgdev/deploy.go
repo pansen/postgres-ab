@@ -200,7 +200,31 @@ func (a *app) deploy(ctx context.Context, slot string) error {
 	}
 
 	// Confirm the running daemon is the one we just shipped.
-	return a.awaitVersion(ctx, slot)
+	if err := a.awaitVersion(ctx, slot); err != nil {
+		return err
+	}
+	// "pgdevd is live" is not "the machine is usable": the unit tolerates a failed
+	// ExecStartPre bootstrap on purpose, so a deploy can succeed onto a machine
+	// with no XFS store or an unconfigured Incus. Report that now, at the deploy
+	// that carries it, instead of leaving the next `pgdev up` to fail obscurely.
+	return a.reportBootstrap(ctx, slot)
+}
+
+// reportBootstrap fails the deploy when the freshly-restarted daemon reports its
+// bootstrap did not complete. Status being unreachable is not treated as a
+// bootstrap failure — the version handshake already proved the daemon answers,
+// so that would be a different fault, and awaitVersion is its own guard.
+func (a *app) reportBootstrap(ctx context.Context, slot string) error {
+	cl, err := a.clientFor(ctx, slot)
+	if err != nil {
+		return nil
+	}
+	st, err := cl.Status(ctx)
+	if err != nil || st.BootstrapError == "" {
+		return nil
+	}
+	return fmt.Errorf("%s: pgdevd is live but its bootstrap failed: %s",
+		a.cfg.MachineNameForSlot(slot), st.BootstrapError)
 }
 
 // awaitVersion polls slot's /v1/version until the daemon reports our build stamp

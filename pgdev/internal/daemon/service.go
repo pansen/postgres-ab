@@ -119,6 +119,7 @@ func (s *Service) Status(ctx context.Context) (agentapi.StatusResponse, error) {
 		DataStoreMounted: s.Store.RequireMounted() == nil,
 		IncusVersion:     s.Incus.Version(ctx),
 		Snapshots:        snaps,
+		BootstrapError:   LastBootstrapError(),
 	}, nil
 }
 

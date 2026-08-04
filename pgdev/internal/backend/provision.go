@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -140,6 +141,89 @@ func (i *Incus) EnsureTopology(ctx context.Context, cfg config.Config) error {
 		}
 	}
 	return nil
+}
+
+// RepairNetworks re-creates managed bridges that Incus knows about but whose
+// interface is missing from the kernel. An incusd that started against a
+// read-only /proc/sys cannot write net.ipv6.conf.<bridge>.disable_ipv6 and so
+// leaves its bridge defined-but-UNAVAILABLE; every instance on it then fails to
+// start. Incus has no per-network "start" verb — only a daemon restart re-runs
+// the setup — so this restarts incusd, but only when a bridge is actually
+// missing (i.e. once, on the boot that first remounted /proc/sys read-write).
+//
+// The restart is issued --no-block: pgdevd is ordered After=incus.service, so a
+// blocking restart from its ExecStartPre could deadlock against its own start
+// job. The post-condition waited on is therefore the interface appearing, not
+// the systemd job finishing.
+func (i *Incus) RepairNetworks(ctx context.Context, timeout time.Duration) error {
+	missing, err := i.missingBridges(ctx)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	i.log("Incus bridge(s) %s are defined but absent; restarting incusd to re-create them...",
+		strings.Join(missing, ", "))
+	if out, err := exec.CommandContext(ctx, "systemctl", "restart", "--no-block", "incus.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("restart incus.service: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	// Wait for the restart to actually land. A query error here means incusd is
+	// mid-restart (the shutting-down daemon answers "database is closed"), which
+	// is a "keep waiting", NOT a "nothing is missing" — reading it as the latter
+	// would return success and hand the next caller a daemon that is still going
+	// down.
+	deadline := time.Now().Add(timeout)
+	for {
+		switch left, err := i.missingBridges(ctx); {
+		case err != nil: // incusd not answering yet
+		case len(left) == 0:
+			i.log("Incus bridge(s) %s are back.", strings.Join(missing, ", "))
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("Incus bridge(s) %s did not come back within %s after restarting incusd",
+				strings.Join(missing, ", "), timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// missingBridges lists the managed bridge networks with no kernel interface. The
+// error is the caller's signal that the daemon could not be asked at all, which
+// is never the same answer as "none are missing".
+func (i *Incus) missingBridges(ctx context.Context) ([]string, error) {
+	out, err := i.output(ctx, "network", "list", "--format", "csv", "-c", "ntm")
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, name := range managedBridges(out) {
+		if _, err := os.Stat("/sys/class/net/" + name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	return missing, nil
+}
+
+// managedBridges picks the Incus-managed bridges out of
+// `incus network list --format csv -c ntm` (name,type,managed). Unmanaged
+// entries are the machine's own interfaces (eth0, lo) — Incus never creates
+// those, so their presence is not its business.
+func managedBridges(csv string) []string {
+	var out []string
+	for _, line := range strings.Split(csv, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		if len(f) < 3 || f[1] != "bridge" || !strings.EqualFold(f[2], "YES") {
+			continue
+		}
+		out = append(out, f[0])
+	}
+	return out
 }
 
 // WaitReady blocks until the local Incus daemon answers (ports `incus admin

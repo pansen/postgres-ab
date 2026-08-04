@@ -188,6 +188,15 @@ func (a *app) renderStatus(ctx context.Context) {
 	}
 	tw.Flush()
 	fmt.Println()
+	// A machine whose bootstrap failed answers every request normally but cannot
+	// provision or start a backend — say so here rather than letting it surface
+	// later as an unrelated-looking Incus error.
+	for _, slot := range slotsAB {
+		if e := statuses[slot].st.BootstrapError; e != "" {
+			a.log.Warn("machine bootstrap failed — provisioning will not work until this is fixed",
+				"machine", a.cfg.MachineNameForSlot(slot), "err", e)
+		}
+	}
 	a.renderProxy(ctx)
 	fmt.Println()
 	a.renderSnapshots(statuses, true)
@@ -396,7 +405,12 @@ func (a *app) snapshotCmd(role string) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			cl, err := a.clientForRole(ctx, role)
+			// Long-timeout client: a snapshot stops PostgreSQL (a checkpoint of a
+			// freshly-imported dump alone can outlast 30s) and reflink-clones the
+			// whole data dir before answering. The default deadline aborted the
+			// request while the daemon went on to complete it — the caller saw a
+			// failure for a snapshot that exists.
+			cl, err := a.longClientForRole(ctx, role)
 			if err != nil {
 				return err
 			}
@@ -479,7 +493,14 @@ func (a *app) runRestore(ctx context.Context, role, name string, last, force boo
 		}
 	}
 
-	res, err := cl.Restore(ctx, agentapi.RestoreRequest{Name: name, Last: last, Force: effForce})
+	// The listing above already proved the machine answers, so the restore itself
+	// runs on the long-timeout client: it stops PostgreSQL, swaps the data dir and
+	// waits for the cluster to come back, which outlasts the default deadline.
+	mut, err := a.longClientForRole(ctx, role)
+	if err != nil {
+		return err
+	}
+	res, err := mut.Restore(ctx, agentapi.RestoreRequest{Name: name, Last: last, Force: effForce})
 	if err != nil {
 		return err
 	}

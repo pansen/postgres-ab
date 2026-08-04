@@ -45,6 +45,11 @@ type StatusResponse struct {
 	DataStoreMounted bool           `json:"dataStoreMounted"` // the XFS reflink store is mounted
 	IncusVersion     string         `json:"incusVersion"`
 	Snapshots        []SnapshotInfo `json:"snapshots"`
+	// BootstrapError is what this boot's `pgdevd bootstrap` failed with, or ""
+	// if it succeeded. The unit tolerates that failure on purpose (so status
+	// stays reachable to diagnose it), which is exactly why it has to be
+	// reported here rather than only in the machine's journal.
+	BootstrapError string `json:"bootstrapError,omitempty"`
 }
 
 // SnapshotsResponse answers GET /v1/snapshots.

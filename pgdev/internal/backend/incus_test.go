@@ -42,3 +42,20 @@ func TestPGActiveClassifiesExit(t *testing.T) {
 		t.Fatalf("transport failure: got err=%v, want %v", err, sentinel)
 	}
 }
+
+// managedBridges must pick out only the bridges Incus itself created: an
+// UNAVAILABLE incusbr0 is the one worth repairing, while the machine's own
+// eth0/lo are listed too and are none of Incus's business.
+func TestManagedBridges(t *testing.T) {
+	const list = "eth0,physical,NO\n" +
+		"incusbr0,bridge,YES\n" +
+		"br-foreign,bridge,NO\n" +
+		"lo,loopback,NO\n"
+	got := managedBridges(list)
+	if len(got) != 1 || got[0] != "incusbr0" {
+		t.Fatalf("managedBridges = %v, want [incusbr0]", got)
+	}
+	if got := managedBridges(""); got != nil {
+		t.Fatalf("managedBridges(empty) = %v, want nil", got)
+	}
+}
