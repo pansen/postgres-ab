@@ -329,10 +329,22 @@ func (j *job) launchctl(ctx context.Context, timeout time.Duration, args ...stri
 }
 
 // listenerPIDs returns the PIDs LISTENing on a TCP port (lsof; macOS). Best-effort.
+//
+// `-b -w` are load-bearing, not cosmetic: plain lsof stat()s every mounted
+// filesystem, so one unreachable network mount (a disconnected Time Machine
+// smbfs share is the usual culprit) parks it in an uninterruptible kernel wait
+// for minutes. The context timeout cannot save us there — SIGKILL does not land
+// until the syscall returns — so the whole verify budget burns and a perfectly
+// healthy listener reads as absent. -b tells lsof to skip the blocking calls,
+// -w silences the resulting warnings so they stay out of the PID parse.
+// WaitDelay is the second line of defence: if a probe still wedges, Wait gives
+// up instead of holding the caller past its deadline.
 func listenerPIDs(ctx context.Context, port int) []int {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "lsof", "-nP", "-t", "-iTCP:"+strconv.Itoa(port), "-sTCP:LISTEN").Output()
+	cmd := exec.CommandContext(cctx, "lsof", "-nP", "-b", "-w", "-t", "-iTCP:"+strconv.Itoa(port), "-sTCP:LISTEN")
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return nil
 	}
@@ -350,7 +362,9 @@ func listenerPIDs(ctx context.Context, port int) []int {
 func processArgs(ctx context.Context, pid int) string {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	cmd := exec.CommandContext(cctx, "ps", "-o", "command=", "-p", strconv.Itoa(pid))
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
