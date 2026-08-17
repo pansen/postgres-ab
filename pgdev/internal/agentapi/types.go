@@ -32,6 +32,22 @@ type SnapshotInfo struct {
 	CreatedUnix int64  `json:"createdUnix"`
 }
 
+// DBSize is the live database measured two ways. Both are best-effort: a
+// measurement that fails reports its reason here instead of failing the whole
+// status call, since status is the command you run when something is wrong.
+type DBSize struct {
+	// SQLBytes is pg_database_size(PG_DB) — what PostgreSQL accounts for in
+	// this one database. Zero when the query could not run.
+	SQLBytes int64 `json:"sqlBytes"`
+	// DiskBytes is what the slot's whole data directory occupies on the XFS
+	// store (allocated blocks). It covers the entire cluster — WAL, the other
+	// databases, space PostgreSQL has not returned to the filesystem — so it is
+	// normally larger than SQLBytes.
+	DiskBytes int64  `json:"diskBytes"`
+	SQLError  string `json:"sqlError,omitempty"`
+	DiskError string `json:"diskError,omitempty"`
+}
+
 // StatusResponse answers GET /v1/status: this machine's single backend. Raw
 // facts only — the host assigns the active/staging role (from its own pointer),
 // renders endpoints/psql lines and formats credentials.
@@ -44,6 +60,7 @@ type StatusResponse struct {
 	ProxyDevice      bool           `json:"proxyDevice"`      // the eth0→backend proxy device is present
 	DataStoreMounted bool           `json:"dataStoreMounted"` // the XFS reflink store is mounted
 	IncusVersion     string         `json:"incusVersion"`
+	DBSize           DBSize         `json:"dbSize"`
 	Snapshots        []SnapshotInfo `json:"snapshots"`
 	// BootstrapError is what this boot's `pgdevd bootstrap` failed with, or ""
 	// if it succeeded. The unit tolerates that failure on purpose (so status

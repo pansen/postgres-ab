@@ -149,6 +149,18 @@ SQL
 `
 }
 
+// DatabaseSizeScript prints pg_database_size(db) as a bare byte count. The
+// heredoc carries the SQL so the database's own single quotes never have to
+// survive `su -c`'s quoting, and -Atq strips psql's headers and row counts so
+// the caller parses one integer.
+func DatabaseSizeScript(db string) string {
+	return `set -euo pipefail
+su - postgres -c 'psql -v ON_ERROR_STOP=1 -Atq' <<'SQL'
+SELECT pg_database_size(` + sqlLit(db) + `);
+SQL
+`
+}
+
 // sqlLit renders a single-quoted SQL string literal.
 func sqlLit(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 

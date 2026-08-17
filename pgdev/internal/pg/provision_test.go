@@ -1,6 +1,9 @@
 package pg
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSQLEscaping(t *testing.T) {
 	if got := sqlLit("o'brien"); got != "'o''brien'" {
@@ -60,4 +63,15 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func TestDatabaseSizeScriptQuotesDBName(t *testing.T) {
+	s := DatabaseSizeScript("v'pg")
+	if !strings.Contains(s, `pg_database_size('v''pg')`) {
+		t.Errorf("database name not escaped as a SQL literal:\n%s", s)
+	}
+	// -Atq is what keeps the output to a bare integer for parseDBSize.
+	if !strings.Contains(s, "-Atq") {
+		t.Errorf("expected psql -Atq:\n%s", s)
+	}
 }

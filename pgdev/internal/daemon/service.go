@@ -11,7 +11,10 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"pansen.me/pgdev/internal/agentapi"
 	"pansen.me/pgdev/internal/backend"
@@ -19,6 +22,7 @@ import (
 	"pansen.me/pgdev/internal/config"
 	"pansen.me/pgdev/internal/logx"
 	"pansen.me/pgdev/internal/ops"
+	"pansen.me/pgdev/internal/pg"
 	"pansen.me/pgdev/internal/reconcile"
 	"pansen.me/pgdev/internal/store"
 	"pansen.me/pgdev/internal/task"
@@ -118,9 +122,65 @@ func (s *Service) Status(ctx context.Context) (agentapi.StatusResponse, error) {
 		ProxyDevice:      fwd,
 		DataStoreMounted: s.Store.RequireMounted() == nil,
 		IncusVersion:     s.Incus.Version(ctx),
+		DBSize:           s.dbSize(ctx, state),
 		Snapshots:        snaps,
 		BootstrapError:   LastBootstrapError(),
 	}, nil
+}
+
+// dbSizeTimeout bounds the in-container psql call. Status has to stay answerable
+// while the backend is sick, so a wedged query costs a dash, not a hang.
+const dbSizeTimeout = 10 * time.Second
+
+// dbSize measures the live database from both sides: what PostgreSQL accounts
+// for (pg_database_size) and what the slot's data directory occupies on the XFS
+// store. The two differ by design — the second covers the whole cluster — and
+// seeing them together is what tells you whether a bloated store is data or
+// leftovers. Neither failure is fatal; the reason travels to the host instead.
+func (s *Service) dbSize(ctx context.Context, state string) agentapi.DBSize {
+	var sz agentapi.DBSize
+	if n, err := store.DiskBytes(s.Store.Current(s.slot())); err != nil {
+		sz.DiskError = err.Error()
+	} else {
+		sz.DiskBytes = n
+	}
+	if state != "RUNNING" {
+		sz.SQLError = "backend not running"
+		return sz
+	}
+	ctx, cancel := context.WithTimeout(ctx, dbSizeTimeout)
+	defer cancel()
+	out, err := s.Incus.ExecScript(ctx, s.container(), pg.DatabaseSizeScript(s.Cfg.PGDB))
+	if err != nil {
+		sz.SQLError = err.Error()
+		return sz
+	}
+	n, err := parseDBSize(out)
+	if err != nil {
+		sz.SQLError = err.Error()
+		return sz
+	}
+	sz.SQLBytes = n
+	return sz
+}
+
+// parseDBSize reads the byte count off psql's output, taking the LAST non-empty
+// line: `su - postgres` can prepend login noise (motd, profile chatter) that the
+// -Atq flags do not suppress because psql never emitted it.
+func parseDBSize(out string) (int64, error) {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("unexpected pg_database_size output %q", line)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("pg_database_size returned no output")
 }
 
 func (s *Service) Snapshots(ctx context.Context) ([]agentapi.SnapshotInfo, error) {

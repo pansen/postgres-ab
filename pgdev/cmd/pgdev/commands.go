@@ -233,6 +233,7 @@ func (a *app) renderSnapshots(statuses map[string]slotStatus, withPsql bool) {
 		if withPsql {
 			fmt.Printf("$ %s\n\n", a.psqlCmd(a.cfg.ClientPort(role)))
 		}
+		fmt.Printf("%s\n\n", dbSizeLine(a.cfg.PGDB, ms.st.DBSize))
 		if len(ms.st.Snapshots) == 0 {
 			fmt.Println("(no snapshots)")
 		} else {
@@ -807,6 +808,66 @@ func rebuildHint(role string) string {
 		return "make pg.staging.rebuild"
 	}
 	return "make start"
+}
+
+// dbSizeLine reports the live database from both sides. The SQL figure is
+// pg_database_size, so it counts only this database; the on-disk figure is the
+// slot's whole data directory on the XFS store, which also carries WAL and the
+// space PostgreSQL has not given back. The gap between them is the point of
+// printing both: a store that dwarfs the database is bloat, not data.
+func dbSizeLine(db string, sz agentapi.DBSize) string {
+	// A daemon older than these fields answers with zeros and no error. Say that
+	// once, instead of printing "0 bytes" twice as if the database were empty.
+	if sz == (agentapi.DBSize{}) {
+		return fmt.Sprintf("database %s: size not reported by this machine's daemon (run 'make deploy')", db)
+	}
+	return fmt.Sprintf("database %s: %s / %s", db,
+		sizeCell(sz.SQLBytes, sz.SQLError, "(SQL: %s)", "%s (SQL)"),
+		sizeCell(sz.DiskBytes, sz.DiskError, "on disk (%s)", "%s on disk"))
+}
+
+// sizeCell renders one measurement, replacing a missing number with a dash and
+// the reason it is missing. Zero counts as missing: PostgreSQL never reports an
+// empty database, and neither does a data directory that exists.
+func sizeCell(n int64, errText, missing, present string) string {
+	switch {
+	case errText != "":
+		return "- " + fmt.Sprintf(missing, shortErr(errText))
+	case n == 0:
+		return "- " + fmt.Sprintf(missing, "not reported")
+	}
+	return fmt.Sprintf(present, fmtBytes(n))
+}
+
+// fmtBytes renders a byte count the way pg_size_pretty does — 1024-based steps
+// under the familiar kB/MB/GB labels — so the SQL figure on a status line reads
+// the same as the one you would get from psql.
+func fmtBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d bytes", n)
+	}
+	v := float64(n) / unit
+	exp := 0
+	for v >= unit && exp < 3 {
+		v /= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %s", v, [...]string{"kB", "MB", "GB", "TB"}[exp])
+}
+
+// shortErr trims a measurement failure to something that fits on the status
+// line. The daemon sends the full message (an incus exec failure carries the
+// script's whole output); the reason belongs here, the detail belongs in logs.
+func shortErr(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 60 {
+		s = s[:57] + "..."
+	}
+	return s
 }
 
 func orQ(s string) string {
