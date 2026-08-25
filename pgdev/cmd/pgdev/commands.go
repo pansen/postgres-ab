@@ -140,19 +140,24 @@ type slotStatus struct {
 func (a *app) fetchStatuses(ctx context.Context) map[string]slotStatus {
 	out := make(map[string]slotStatus, len(slotsAB))
 	for _, slot := range slotsAB {
-		cl, err := a.clientFor(ctx, slot)
-		if err == nil {
-			var st agentapi.StatusResponse
-			if st, err = cl.Status(ctx); err == nil {
-				out[slot] = slotStatus{st: st}
-				continue
-			}
-		}
-		// Only ask the (slow) Apple CLI whether the machine exists once
-		// something already went wrong — the happy path stays exec-free.
-		out[slot] = slotStatus{err: err, absent: !a.apple(slot).Exists(ctx)}
+		out[slot] = a.fetchStatus(ctx, slot)
 	}
 	return out
+}
+
+// fetchStatus queries one machine's status, turning any failure into a
+// slotStatus rather than an error, so a caller can report the fault in place.
+func (a *app) fetchStatus(ctx context.Context, slot string) slotStatus {
+	cl, err := a.clientFor(ctx, slot)
+	if err == nil {
+		var st agentapi.StatusResponse
+		if st, err = cl.Status(ctx); err == nil {
+			return slotStatus{st: st}
+		}
+	}
+	// Only ask the (slow) Apple CLI whether the machine exists once something
+	// already went wrong — the happy path stays exec-free.
+	return slotStatus{err: err, absent: !a.apple(slot).Exists(ctx)}
 }
 
 func (a *app) renderStatus(ctx context.Context) {
@@ -234,18 +239,31 @@ func (a *app) renderSnapshots(statuses map[string]slotStatus, withPsql bool) {
 			fmt.Printf("$ %s\n\n", a.psqlCmd(a.cfg.ClientPort(role)))
 		}
 		fmt.Printf("%s\n\n", dbSizeLine(a.cfg.PGDB, ms.st.DBSize))
-		if len(ms.st.Snapshots) == 0 {
-			fmt.Println("(no snapshots)")
+		if t := snapshotTable(ms.st.Snapshots); t != "" {
+			fmt.Print(t)
 		} else {
-			tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tCREATED_AT")
-			for _, s := range ms.st.Snapshots {
-				fmt.Fprintf(tw, "%s\t%s\n", s.Name, time.Unix(s.CreatedUnix, 0).Format("2006-01-02 15:04:05 -0700"))
-			}
-			tw.Flush()
+			fmt.Println("(no snapshots)")
 		}
 		fmt.Println()
 	}
+}
+
+// snapshotTable renders the snapshot timeline as a column-aligned block (empty
+// when there are none). It returns the text rather than printing it so callers
+// that need it inside an indented prompt can shift the whole block without
+// disturbing tabwriter's alignment.
+func snapshotTable(snaps []agentapi.SnapshotInfo) string {
+	if len(snaps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tCREATED_AT")
+	for _, s := range snaps {
+		fmt.Fprintf(tw, "%s\t%s\n", s.Name, time.Unix(s.CreatedUnix, 0).Format("2006-01-02 15:04:05 -0700"))
+	}
+	tw.Flush()
+	return b.String()
 }
 
 // ----- endpoint & ip ---------------------------------------------------------
@@ -628,9 +646,9 @@ func (a *app) stagingPurgeCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n", machine)
-			fmt.Printf("    It will NOT be recreated — run 'make pg.staging.rebuild' or 'make start' to bring it back.\n")
-			fmt.Printf("    %s (active) is never touched.\n", activeMachine)
+			fmt.Printf("==> This DELETES %s (staging), discarding its data and snapshots, and reclaims its macOS disk.\n\n", machine)
+			a.printPurgeInventory(ctx, slot, machine)
+			fmt.Printf("    It will NOT be recreated — run 'make pg.staging.rebuild' or 'make start' to bring it back.\n\n")
 			if !force {
 				ok, err := confirm()
 				if err != nil {
@@ -663,6 +681,31 @@ func (a *app) stagingPurgeCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&force, "force", false, "skip the confirmation prompt")
 	return c
+}
+
+// printPurgeInventory shows what the confirmation is actually asking you to give
+// up — how much data the staging machine holds and which snapshots go with it —
+// so the decision is made against real numbers rather than the word "data".
+//
+// Best-effort by design: a machine that is already gone, or whose daemon does
+// not answer, still has to be purgeable (that is often WHY you are purging it),
+// so a failed lookup prints why and lets the prompt continue.
+func (a *app) printPurgeInventory(ctx context.Context, slot, machine string) {
+	ms := a.fetchStatus(ctx, slot)
+	switch {
+	case ms.absent:
+		fmt.Printf("    (%s does not exist — there is nothing left to discard)\n\n", machine)
+		return
+	case ms.err != nil:
+		fmt.Printf("    (%s is unreachable, so its contents cannot be listed: %s)\n\n", machine, shortErr(ms.err.Error()))
+		return
+	}
+	fmt.Printf("    %s\n\n", dbSizeLine(a.cfg.PGDB, ms.st.DBSize))
+	if t := snapshotTable(ms.st.Snapshots); t != "" {
+		fmt.Printf("%s\n\n", indent(t, "    "))
+		return
+	}
+	fmt.Printf("    (no snapshots)\n\n")
 }
 
 // stagingRebuildCmd is the hard-reset reclaim tier (spec 0002 §0.1/§2): delete
@@ -854,6 +897,19 @@ func fmtBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.2f %s", v, [...]string{"kB", "MB", "GB", "TB"}[exp])
+}
+
+// indent shifts every non-empty line of a block by prefix. Blank lines are left
+// bare so no trailing whitespace is emitted, and the block keeps the column
+// alignment tabwriter gave it.
+func indent(s, prefix string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		if l != "" {
+			lines[i] = prefix + l
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // shortErr trims a measurement failure to something that fits on the status
